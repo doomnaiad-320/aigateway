@@ -4,6 +4,16 @@
 
 This is an AI API gateway/proxy built with Go. It aggregates 40+ upstream AI providers (OpenAI, Claude, Gemini, Azure, AWS Bedrock, etc.) behind a unified API, with user management, billing, rate limiting, and an admin dashboard.
 
+## Git Workflow
+
+- `origin` is the upstream source repository: `https://github.com/MAX-API-Next/MAX-API.git`.
+- `aigateway` is our development repository: `git@github.com:doomnaiad-320/aigateway.git`.
+- `dev` is our active development branch and should track `aigateway/dev`.
+- Sync upstream changes by pulling `origin/main` into the local working branch, then push the updated `dev` branch to `aigateway/dev`.
+- Keep `origin` available for fetching and syncing upstream code. Do not change `origin` to point at the development repository.
+- Do not push directly to `origin` unless the user explicitly asks and the account has upstream write permission.
+- Commit and push project changes to `dev`; avoid committing unrelated local files unless the user explicitly asks for them.
+
 ## Tech Stack
 
 - **Backend**: Go 1.22+, Gin web framework, GORM v2 ORM
