@@ -73,9 +73,6 @@ func mokaEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 	// 	}, nil
 	// }
 	fullTextResponse := embeddingResponseMoka2OpenAI(&baiduResponse)
-	if modelName := relaycommon.ClientVisibleModelName(info); modelName != "" {
-		fullTextResponse.Model = modelName
-	}
 	jsonResponse, err := common.Marshal(fullTextResponse)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)

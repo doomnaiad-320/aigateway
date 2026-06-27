@@ -55,7 +55,7 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 	// convert coze response to openai response
 	var response dto.TextResponse
 	var cozeResponse CozeChatDetailResponse
-	response.Model = relaycommon.OutputModelName(info)
+	response.Model = info.UpstreamModelName
 	err = json.Unmarshal(responseBody, &cozeResponse)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
@@ -190,7 +190,7 @@ func handleCozeEvent(c *gin.Context, event string, data string, responseText *st
 			Id:      id,
 			Object:  "chat.completion.chunk",
 			Created: common.GetTimestamp(),
-			Model:   relaycommon.OutputModelName(info),
+			Model:   info.UpstreamModelName,
 		}
 
 		choice := dto.ChatCompletionsStreamResponseChoice{
