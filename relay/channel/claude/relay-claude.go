@@ -45,6 +45,17 @@ func maybeMarkClaudeRefusal(c *gin.Context, stopReason string) {
 	}
 }
 
+func maskClaudeResponseModel(info *relaycommon.RelayInfo, resp *dto.ClaudeResponse) {
+	modelName := relaycommon.ClientVisibleModelName(info)
+	if modelName == "" || resp == nil {
+		return
+	}
+	resp.Model = modelName
+	if resp.Message != nil {
+		resp.Message.Model = modelName
+	}
+}
+
 func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRequest) (*dto.ClaudeRequest, error) {
 	claudeTools := make([]any, 0, len(textRequest.Tools))
 
@@ -767,6 +778,10 @@ func setMessageDeltaUsageInt(data string, path string, localValue int) string {
 }
 
 func FormatClaudeResponseInfo(claudeResponse *dto.ClaudeResponse, oaiResponse *dto.ChatCompletionsStreamResponse, claudeInfo *ClaudeResponseInfo) bool {
+	return formatClaudeResponseInfo(claudeResponse, oaiResponse, claudeInfo, nil)
+}
+
+func formatClaudeResponseInfo(claudeResponse *dto.ClaudeResponse, oaiResponse *dto.ChatCompletionsStreamResponse, claudeInfo *ClaudeResponseInfo, info *relaycommon.RelayInfo) bool {
 	if claudeInfo == nil {
 		return false
 	}
@@ -834,6 +849,9 @@ func FormatClaudeResponseInfo(claudeResponse *dto.ClaudeResponse, oaiResponse *d
 		oaiResponse.Id = claudeInfo.ResponseId
 		oaiResponse.Created = claudeInfo.Created
 		oaiResponse.Model = claudeInfo.Model
+		if modelName := relaycommon.ClientVisibleModelName(info); modelName != "" {
+			oaiResponse.Model = modelName
+		}
 	}
 	return true
 }
@@ -855,7 +873,7 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		maybeMarkClaudeRefusal(c, *claudeResponse.Delta.StopReason)
 	}
 	if info.RelayFormat == types.RelayFormatClaude {
-		FormatClaudeResponseInfo(&claudeResponse, nil, claudeInfo)
+		formatClaudeResponseInfo(&claudeResponse, nil, claudeInfo, info)
 
 		if claudeResponse.Type == "message_start" {
 			// message_start, 获取usage
@@ -867,13 +885,18 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 			// 解决 AWS Bedrock 等上游返回的 message_delta 缺少这些字段的问题
 			if !shouldSkipClaudeMessageDeltaUsagePatch(info) {
 				data = patchClaudeMessageDeltaUsageData(data, buildMessageDeltaPatchUsage(&claudeResponse, claudeInfo))
+				_ = common.UnmarshalJsonStr(data, &claudeResponse)
 			}
+		}
+		maskClaudeResponseModel(info, &claudeResponse)
+		if maskedData, marshalErr := common.Marshal(claudeResponse); marshalErr == nil {
+			data = string(maskedData)
 		}
 		helper.ClaudeChunkData(c, claudeResponse, data)
 	} else if info.RelayFormat == types.RelayFormatOpenAI {
 		response := StreamResponseClaude2OpenAI(&claudeResponse)
 
-		if !FormatClaudeResponseInfo(&claudeResponse, response, claudeInfo) {
+		if !formatClaudeResponseInfo(&claudeResponse, response, claudeInfo, info) {
 			return nil
 		}
 
@@ -913,7 +936,7 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 	} else if info.RelayFormat == types.RelayFormatOpenAI {
 		if info.ShouldIncludeUsage {
 			openAIUsage := buildOpenAIStyleUsageFromClaudeUsage(claudeInfo.Usage)
-			response := helper.GenerateFinalUsageResponse(claudeInfo.ResponseId, claudeInfo.Created, info.UpstreamModelName, openAIUsage)
+			response := helper.GenerateFinalUsageResponse(claudeInfo.ResponseId, claudeInfo.Created, relaycommon.OutputModelName(info), openAIUsage)
 			err := helper.ObjectData(c, response)
 			if err != nil {
 				common.SysLog("send final response failed: " + err.Error())
@@ -983,7 +1006,11 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 			return types.NewError(err, types.ErrorCodeBadResponseBody)
 		}
 	case types.RelayFormatClaude:
-		responseData = data
+		maskClaudeResponseModel(info, &claudeResponse)
+		responseData, err = common.Marshal(claudeResponse)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeBadResponseBody)
+		}
 		if service.ResponseAuditEnabled() {
 			auditResponse = ResponseClaude2OpenAI(&claudeResponse)
 		}

@@ -103,6 +103,7 @@ type RelayInfo struct {
 	UsePrice               bool
 	RelayMode              int
 	OriginModelName        string
+	ClientModelName        string
 	RequestURLPath         string
 	RequestHeaders         map[string]string
 	ShouldIncludeUsage     bool
@@ -464,6 +465,7 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 	if reqId == "" {
 		reqId = common.GetTimeString() + common.GetRandomString(8)
 	}
+	originModelName := common.GetContextKeyString(c, constant.ContextKeyOriginalModel)
 	info := &RelayInfo{
 		Request: request,
 
@@ -474,7 +476,8 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 		UserQuota:  common.GetContextKeyInt(c, constant.ContextKeyUserQuota),
 		UserEmail:  common.GetContextKeyString(c, constant.ContextKeyUserEmail),
 
-		OriginModelName: common.GetContextKeyString(c, constant.ContextKeyOriginalModel),
+		OriginModelName: originModelName,
+		ClientModelName: originModelName,
 
 		TokenId:        common.GetContextKeyInt(c, constant.ContextKeyTokenId),
 		TokenKey:       common.GetContextKeyString(c, constant.ContextKeyTokenKey),
@@ -515,6 +518,30 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 	}
 
 	return info
+}
+
+func (info *RelayInfo) ClientVisibleModelName() string {
+	return ClientVisibleModelName(info)
+}
+
+func ClientVisibleModelName(info *RelayInfo) string {
+	if info == nil || info.ChannelMeta == nil || !info.ChannelMeta.IsModelMapped {
+		return ""
+	}
+	if info.ClientModelName != "" {
+		return info.ClientModelName
+	}
+	return info.OriginModelName
+}
+
+func OutputModelName(info *RelayInfo) string {
+	if modelName := ClientVisibleModelName(info); modelName != "" {
+		return modelName
+	}
+	if info == nil {
+		return ""
+	}
+	return info.UpstreamModelName
 }
 
 func cloneRequestHeaders(c *gin.Context) map[string]string {

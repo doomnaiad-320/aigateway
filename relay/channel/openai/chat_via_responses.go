@@ -64,6 +64,9 @@ func OaiResponsesToChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
+	if modelName := clientVisibleModelName(info); modelName != "" {
+		chatResp.Model = modelName
+	}
 	if usage == nil || usage.TotalTokens == 0 {
 		outputAuditText := service.ExtractOutputTextFromResponses(&responsesResp)
 		usage = service.ResponseText2Usage(c, outputAuditText, info.UpstreamModelName, info.GetEstimatePromptTokens())
@@ -104,6 +107,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	responseId := helper.GetResponseID(c)
 	createAt := time.Now().Unix()
 	model := info.UpstreamModelName
+	if modelName := clientVisibleModelName(info); modelName != "" {
+		model = modelName
+	}
 
 	var (
 		usage       = &dto.Usage{}
@@ -316,7 +322,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		switch streamResp.Type {
 		case "response.created":
 			if streamResp.Response != nil {
-				if streamResp.Response.Model != "" {
+				if streamResp.Response.Model != "" && clientVisibleModelName(info) == "" {
 					model = streamResp.Response.Model
 				}
 				if streamResp.Response.CreatedAt != 0 {
@@ -448,7 +454,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 
 		case "response.completed":
 			if streamResp.Response != nil {
-				if streamResp.Response.Model != "" {
+				if streamResp.Response.Model != "" && clientVisibleModelName(info) == "" {
 					model = streamResp.Response.Model
 				}
 				if streamResp.Response.CreatedAt != 0 {

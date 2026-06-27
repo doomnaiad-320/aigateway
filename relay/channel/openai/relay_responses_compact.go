@@ -32,6 +32,11 @@ func OaiResponsesCompactionHandler(c *gin.Context, info *relaycommon.RelayInfo, 
 		service.SetRelayResponseAuditContent(info, service.BuildRawJSONAuditContent(compactResp.Output))
 	}
 
+	responseBody, err = maskResponseModelBytes(info, responseBody)
+	if err != nil {
+		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+	}
+
 	service.IOCopyBytesGracefully(c, resp, responseBody)
 
 	usage := dto.Usage{}

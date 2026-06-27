@@ -39,6 +39,8 @@ func TestFormatUserLogsExposesOnlyUserAuditContent(t *testing.T) {
 				"stream_status": map[string]interface{}{
 					"status": "error",
 				},
+				"is_model_mapped":     true,
+				"upstream_model_name": "private-upstream-model",
 			}),
 		},
 	}
@@ -49,6 +51,8 @@ func TestFormatUserLogsExposesOnlyUserAuditContent(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, other, "admin_info")
 	require.NotContains(t, other, "stream_status")
+	require.NotContains(t, other, "is_model_mapped")
+	require.NotContains(t, other, "upstream_model_name")
 	require.Equal(t, 11, logs[0].Id)
 
 	auditInfo, ok := other["audit_info"].(map[string]interface{})
