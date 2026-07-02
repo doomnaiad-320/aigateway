@@ -11,6 +11,7 @@ logs
 web/default/dist
 web/node_modules
 .env
+.env.howlife
 one-api
 max-api
 new-api

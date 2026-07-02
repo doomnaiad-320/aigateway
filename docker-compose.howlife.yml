@@ -1,0 +1,30 @@
+services:
+  howlife:
+    image: ghcr.io/mulan777/new-api-custom:v1.5.4
+    container_name: howlife
+    restart: always
+    network_mode: host
+    command: --log-dir /app/logs
+    env_file:
+      - .env.howlife
+    volumes:
+      - howlife_data:/data
+      - /www/wwwroot/howlife/log:/app/logs
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:3001/api/status | grep -o '\"success\":\\s*true' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+volumes:
+  howlife_data:
