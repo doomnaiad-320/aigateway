@@ -33,6 +33,17 @@ func appendRequestPath(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, other
 	}
 }
 
+func AppendRetryLogInfo(ctx *gin.Context, adminInfo map[string]interface{}, other map[string]interface{}) {
+	if ctx == nil || adminInfo == nil || other == nil {
+		return
+	}
+	useChannel := ctx.GetStringSlice("use_channel")
+	adminInfo["use_channel"] = useChannel
+	if len(useChannel) > 1 {
+		other["retry_log"] = true
+	}
+}
+
 func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, modelRatio, groupRatio, completionRatio float64,
 	cacheTokens int, cacheRatio float64, modelPrice float64, userGroupRatio float64) map[string]interface{} {
 	other := make(map[string]interface{})
@@ -58,7 +69,7 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	}
 
 	adminInfo := make(map[string]interface{})
-	adminInfo["use_channel"] = ctx.GetStringSlice("use_channel")
+	AppendRetryLogInfo(ctx, adminInfo, other)
 	isMultiKey := common.GetContextKeyBool(ctx, constant.ContextKeyChannelIsMultiKey)
 	if isMultiKey {
 		adminInfo["is_multi_key"] = true
@@ -72,8 +83,10 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 
 	AppendChannelAffinityAdminInfo(ctx, adminInfo)
 	AppendContentAuditAdminInfo(relayInfo, adminInfo)
+	appendEmptyCompletionAdminInfo(ctx, adminInfo)
 
 	other["admin_info"] = adminInfo
+	appendEmptyCompletionInfo(ctx, other)
 	appendRequestPath(ctx, relayInfo, other)
 	appendRequestConversionChain(relayInfo, other)
 	appendFinalRequestFormat(relayInfo, other)
@@ -81,6 +94,59 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	appendParamOverrideInfo(relayInfo, other)
 	appendStreamStatus(relayInfo, other)
 	return other
+}
+
+func appendEmptyCompletionAdminInfo(ctx *gin.Context, adminInfo map[string]interface{}) {
+	if ctx == nil || adminInfo == nil {
+		return
+	}
+	info, ok := common.GetContextKeyType[map[string]any](ctx, constant.ContextKeyEmptyCompletionInfo)
+	if !ok || len(info) == 0 {
+		return
+	}
+	adminInfo["empty_completion"] = info
+}
+
+func appendEmptyCompletionInfo(ctx *gin.Context, other map[string]interface{}) {
+	if ctx == nil || other == nil {
+		return
+	}
+	info, ok := common.GetContextKeyType[map[string]any](ctx, constant.ContextKeyEmptyCompletionInfo)
+	if !ok || len(info) == 0 {
+		return
+	}
+	copyBool := func(key string) {
+		if v, ok := info[key].(bool); ok {
+			other[key] = v
+		}
+	}
+	copyInt := func(key string) {
+		if v, ok := info[key].(int); ok {
+			other[key] = v
+		}
+	}
+	copyString := func(key string) {
+		if v, ok := info[key].(string); ok && v != "" {
+			other[key] = v
+		}
+	}
+	copyBool("empty_completion")
+	copyBool("empty_retry")
+	copyInt("empty_retry_count")
+	copyString("empty_retry_result")
+	copyString("empty_reason")
+	if v, ok := info["empty_output_types"].([]string); ok && len(v) > 0 {
+		other["empty_output_types"] = v
+	}
+	copyInt("first_empty_channel_id")
+	copyInt("last_empty_channel_id")
+	copyInt("first_empty_channel_type")
+	copyInt("last_empty_channel_type")
+	copyInt("first_empty_retry_index")
+	copyInt("last_empty_retry_index")
+	copyInt("final_channel_id")
+	copyInt("final_channel_type")
+	copyInt("final_retry_index")
 }
 
 func appendParamOverrideInfo(relayInfo *relaycommon.RelayInfo, other map[string]interface{}) {

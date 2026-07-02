@@ -38,9 +38,11 @@ export interface UsageLog {
   completion_tokens: number
   use_time: number
   is_stream: boolean
+  is_retry?: boolean
   channel: number
   channel_name?: string
   token_id?: number
+  log_id?: number
   group: string
   ip?: string
   request_id?: string
@@ -127,6 +129,8 @@ export interface LogAuditInfo {
 }
 
 export interface LogOtherData {
+  retry_log?: boolean
+  empty_retry?: boolean
   op?: {
     action?: string
     params?: Record<string, unknown>
@@ -299,6 +303,7 @@ export interface GetLogsParams {
   p?: number
   page_size?: number
   type?: number
+  log_filter?: string
   username?: string
   token_name?: string
   model_name?: string
@@ -321,8 +326,15 @@ export interface GetLogsResponse {
   }
 }
 
+export interface GetLogDetailResponse {
+  success: boolean
+  message?: string
+  data?: UsageLog
+}
+
 export interface GetLogStatsParams {
   type?: number
+  log_filter?: string
   username?: string
   token_name?: string
   model_name?: string

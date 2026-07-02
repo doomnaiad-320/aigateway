@@ -341,15 +341,19 @@ func shouldRetry(c *gin.Context, openaiErr *types.MaxAPIError, retryTimes int) b
 	if _, ok := c.Get("specific_channel_id"); ok {
 		return false
 	}
+	errorCode := openaiErr.GetErrorCode()
+	if operation_setting.IsAlwaysSkipRetryCode(errorCode) {
+		return false
+	}
+	if errorCode == types.ErrorCodeEmptyCompletion && !common.EmptyCompletionRetryEnabled {
+		return false
+	}
 	code := openaiErr.StatusCode
 	if code >= 200 && code < 300 {
 		return false
 	}
 	if code < 100 || code > 599 {
 		return true
-	}
-	if operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()) {
-		return false
 	}
 	return operation_setting.ShouldRetryByStatusCode(code)
 }
@@ -383,7 +387,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		other["channel_name"] = c.GetString("channel_name")
 		other["channel_type"] = c.GetInt("channel_type")
 		adminInfo := make(map[string]interface{})
-		adminInfo["use_channel"] = c.GetStringSlice("use_channel")
+		service.AppendRetryLogInfo(c, adminInfo, other)
 		isMultiKey := common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey)
 		if isMultiKey {
 			adminInfo["is_multi_key"] = true

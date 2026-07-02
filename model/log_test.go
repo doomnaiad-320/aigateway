@@ -1,10 +1,15 @@
 package model
 
 import (
+	"errors"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/MAX-API-Next/MAX-API/common"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func withLogAuditSettings(t *testing.T, requestEnabled bool, responseEnabled bool) {
@@ -19,41 +24,632 @@ func withLogAuditSettings(t *testing.T, requestEnabled bool, responseEnabled boo
 	})
 }
 
-func TestFormatUserLogsExposesOnlyUserAuditContent(t *testing.T) {
-	withLogAuditSettings(t, true, true)
+func TestGetAllLogsRetryFilter(t *testing.T) {
+	require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+	t.Cleanup(func() {
+		require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+	})
 
-	logs := []*Log{
+	logs := createRetryFilterLogs(t)
+
+	got, total, err := GetAllLogs(LogTypeUnknown, LogFilterRetry, 0, 0, "", "", "", 0, 10, 0, "", "", "")
+	require.NoError(t, err)
+	require.EqualValues(t, 4, total)
+	require.Len(t, got, 4)
+	require.ElementsMatch(t, []int{logs[0].Id, logs[1].Id, logs[4].Id, logs[5].Id}, []int{got[0].Id, got[1].Id, got[2].Id, got[3].Id})
+}
+
+func TestGetUserLogsRetryFilter(t *testing.T) {
+	require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+	t.Cleanup(func() {
+		require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+	})
+
+	logs := createRetryFilterLogs(t)
+
+	got, total, err := GetUserLogs(1, LogTypeUnknown, LogFilterRetry, 0, 0, "", "", 0, 10, "", "", "")
+	require.NoError(t, err)
+	require.EqualValues(t, 3, total)
+	require.Len(t, got, 3)
+	gotLogIds := []int{got[0].LogId, got[1].LogId, got[2].LogId}
+	require.ElementsMatch(t, []int{logs[0].Id, logs[1].Id, logs[5].Id}, gotLogIds)
+	require.NotContains(t, gotLogIds, logs[4].Id)
+	for _, log := range got {
+		require.Equal(t, 1, log.UserId)
+	}
+}
+
+func TestSumUsedQuotaRetryFilter(t *testing.T) {
+	require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+	t.Cleanup(func() {
+		require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+	})
+
+	createRetryFilterLogs(t)
+
+	stat, err := SumUsedQuota(LogTypeUnknown, LogFilterRetry, 0, 0, "", "", "", 0, "")
+	require.NoError(t, err)
+	require.Equal(t, 1200, stat.Quota)
+	require.Equal(t, 4, stat.Rpm)
+	require.Equal(t, 71, stat.Tpm)
+}
+
+func TestSumUsedQuotaAppliesExplicitLogType(t *testing.T) {
+	require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+	t.Cleanup(func() {
+		require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+	})
+
+	createRetryFilterLogs(t)
+
+	stat, err := SumUsedQuota(LogTypeError, "", 0, 0, "", "", "", 0, "")
+	require.NoError(t, err)
+	require.Equal(t, 0, stat.Quota)
+	require.Equal(t, 1, stat.Rpm)
+	require.Equal(t, 0, stat.Tpm)
+}
+
+func TestRetryFilterIgnoresNestedRetryMarker(t *testing.T) {
+	require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+	t.Cleanup(func() {
+		require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+	})
+
+	logs := []Log{
 		{
+			UserId:           1,
+			CreatedAt:        time.Now().Unix() - 10,
+			Type:             LogTypeConsume,
+			Quota:            300,
+			PromptTokens:     3,
+			CompletionTokens: 7,
 			Other: common.MapToJsonStr(map[string]interface{}{
 				"admin_info": map[string]interface{}{
-					"request_content":            "user prompt",
-					"request_content_truncated":  true,
-					"response_content":           "model answer",
-					"response_content_truncated": true,
-					"local_count_tokens":         true,
-					"use_channel":                []int{1, 2},
+					"request_content": `user prompt literally contains "retry_log":true`,
+					"retry_log":       true,
 				},
-				"audit_info": map[string]interface{}{
-					"request_content": "stale audit content",
-				},
-				"stream_status": map[string]interface{}{
-					"status": "error",
+			}),
+		},
+		{
+			UserId:           1,
+			CreatedAt:        time.Now().Unix() - 20,
+			Type:             LogTypeConsume,
+			Quota:            200,
+			PromptTokens:     5,
+			CompletionTokens: 11,
+			Other: common.MapToJsonStr(map[string]interface{}{
+				"retry_log": true,
+			}),
+		},
+	}
+	require.NoError(t, LOG_DB.Create(&logs).Error)
+
+	got, total, err := GetAllLogs(LogTypeUnknown, LogFilterRetry, 0, 0, "", "", "", 0, 10, 0, "", "", "")
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	require.Len(t, got, 1)
+	require.Equal(t, logs[1].Id, got[0].Id)
+
+	stat, err := SumUsedQuota(LogTypeUnknown, LogFilterRetry, 0, 0, "", "", "", 0, "")
+	require.NoError(t, err)
+	require.Equal(t, 200, stat.Quota)
+	require.Equal(t, 1, stat.Rpm)
+	require.Equal(t, 16, stat.Tpm)
+}
+
+func TestRetryFilterBackfillsLegacyMarkersBeforeCompletion(t *testing.T) {
+	markerKey := logRetryMarkerBackfillCompletionKey()
+	require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+	require.NoError(t, DB.Where(commonKeyCol+" = ?", markerKey).Delete(&Option{}).Error)
+	t.Cleanup(func() {
+		require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+		require.NoError(t, DB.Where(commonKeyCol+" = ?", markerKey).Delete(&Option{}).Error)
+	})
+
+	logs := []Log{
+		{
+			UserId:           1,
+			CreatedAt:        time.Now().Unix() - 10,
+			Type:             LogTypeConsume,
+			Quota:            100,
+			PromptTokens:     3,
+			CompletionTokens: 5,
+			Other: common.MapToJsonStr(map[string]interface{}{
+				"retry_log": true,
+			}),
+		},
+		{
+			UserId:           1,
+			CreatedAt:        time.Now().Unix() - 20,
+			Type:             LogTypeConsume,
+			Quota:            200,
+			PromptTokens:     7,
+			CompletionTokens: 11,
+			Other: common.MapToJsonStr(map[string]interface{}{
+				"admin_info": map[string]interface{}{
+					"retry_log": true,
 				},
 				"is_model_mapped":     true,
 				"upstream_model_name": "private-upstream-model",
 			}),
 		},
 	}
+	require.NoError(t, LOG_DB.Create(&logs).Error)
+	require.NoError(t, LOG_DB.Model(&Log{}).Where("1 = 1").UpdateColumn("is_retry", false).Error)
 
-	formatUserLogs(logs, 10)
-
-	other, err := common.StrToMap(logs[0].Other)
+	got, total, err := GetAllLogs(LogTypeUnknown, LogFilterRetry, 0, 0, "", "", "", 0, 10, 0, "", "", "")
 	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	require.Len(t, got, 1)
+	require.Equal(t, logs[0].Id, got[0].Id)
+
+	var reloaded []Log
+	require.NoError(t, LOG_DB.Order("id asc").Find(&reloaded).Error)
+	require.Len(t, reloaded, 2)
+	require.True(t, reloaded[0].IsRetry)
+	require.False(t, reloaded[1].IsRetry)
+}
+
+func TestRetryFilterUsesIsRetryAfterBackfillCompletion(t *testing.T) {
+	markerKey := logRetryMarkerBackfillCompletionKey()
+	require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+	require.NoError(t, DB.Where(commonKeyCol+" = ?", markerKey).Delete(&Option{}).Error)
+	t.Cleanup(func() {
+		require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+		require.NoError(t, DB.Where(commonKeyCol+" = ?", markerKey).Delete(&Option{}).Error)
+	})
+
+	log := Log{
+		UserId:    1,
+		CreatedAt: time.Now().Unix() - 10,
+		Type:      LogTypeConsume,
+		Quota:     100,
+		Other: common.MapToJsonStr(map[string]interface{}{
+			"retry_log": true,
+		}),
+	}
+	require.NoError(t, LOG_DB.Create(&log).Error)
+	require.NoError(t, LOG_DB.Model(&Log{}).Where("id = ?", log.Id).UpdateColumn("is_retry", false).Error)
+	require.NoError(t, markLogRetryMarkerBackfillCompleted())
+
+	got, total, err := GetAllLogs(LogTypeUnknown, LogFilterRetry, 0, 0, "", "", "", 0, 10, 0, "", "", "")
+	require.NoError(t, err)
+	require.EqualValues(t, 0, total)
+	require.Empty(t, got)
+
+	var reloaded Log
+	require.NoError(t, LOG_DB.First(&reloaded, log.Id).Error)
+	require.False(t, reloaded.IsRetry)
+}
+
+func TestRetryFilterReadPathsReturnReadinessError(t *testing.T) {
+	originalEnsure := ensureLogRetryMarkerBackfillCompletedForRead
+	expectedErr := errors.New("readiness unavailable")
+	ensureLogRetryMarkerBackfillCompletedForRead = func() error {
+		return expectedErr
+	}
+	t.Cleanup(func() {
+		ensureLogRetryMarkerBackfillCompletedForRead = originalEnsure
+	})
+
+	got, total, err := GetAllLogs(LogTypeUnknown, LogFilterRetry, 0, 0, "", "", "", 0, 10, 0, "", "", "")
+	require.ErrorIs(t, err, expectedErr)
+	require.Nil(t, got)
+	require.Zero(t, total)
+
+	got, total, err = GetUserLogs(1, LogTypeUnknown, LogFilterRetry, 0, 0, "", "", 0, 10, "", "", "")
+	require.ErrorIs(t, err, expectedErr)
+	require.Nil(t, got)
+	require.Zero(t, total)
+
+	stat, err := SumUsedQuota(LogTypeUnknown, LogFilterRetry, 0, 0, "", "", "", 0, "")
+	require.ErrorIs(t, err, expectedErr)
+	require.Zero(t, stat)
+}
+
+func TestBackfillLogRetryMarkerUsesTopLevelMarkersOnly(t *testing.T) {
+	markerKey := logRetryMarkerBackfillCompletionKey()
+	require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+	require.NoError(t, DB.Where(commonKeyCol+" = ?", markerKey).Delete(&Option{}).Error)
+	t.Cleanup(func() {
+		require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+		require.NoError(t, DB.Where(commonKeyCol+" = ?", markerKey).Delete(&Option{}).Error)
+	})
+
+	logs := []Log{
+		{
+			UserId: 1,
+			Type:   LogTypeConsume,
+			Other: common.MapToJsonStr(map[string]interface{}{
+				"retry_log": true,
+			}),
+		},
+		{
+			UserId: 1,
+			Type:   LogTypeConsume,
+			Other: common.MapToJsonStr(map[string]interface{}{
+				"admin_info": map[string]interface{}{
+					"retry_log": true,
+				},
+			}),
+		},
+	}
+	require.NoError(t, LOG_DB.Create(&logs).Error)
+	require.NoError(t, LOG_DB.Model(&Log{}).Where("1 = 1").UpdateColumn("is_retry", false).Error)
+
+	require.NoError(t, backfillLogRetryMarker())
+
+	var reloaded []Log
+	require.NoError(t, LOG_DB.Order("id asc").Find(&reloaded).Error)
+	require.Len(t, reloaded, 2)
+	require.True(t, reloaded[0].IsRetry)
+	require.False(t, reloaded[1].IsRetry)
+}
+
+func TestBackfillLogRetryMarkerSkipsAfterCompletionMarker(t *testing.T) {
+	markerKey := logRetryMarkerBackfillCompletionKey()
+	require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+	require.NoError(t, DB.Where(commonKeyCol+" = ?", markerKey).Delete(&Option{}).Error)
+	t.Cleanup(func() {
+		require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+		require.NoError(t, DB.Where(commonKeyCol+" = ?", markerKey).Delete(&Option{}).Error)
+	})
+
+	log := Log{
+		UserId: 1,
+		Type:   LogTypeConsume,
+		Other: common.MapToJsonStr(map[string]interface{}{
+			"retry_log": true,
+		}),
+	}
+	require.NoError(t, LOG_DB.Create(&log).Error)
+	require.NoError(t, LOG_DB.Model(&Log{}).Where("1 = 1").UpdateColumn("is_retry", false).Error)
+	require.NoError(t, backfillLogRetryMarker())
+
+	var marker Option
+	require.NoError(t, DB.First(&marker, commonKeyCol+" = ?", markerKey).Error)
+	require.Equal(t, "true", marker.Value)
+
+	require.NoError(t, LOG_DB.Model(&Log{}).Where("1 = 1").UpdateColumn("is_retry", false).Error)
+	require.NoError(t, backfillLogRetryMarker())
+
+	var reloaded Log
+	require.NoError(t, LOG_DB.First(&reloaded, log.Id).Error)
+	require.False(t, reloaded.IsRetry)
+}
+
+func TestBackfillLogRetryMarkerCompletionIsScopedToLogDBIdentity(t *testing.T) {
+	originalDB := DB
+	originalLOGDB := LOG_DB
+	originalLogSQLType := common.LogSqlType
+	t.Cleanup(func() {
+		DB = originalDB
+		LOG_DB = originalLOGDB
+		common.LogSqlType = originalLogSQLType
+		initCol()
+	})
+
+	mainDB := newRetryBackfillTestDB(t, &Option{})
+	logOneDB := newRetryBackfillTestDB(t, &Log{})
+	logTwoDB := newRetryBackfillTestDB(t, &Log{})
+
+	DB = mainDB
+	common.LogSqlType = common.DatabaseTypeSQLite
+
+	t.Setenv("LOG_SQL_DSN", "sqlite://log-one")
+	initCol()
+	LOG_DB = logOneDB
+	logOne := Log{
+		UserId: 1,
+		Type:   LogTypeConsume,
+		Other: common.MapToJsonStr(map[string]interface{}{
+			"retry_log": true,
+		}),
+	}
+	require.NoError(t, LOG_DB.Create(&logOne).Error)
+	require.NoError(t, LOG_DB.Model(&Log{}).Where("1 = 1").UpdateColumn("is_retry", false).Error)
+	require.NoError(t, backfillLogRetryMarker())
+
+	var reloaded Log
+	require.NoError(t, logOneDB.First(&reloaded, logOne.Id).Error)
+	require.True(t, reloaded.IsRetry)
+
+	require.NoError(t, os.Setenv("LOG_SQL_DSN", "sqlite://log-two"))
+	initCol()
+	LOG_DB = logTwoDB
+	logTwo := Log{
+		UserId: 1,
+		Type:   LogTypeConsume,
+		Other: common.MapToJsonStr(map[string]interface{}{
+			"retry_log": true,
+		}),
+	}
+	require.NoError(t, LOG_DB.Create(&logTwo).Error)
+	require.NoError(t, LOG_DB.Model(&Log{}).Where("1 = 1").UpdateColumn("is_retry", false).Error)
+
+	require.NoError(t, backfillLogRetryMarker())
+
+	reloaded = Log{}
+	require.NoError(t, logTwoDB.First(&reloaded, logTwo.Id).Error)
+	require.True(t, reloaded.IsRetry)
+}
+
+func TestMigrateLOGDBSchedulesRetryMarkerBackfillWithoutRunningInline(t *testing.T) {
+	originalDB := DB
+	originalLOGDB := LOG_DB
+	originalRunner := logRetryMarkerBackfillAsyncRunner
+	originalLogSQLType := common.LogSqlType
+	t.Cleanup(func() {
+		DB = originalDB
+		LOG_DB = originalLOGDB
+		logRetryMarkerBackfillAsyncRunner = originalRunner
+		common.LogSqlType = originalLogSQLType
+		initCol()
+	})
+
+	mainDB := newRetryBackfillTestDB(t, &Option{})
+	logDB := newRetryBackfillTestDB(t)
+
+	DB = mainDB
+	LOG_DB = logDB
+	common.LogSqlType = common.DatabaseTypeSQLite
+	t.Setenv("LOG_SQL_DSN", "sqlite://async-backfill")
+	initCol()
+
+	var scheduled []func()
+	logRetryMarkerBackfillAsyncRunner = func(fn func()) {
+		scheduled = append(scheduled, fn)
+	}
+
+	require.NoError(t, migrateLOGDB())
+	require.Len(t, scheduled, 1)
+
+	log := Log{
+		UserId: 1,
+		Type:   LogTypeConsume,
+		Other: common.MapToJsonStr(map[string]interface{}{
+			"retry_log": true,
+		}),
+	}
+	require.NoError(t, LOG_DB.Create(&log).Error)
+	require.NoError(t, LOG_DB.Model(&Log{}).Where("1 = 1").UpdateColumn("is_retry", false).Error)
+
+	var reloaded Log
+	require.NoError(t, LOG_DB.First(&reloaded, log.Id).Error)
+	require.False(t, reloaded.IsRetry)
+
+	scheduled[0]()
+
+	reloaded = Log{}
+	require.NoError(t, LOG_DB.First(&reloaded, log.Id).Error)
+	require.True(t, reloaded.IsRetry)
+}
+
+func TestScheduleLogRetryMarkerBackfillSkipsCompletedMarker(t *testing.T) {
+	originalDB := DB
+	originalLOGDB := LOG_DB
+	originalRunner := logRetryMarkerBackfillAsyncRunner
+	originalLogSQLType := common.LogSqlType
+	t.Cleanup(func() {
+		DB = originalDB
+		LOG_DB = originalLOGDB
+		logRetryMarkerBackfillAsyncRunner = originalRunner
+		common.LogSqlType = originalLogSQLType
+		initCol()
+	})
+
+	mainDB := newRetryBackfillTestDB(t, &Option{})
+	logDB := newRetryBackfillTestDB(t, &Log{})
+
+	DB = mainDB
+	LOG_DB = logDB
+	common.LogSqlType = common.DatabaseTypeSQLite
+	t.Setenv("LOG_SQL_DSN", "sqlite://completed-backfill")
+	initCol()
+	require.NoError(t, markLogRetryMarkerBackfillCompleted())
+
+	called := false
+	logRetryMarkerBackfillAsyncRunner = func(fn func()) {
+		called = true
+	}
+
+	scheduleLogRetryMarkerBackfill()
+	require.False(t, called)
+}
+
+func TestLogRetryMarkerCompletionKeyUsesHashedLogDBIdentity(t *testing.T) {
+	originalLogSQLType := common.LogSqlType
+	t.Cleanup(func() {
+		common.LogSqlType = originalLogSQLType
+	})
+
+	common.LogSqlType = common.DatabaseTypeMySQL
+	t.Setenv("LOG_SQL_DSN", "user:secret@tcp(log-one:3306)/logs")
+	firstKey := logRetryMarkerBackfillCompletionKey()
+	require.NotEqual(t, logRetryMarkerBackfillOptionKey, firstKey)
+	require.NotContains(t, firstKey, "secret")
+	require.NotContains(t, firstKey, "log-one")
+
+	require.NoError(t, os.Setenv("LOG_SQL_DSN", "user:secret@tcp(log-two:3306)/logs"))
+	secondKey := logRetryMarkerBackfillCompletionKey()
+	require.NotEqual(t, firstKey, secondKey)
+}
+
+func TestLogRetryMarkerIsRecomputedWhenOtherChanges(t *testing.T) {
+	require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+	t.Cleanup(func() {
+		require.NoError(t, LOG_DB.Where("1 = 1").Delete(&Log{}).Error)
+	})
+
+	log := Log{
+		UserId: 1,
+		Type:   LogTypeConsume,
+		Other: common.MapToJsonStr(map[string]interface{}{
+			"retry_log": true,
+		}),
+	}
+	require.NoError(t, LOG_DB.Create(&log).Error)
+	require.True(t, log.IsRetry)
+
+	log.Other = common.MapToJsonStr(map[string]interface{}{
+		"admin_info": map[string]interface{}{
+			"use_channel": []string{"1"},
+		},
+	})
+	require.NoError(t, LOG_DB.Save(&log).Error)
+
+	var reloaded Log
+	require.NoError(t, LOG_DB.First(&reloaded, log.Id).Error)
+	require.False(t, reloaded.IsRetry)
+}
+
+func newRetryBackfillTestDB(t *testing.T, models ...interface{}) *gorm.DB {
+	t.Helper()
+
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() {
+		require.NoError(t, sqlDB.Close())
+	})
+
+	require.NoError(t, db.AutoMigrate(models...))
+
+	return db
+}
+
+func createRetryFilterLogs(t *testing.T) []Log {
+	t.Helper()
+
+	logs := []Log{
+		{
+			UserId:           1,
+			CreatedAt:        time.Now().Unix() - 10,
+			Type:             LogTypeConsume,
+			Quota:            100,
+			PromptTokens:     5,
+			CompletionTokens: 10,
+			Other: common.MapToJsonStr(map[string]interface{}{
+				"retry_log": true,
+				"admin_info": map[string]interface{}{
+					"use_channel": []string{"1", "2"},
+				},
+			}),
+		},
+		{
+			UserId:           1,
+			CreatedAt:        time.Now().Unix() - 20,
+			Type:             LogTypeConsume,
+			Quota:            200,
+			PromptTokens:     7,
+			CompletionTokens: 8,
+			Other: common.MapToJsonStr(map[string]interface{}{
+				"empty_retry": true,
+				"admin_info": map[string]interface{}{
+					"use_channel": []string{"3"},
+				},
+			}),
+		},
+		{
+			UserId:           1,
+			CreatedAt:        time.Now().Unix() - 30,
+			Type:             LogTypeConsume,
+			Quota:            400,
+			PromptTokens:     11,
+			CompletionTokens: 13,
+			Other: common.MapToJsonStr(map[string]interface{}{
+				"admin_info": map[string]interface{}{
+					"use_channel": []string{"4"},
+				},
+				"empty_output_types": []string{"message", "function_call"},
+			}),
+		},
+		{
+			UserId:           2,
+			CreatedAt:        time.Now().Unix() - 40,
+			Type:             LogTypeConsume,
+			Quota:            800,
+			PromptTokens:     17,
+			CompletionTokens: 19,
+			Other: common.MapToJsonStr(map[string]interface{}{
+				"admin_info": map[string]interface{}{
+					"use_channel": []string{"5"},
+				},
+			}),
+		},
+		{
+			UserId:           2,
+			CreatedAt:        time.Now().Unix() - 50,
+			Type:             LogTypeConsume,
+			Quota:            900,
+			PromptTokens:     23,
+			CompletionTokens: 18,
+			Other: common.MapToJsonStr(map[string]interface{}{
+				"retry_log": true,
+				"admin_info": map[string]interface{}{
+					"use_channel": []string{"6", "7"},
+				},
+			}),
+		},
+		{
+			UserId:           1,
+			CreatedAt:        time.Now().Unix() - 5,
+			Type:             LogTypeError,
+			Quota:            0,
+			PromptTokens:     0,
+			CompletionTokens: 0,
+			Other: common.MapToJsonStr(map[string]interface{}{
+				"retry_log": true,
+				"admin_info": map[string]interface{}{
+					"use_channel": []string{"8"},
+				},
+			}),
+		},
+	}
+	require.NoError(t, LOG_DB.Create(&logs).Error)
+
+	return logs
+}
+
+func TestFormatUserLogDetailExposesOnlyUserAuditContent(t *testing.T) {
+	withLogAuditSettings(t, true, true)
+
+	log := &Log{
+		Id:          42,
+		ChannelName: "secret channel",
+		Other: common.MapToJsonStr(map[string]interface{}{
+			"admin_info": map[string]interface{}{
+				"request_content":            "user prompt",
+				"request_content_truncated":  true,
+				"response_content":           "model answer",
+				"response_content_truncated": true,
+				"local_count_tokens":         true,
+				"use_channel":                []int{1, 2},
+			},
+			"audit_info": map[string]interface{}{
+				"request_content": "stale audit content",
+			},
+			"stream_status": map[string]interface{}{
+				"status": "error",
+			},
+			"is_model_mapped":     true,
+			"upstream_model_name": "private-upstream-model",
+		}),
+	}
+
+	formatUserLog(log)
+
+	other, err := common.StrToMap(log.Other)
+	require.NoError(t, err)
+	require.Equal(t, 42, log.Id)
+	require.Empty(t, log.ChannelName)
 	require.NotContains(t, other, "admin_info")
 	require.NotContains(t, other, "stream_status")
 	require.NotContains(t, other, "is_model_mapped")
 	require.NotContains(t, other, "upstream_model_name")
-	require.Equal(t, 11, logs[0].Id)
 
 	auditInfo, ok := other["audit_info"].(map[string]interface{})
 	require.True(t, ok)
@@ -65,11 +661,75 @@ func TestFormatUserLogsExposesOnlyUserAuditContent(t *testing.T) {
 	require.NotContains(t, auditInfo, "use_channel")
 }
 
+func TestFormatUserLogsStripsAuditContentFromList(t *testing.T) {
+	withLogAuditSettings(t, true, true)
+
+	logs := []*Log{
+		{
+			Id: 42,
+			Other: common.MapToJsonStr(map[string]interface{}{
+				"admin_info": map[string]interface{}{
+					"request_content":            "user prompt",
+					"request_content_truncated":  true,
+					"response_content":           "model answer",
+					"response_content_truncated": true,
+					"local_count_tokens":         true,
+					"use_channel":                []int{1, 2},
+				},
+			}),
+		},
+	}
+
+	formatUserLogs(logs, 10)
+
+	other, err := common.StrToMap(logs[0].Other)
+	require.NoError(t, err)
+	require.Equal(t, 42, logs[0].LogId)
+	require.Equal(t, 11, logs[0].Id)
+	require.NotContains(t, other, "admin_info")
+
+	auditInfo, ok := other["audit_info"].(map[string]interface{})
+	require.True(t, ok)
+	require.NotContains(t, auditInfo, "request_content")
+	require.NotContains(t, auditInfo, "response_content")
+	require.Equal(t, true, auditInfo["request_content_truncated"])
+	require.Equal(t, true, auditInfo["response_content_truncated"])
+}
+
+func TestStripLogAuditContentKeepsAdminMetadata(t *testing.T) {
+	log := &Log{
+		Other: common.MapToJsonStr(map[string]interface{}{
+			"admin_info": map[string]interface{}{
+				"request_content":            "user prompt",
+				"request_content_truncated":  true,
+				"response_content":           "model answer",
+				"response_content_truncated": true,
+				"local_count_tokens":         true,
+				"use_channel":                []int{1, 2},
+			},
+		}),
+	}
+
+	stripLogAuditContent(log)
+
+	other, err := common.StrToMap(log.Other)
+	require.NoError(t, err)
+	adminInfo, ok := other["admin_info"].(map[string]interface{})
+	require.True(t, ok)
+	require.NotContains(t, adminInfo, "request_content")
+	require.NotContains(t, adminInfo, "response_content")
+	require.Equal(t, true, adminInfo["request_content_truncated"])
+	require.Equal(t, true, adminInfo["response_content_truncated"])
+	require.Equal(t, true, adminInfo["local_count_tokens"])
+	require.Contains(t, adminInfo, "use_channel")
+}
+
 func TestFormatUserLogsHidesAuditContentWhenDisabled(t *testing.T) {
 	withLogAuditSettings(t, false, false)
 
 	logs := []*Log{
 		{
+			Id: 42,
 			Other: common.MapToJsonStr(map[string]interface{}{
 				"admin_info": map[string]interface{}{
 					"request_content":  "user prompt",
@@ -83,6 +743,7 @@ func TestFormatUserLogsHidesAuditContentWhenDisabled(t *testing.T) {
 
 	other, err := common.StrToMap(logs[0].Other)
 	require.NoError(t, err)
+	require.Equal(t, 42, logs[0].LogId)
 	require.NotContains(t, other, "admin_info")
 	require.NotContains(t, other, "audit_info")
 }

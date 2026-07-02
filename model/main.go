@@ -1,6 +1,7 @@
 package model
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"github.com/MAX-API-Next/MAX-API/common"
 	"github.com/MAX-API-Next/MAX-API/constant"
 
+	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/glebarez/sqlite"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
@@ -24,6 +26,28 @@ var commonFalseVal string
 
 var logKeyCol string
 var logGroupCol string
+
+const logRetryMarkerBackfillOptionKey = "LogRetryMarkerBackfillCompleted"
+
+var logRetryMarkerBackfillMu sync.Mutex
+
+var logRetryMarkerBackfillAsyncRunner = func(fn func()) {
+	gopool.Go(fn)
+}
+
+func logRetryMarkerBackfillCompletionKey() string {
+	logDSN := strings.TrimSpace(os.Getenv("LOG_SQL_DSN"))
+	if logDSN == "" {
+		return logRetryMarkerBackfillOptionKey
+	}
+
+	if strings.HasPrefix(logDSN, "local") {
+		logDSN = logDSN + "\n" + common.SQLitePath
+	}
+
+	fingerprint := common.Sha1([]byte(common.LogSqlType + "\n" + logDSN))
+	return logRetryMarkerBackfillOptionKey + ":" + fingerprint
+}
 
 func initCol() {
 	// init common column names
@@ -296,6 +320,10 @@ func migrateDB() error {
 			return err
 		}
 	}
+	if os.Getenv("LOG_SQL_DSN") == "" {
+		LOG_DB = DB
+		scheduleLogRetryMarkerBackfill()
+	}
 	return nil
 }
 
@@ -376,7 +404,107 @@ func migrateLOGDB() error {
 	if err = LOG_DB.AutoMigrate(&Log{}); err != nil {
 		return err
 	}
+	scheduleLogRetryMarkerBackfill()
 	return nil
+}
+
+func scheduleLogRetryMarkerBackfill() {
+	if LOG_DB == nil || !LOG_DB.Migrator().HasColumn(&Log{}, "is_retry") {
+		return
+	}
+	if completed, err := isLogRetryMarkerBackfillCompleted(); err == nil && completed {
+		return
+	} else if err != nil {
+		common.SysLog("failed to check log retry marker backfill status: " + err.Error())
+	}
+
+	logRetryMarkerBackfillAsyncRunner(func() {
+		common.SysLog("log retry marker backfill started")
+		if err := backfillLogRetryMarker(); err != nil {
+			common.SysLog("log retry marker backfill failed: " + err.Error())
+			return
+		}
+		common.SysLog("log retry marker backfill finished")
+	})
+}
+
+func backfillLogRetryMarker() error {
+	logRetryMarkerBackfillMu.Lock()
+	defer logRetryMarkerBackfillMu.Unlock()
+
+	if LOG_DB == nil || !LOG_DB.Migrator().HasColumn(&Log{}, "is_retry") {
+		return nil
+	}
+	if completed, err := isLogRetryMarkerBackfillCompleted(); err == nil && completed {
+		return nil
+	} else if err != nil {
+		common.SysLog("failed to check log retry marker backfill status: " + err.Error())
+	}
+
+	const batchSize = 500
+	var lastId int
+	for {
+		var logs []Log
+		if err := LOG_DB.
+			Select("id", "other", "is_retry").
+			Where("id > ? AND is_retry = ?", lastId, false).
+			Order("id asc").
+			Limit(batchSize).
+			Find(&logs).Error; err != nil {
+			return err
+		}
+		if len(logs) == 0 {
+			return markLogRetryMarkerBackfillCompleted()
+		}
+
+		retryIds := make([]int, 0, len(logs))
+		for _, log := range logs {
+			lastId = log.Id
+			if log.IsRetry {
+				continue
+			}
+			if logOtherHasRetryMarker(log.Other) {
+				retryIds = append(retryIds, log.Id)
+			}
+		}
+		if len(retryIds) > 0 {
+			if err := LOG_DB.Model(&Log{}).
+				Where("id IN ?", retryIds).
+				Update("is_retry", true).Error; err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func isLogRetryMarkerBackfillCompleted() (bool, error) {
+	if DB == nil || !DB.Migrator().HasTable(&Option{}) {
+		return false, nil
+	}
+
+	var option Option
+	err := DB.First(&option, commonKeyCol+" = ?", logRetryMarkerBackfillCompletionKey()).Error
+	if err == nil {
+		return option.Value == "true", nil
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	return false, err
+}
+
+func markLogRetryMarkerBackfillCompleted() error {
+	if DB == nil || !DB.Migrator().HasTable(&Option{}) {
+		return nil
+	}
+
+	markerKey := logRetryMarkerBackfillCompletionKey()
+	option := Option{Key: markerKey}
+	if err := DB.FirstOrCreate(&option, Option{Key: markerKey}).Error; err != nil {
+		return err
+	}
+	option.Value = "true"
+	return DB.Save(&option).Error
 }
 
 type sqliteColumnDef struct {

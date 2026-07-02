@@ -53,6 +53,25 @@ type Log struct {
 	RequestId         string `json:"request_id,omitempty" gorm:"type:varchar(64);index:idx_logs_request_id;default:''"`
 	UpstreamRequestId string `json:"upstream_request_id,omitempty" gorm:"type:varchar(128);index:idx_logs_upstream_request_id;default:''"`
 	Other             string `json:"other"`
+	IsRetry           bool   `json:"is_retry" gorm:"default:false;index"`
+	LogId             int    `json:"log_id,omitempty" gorm:"-"`
+}
+
+func (log *Log) BeforeCreate(*gorm.DB) error {
+	log.syncRetryMarker()
+	return nil
+}
+
+func (log *Log) BeforeSave(*gorm.DB) error {
+	log.syncRetryMarker()
+	return nil
+}
+
+func (log *Log) syncRetryMarker() {
+	if log == nil {
+		return
+	}
+	log.IsRetry = logOtherHasRetryMarker(log.Other)
 }
 
 // don't use iota, avoid change log type value
@@ -66,6 +85,47 @@ const (
 	LogTypeRefund  = 6
 	LogTypeLogin   = 7
 )
+
+const LogFilterRetry = "retry"
+
+func applyLogTypeFilter(tx *gorm.DB, logType int) *gorm.DB {
+	if logType == LogTypeUnknown {
+		return tx
+	}
+	return tx.Where("logs.type = ?", logType)
+}
+
+var ensureLogRetryMarkerBackfillCompletedForRead = ensureLogRetryMarkerBackfillCompletedForReadDefault
+
+func applyRetryLogFilter(tx *gorm.DB) (*gorm.DB, error) {
+	if err := ensureLogRetryMarkerBackfillCompletedForRead(); err != nil {
+		return nil, err
+	}
+	return tx.Where("logs.is_retry = ?", true), nil
+}
+
+func ensureLogRetryMarkerBackfillCompletedForReadDefault() error {
+	completed, err := isLogRetryMarkerBackfillCompleted()
+	if err != nil {
+		return fmt.Errorf("failed to check log retry marker backfill status before retry log read: %w", err)
+	}
+	if completed {
+		return nil
+	}
+	if err := backfillLogRetryMarker(); err != nil {
+		return fmt.Errorf("failed to backfill log retry markers before retry log read: %w", err)
+	}
+	return nil
+}
+
+func applyLogFilter(tx *gorm.DB, filter string) (*gorm.DB, error) {
+	switch filter {
+	case LogFilterRetry:
+		return applyRetryLogFilter(tx)
+	default:
+		return tx, nil
+	}
+}
 
 func userVisibleAuditInfo(adminInfoValue interface{}) map[string]interface{} {
 	if !common.LogRequestContentEnabled && !common.LogResponseContentEnabled {
@@ -102,25 +162,94 @@ func userVisibleAuditInfo(adminInfoValue interface{}) map[string]interface{} {
 	return auditInfo
 }
 
+func stripAuditContentFields(auditInfo map[string]interface{}) {
+	if auditInfo == nil {
+		return
+	}
+	delete(auditInfo, "request_content")
+	delete(auditInfo, "response_content")
+}
+
+func stripAuditContentValue(value interface{}) {
+	auditInfo, ok := value.(map[string]interface{})
+	if !ok {
+		return
+	}
+	stripAuditContentFields(auditInfo)
+}
+
+func stripLogAuditContent(log *Log) {
+	if log == nil || strings.TrimSpace(log.Other) == "" {
+		return
+	}
+	otherMap, err := common.StrToMap(log.Other)
+	if err != nil || otherMap == nil {
+		return
+	}
+	stripAuditContentValue(otherMap["admin_info"])
+	stripAuditContentValue(otherMap["audit_info"])
+	log.Other = common.MapToJsonStr(otherMap)
+}
+
+func stripLogsAuditContent(logs []*Log) {
+	for _, log := range logs {
+		stripLogAuditContent(log)
+	}
+}
+
+func logOtherHasRetryMarker(other string) bool {
+	if strings.TrimSpace(other) == "" {
+		return false
+	}
+	otherMap, err := common.StrToMap(other)
+	if err != nil || otherMap == nil {
+		return false
+	}
+	if retryLog, ok := otherMap["retry_log"].(bool); ok && retryLog {
+		return true
+	}
+	if emptyRetry, ok := otherMap["empty_retry"].(bool); ok && emptyRetry {
+		return true
+	}
+	return false
+}
+
+func formatUserLog(log *Log) {
+	if log == nil {
+		return
+	}
+	log.ChannelName = ""
+	log.Other = formatUserLogOther(log.Other, false)
+}
+
+func formatUserLogOther(other string, stripAuditContent bool) string {
+	var otherMap map[string]interface{}
+	otherMap, _ = common.StrToMap(other)
+	if otherMap != nil {
+		auditInfo := userVisibleAuditInfo(otherMap["admin_info"])
+		// Remove admin-only debug fields.
+		delete(otherMap, "admin_info")
+		delete(otherMap, "audit_info")
+		// delete(otherMap, "reject_reason")
+		delete(otherMap, "stream_status")
+		delete(otherMap, "is_model_mapped")
+		delete(otherMap, "upstream_model_name")
+		if auditInfo != nil {
+			if stripAuditContent {
+				stripAuditContentFields(auditInfo)
+			}
+			otherMap["audit_info"] = auditInfo
+		}
+	}
+	return common.MapToJsonStr(otherMap)
+}
+
 func formatUserLogs(logs []*Log, startIdx int) {
 	for i := range logs {
+		realId := logs[i].Id
 		logs[i].ChannelName = ""
-		var otherMap map[string]interface{}
-		otherMap, _ = common.StrToMap(logs[i].Other)
-		if otherMap != nil {
-			auditInfo := userVisibleAuditInfo(otherMap["admin_info"])
-			// Remove admin-only debug fields.
-			delete(otherMap, "admin_info")
-			delete(otherMap, "audit_info")
-			// delete(otherMap, "reject_reason")
-			delete(otherMap, "stream_status")
-			delete(otherMap, "is_model_mapped")
-			delete(otherMap, "upstream_model_name")
-			if auditInfo != nil {
-				otherMap["audit_info"] = auditInfo
-			}
-		}
-		logs[i].Other = common.MapToJsonStr(otherMap)
+		logs[i].Other = formatUserLogOther(logs[i].Other, true)
+		logs[i].LogId = realId
 		logs[i].Id = startIdx + i + 1
 	}
 }
@@ -413,12 +542,10 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 	}
 }
 
-func GetAllLogs(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, startIdx int, num int, channel int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {
-	var tx *gorm.DB
-	if logType == LogTypeUnknown {
-		tx = LOG_DB
-	} else {
-		tx = LOG_DB.Where("logs.type = ?", logType)
+func GetAllLogs(logType int, logFilter string, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, startIdx int, num int, channel int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {
+	tx, err := applyLogFilter(applyLogTypeFilter(LOG_DB, logType), logFilter)
+	if err != nil {
+		return nil, 0, err
 	}
 
 	if tx, err = applyExplicitLogTextFilter(tx, "logs.model_name", modelName); err != nil {
@@ -497,17 +624,16 @@ func GetAllLogs(logType int, startTimestamp int64, endTimestamp int64, modelName
 		}
 	}
 
+	stripLogsAuditContent(logs)
 	return logs, total, err
 }
 
 const logSearchCountLimit = 10000
 
-func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int64, modelName string, tokenName string, startIdx int, num int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {
-	var tx *gorm.DB
-	if logType == LogTypeUnknown {
-		tx = LOG_DB.Where("logs.user_id = ?", userId)
-	} else {
-		tx = LOG_DB.Where("logs.user_id = ? and logs.type = ?", userId, logType)
+func GetUserLogs(userId int, logType int, logFilter string, startTimestamp int64, endTimestamp int64, modelName string, tokenName string, startIdx int, num int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {
+	tx, err := applyLogFilter(applyLogTypeFilter(LOG_DB.Where("logs.user_id = ?", userId), logType), logFilter)
+	if err != nil {
+		return nil, 0, err
 	}
 
 	if tx, err = applyExplicitLogTextFilter(tx, "logs.model_name", modelName); err != nil {
@@ -546,17 +672,57 @@ func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int
 	return logs, total, err
 }
 
+func GetLogById(id int) (*Log, error) {
+	if id <= 0 {
+		return nil, errors.New("invalid log id")
+	}
+	log := &Log{}
+	err := LOG_DB.Where("id = ?", id).First(log).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, errors.New("log not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return log, nil
+}
+
+func GetUserLogById(userId int, id int) (*Log, error) {
+	if id <= 0 {
+		return nil, errors.New("invalid log id")
+	}
+	log := &Log{}
+	err := LOG_DB.Where("id = ? AND user_id = ?", id, userId).First(log).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, errors.New("log not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+	formatUserLog(log)
+	return log, nil
+}
+
 type Stat struct {
 	Quota int `json:"quota"`
 	Rpm   int `json:"rpm"`
 	Tpm   int `json:"tpm"`
 }
 
-func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, channel int, group string) (stat Stat, err error) {
+func SumUsedQuota(logType int, logFilter string, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, channel int, group string) (stat Stat, err error) {
 	tx := LOG_DB.Table("logs").Select("sum(quota) quota")
 
 	// 为rpm和tpm创建单独的查询
 	rpmTpmQuery := LOG_DB.Table("logs").Select("count(*) rpm, sum(prompt_tokens) + sum(completion_tokens) tpm")
+
+	tx, err = applyLogFilter(tx, logFilter)
+	if err != nil {
+		return stat, err
+	}
+	rpmTpmQuery, err = applyLogFilter(rpmTpmQuery, logFilter)
+	if err != nil {
+		return stat, err
+	}
 
 	if tx, err = applyExplicitLogTextFilter(tx, "username", username); err != nil {
 		return stat, err
@@ -570,9 +736,11 @@ func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelNa
 	}
 	if startTimestamp != 0 {
 		tx = tx.Where("created_at >= ?", startTimestamp)
+		rpmTpmQuery = rpmTpmQuery.Where("created_at >= ?", startTimestamp)
 	}
 	if endTimestamp != 0 {
 		tx = tx.Where("created_at <= ?", endTimestamp)
+		rpmTpmQuery = rpmTpmQuery.Where("created_at <= ?", endTimestamp)
 	}
 	if tx, err = applyExplicitLogTextFilter(tx, "model_name", modelName); err != nil {
 		return stat, err
@@ -589,8 +757,13 @@ func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelNa
 		rpmTpmQuery = rpmTpmQuery.Where(logGroupCol+" = ?", group)
 	}
 
-	tx = tx.Where("type = ?", LogTypeConsume)
-	rpmTpmQuery = rpmTpmQuery.Where("type = ?", LogTypeConsume)
+	if logType != LogTypeUnknown {
+		tx = tx.Where("logs.type = ?", logType)
+		rpmTpmQuery = rpmTpmQuery.Where("logs.type = ?", logType)
+	} else if logFilter != LogFilterRetry {
+		tx = tx.Where("logs.type = ?", LogTypeConsume)
+		rpmTpmQuery = rpmTpmQuery.Where("logs.type = ?", LogTypeConsume)
+	}
 
 	// 只统计最近60秒的rpm和tpm
 	rpmTpmQuery = rpmTpmQuery.Where("created_at >= ?", time.Now().Add(-60*time.Second).Unix())

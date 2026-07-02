@@ -16,11 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact https://github.com/MAX-API-Next/MAX-API/issues
 */
-import DOMPurify from 'dompurify'
 import * as katex from 'katex'
 import 'katex/dist/katex.min.css'
 import { Marked, Renderer, type MarkedExtension, type Tokens } from 'marked'
 import { useMemo } from 'react'
+import { sanitizeHtmlWithOptions } from '@/lib/sanitize-core'
 import { cn } from '@/lib/utils'
 
 interface MarkdownProps {
@@ -167,6 +167,28 @@ function escapeHtml(value: string): string {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;')
+}
+
+const allowedUrlProtocols = new Set(['http:', 'https:', 'mailto:', 'tel:'])
+const urlProtocolPattern = /^[a-z][a-z\d+.-]*:/i
+
+function normalizeUrl(value: string): string | null {
+  try {
+    const normalized = encodeURI(value).replace(/%25/g, '%')
+    const protocol = urlProtocolPattern.exec(normalized.trimStart())?.[0].toLowerCase()
+
+    if (protocol && !allowedUrlProtocols.has(protocol)) {
+      return null
+    }
+
+    return normalized
+  } catch {
+    return null
+  }
+}
+
+function sanitizeHtml(html: string): string {
+  return sanitizeHtmlWithOptions(html, sanitizeOptions)
 }
 
 function normalizeMathSource(source: string): string {
@@ -566,7 +588,6 @@ function renderSequenceDiagram(source: string): string {
 function createMarkdownRenderer() {
   const renderer = new Renderer()
   const renderDefaultCode = renderer.code.bind(renderer)
-  const renderDefaultLink = renderer.link.bind(renderer)
 
   renderer.code = (token: Tokens.Code): string => {
     const language = token.lang?.toLowerCase()
@@ -586,13 +607,17 @@ function createMarkdownRenderer() {
     return renderDefaultCode(token)
   }
 
-  renderer.link = (token: Tokens.Link): string => {
-    const html = renderDefaultLink(token)
+  renderer.link = function (this: Renderer, token: Tokens.Link): string {
+    const text = this.parser.parseInline(token.tokens)
+    const href = normalizeUrl(token.href)
 
-    return html.replace(
-      /^<a /,
-      '<a target="_blank" rel="noopener noreferrer" '
-    )
+    if (href === null) {
+      return text
+    }
+
+    const title = token.title ? ` title="${escapeHtml(token.title)}"` : ''
+
+    return `<a href="${escapeHtml(href)}"${title} target="_blank" rel="noopener noreferrer">${text}</a>`
   }
 
   return renderer
@@ -695,10 +720,10 @@ function createMarkdownParser() {
   return parser
 }
 
-function renderMarkdown(markdown: string): string {
+export function renderMarkdown(markdown: string): string {
   const markdownParser = createMarkdownParser()
   const parsedHtml = markdownParser.parse(markdown, markdownOptions)
-  return DOMPurify.sanitize(parsedHtml, sanitizeOptions)
+  return sanitizeHtml(parsedHtml)
 }
 
 export function Markdown(props: MarkdownProps) {

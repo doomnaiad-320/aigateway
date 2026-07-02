@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact https://github.com/MAX-API-Next/MAX-API/issues
 */
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { useQueryClient, useIsFetching } from '@tanstack/react-query'
+import { useIsFetching } from '@tanstack/react-query'
 import { useNavigate, getRouteApi } from '@tanstack/react-router'
 import { type Table } from '@tanstack/react-table'
 import { Eye, EyeOff } from 'lucide-react'
@@ -39,7 +39,11 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { StatusBadge } from '@/components/status-badge'
-import { LOG_TYPE_ALL_VALUE, LOG_TYPE_FILTERS } from '../constants'
+import {
+  LOG_TYPE_ALL_VALUE,
+  LOG_TYPE_FILTER_VALUES,
+  LOG_TYPE_FILTERS,
+} from '../constants'
 import { buildSearchParams } from '../lib/filter'
 import { getDefaultTimeRange } from '../lib/utils'
 import type { CommonLogFilters } from '../types'
@@ -53,12 +57,11 @@ import {
 import { useUsageLogsContext } from './usage-logs-provider'
 
 const route = getRouteApi('/_authenticated/usage-logs/$section')
-const logTypeValues = ['0', '1', '2', '3', '4', '5', '6', '7'] as const
 
-type LogTypeValue = (typeof logTypeValues)[number]
+type LogTypeValue = (typeof LOG_TYPE_FILTER_VALUES)[number]
 
 function isLogTypeValue(value: string): value is LogTypeValue {
-  return (logTypeValues as readonly string[]).includes(value)
+  return LOG_TYPE_FILTER_VALUES.includes(value)
 }
 
 interface CommonLogsFilterBarProps<TData> {
@@ -70,7 +73,6 @@ export function CommonLogsFilterBar<TData>(
 ) {
   const { t } = useTranslation()
   const navigate = useNavigate()
-  const queryClient = useQueryClient()
   const searchParams = route.useSearch()
   const isAdmin = useIsAdmin()
   const { status } = useStatus()
@@ -140,12 +142,12 @@ export function CommonLogsFilterBar<TData>(
       search: {
         ...filterParams,
         type: [logType],
+        pageSize: props.table.getState().pagination.pageSize,
         page: 1,
+        searchVersion: Date.now(),
       },
     })
-    queryClient.invalidateQueries({ queryKey: ['logs'] })
-    queryClient.invalidateQueries({ queryKey: ['usage-logs-stats'] })
-  }, [filters, logType, navigate, queryClient])
+  }, [filters, logType, navigate, props.table])
 
   const handleReset = useCallback(() => {
     const { start, end } = getDefaultTimeRange()
@@ -158,14 +160,14 @@ export function CommonLogsFilterBar<TData>(
       params: { section: 'common' },
       search: {
         page: 1,
+        pageSize: 100,
         type: [LOG_TYPE_ALL_VALUE],
         startTime: start.getTime(),
         endTime: end.getTime(),
+        searchVersion: undefined,
       },
     })
-    queryClient.invalidateQueries({ queryKey: ['logs'] })
-    queryClient.invalidateQueries({ queryKey: ['usage-logs-stats'] })
-  }, [navigate, queryClient])
+  }, [navigate])
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
