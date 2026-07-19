@@ -53,9 +53,15 @@ interface ModelOption {
 interface GroupOption {
   label: string
   value: string
-  ratio?: number
+  ratio?: number | string
   desc?: string
   description?: string
+}
+
+function shouldShowGroupRatio(ratio: GroupOption['ratio']) {
+  if (ratio === undefined || ratio === '') return false
+  const numeric = typeof ratio === 'number' ? ratio : Number(ratio)
+  return !Number.isNaN(numeric) && numeric !== 0
 }
 
 interface ModelSelectorProps {
@@ -92,6 +98,7 @@ const ModelTriggerButton = React.forwardRef<
       'flex h-8 items-center gap-2 border px-3 font-medium',
       'justify-center p-0 sm:w-auto sm:justify-start sm:px-3',
       'w-8',
+      'min-w-0 sm:max-w-48 md:max-w-64',
       'bg-background text-foreground',
       'hover:bg-accent transition-colors',
       'focus:!ring-0 focus:!outline-none',
@@ -128,6 +135,7 @@ const GroupTriggerButton = React.forwardRef<
       'flex h-8 items-center gap-2 border px-3 font-medium',
       'justify-center p-0 sm:w-auto sm:justify-start sm:px-3',
       'w-8',
+      'min-w-0 sm:max-w-40 md:max-w-52',
       'bg-background text-foreground',
       'hover:bg-accent transition-colors',
       'focus:!ring-0 focus:!outline-none',
@@ -421,7 +429,7 @@ export const GroupSelector: React.FC<GroupSelectorProps> = React.memo(
                     {(group.desc || group.description) && (
                       <div className='text-muted-foreground truncate text-[9px] leading-tight'>
                         {group.desc || group.description}
-                        {group.ratio && (
+                        {shouldShowGroupRatio(group.ratio) && (
                           <>
                             {' · '}
                             {t('Ratio: {{value}}', { value: group.ratio })}
@@ -483,7 +491,7 @@ export const GroupSelector: React.FC<GroupSelectorProps> = React.memo(
                           {(group.desc || group.description) && (
                             <div className='text-muted-foreground mt-0.5 text-xs'>
                               {group.desc || group.description}
-                              {group.ratio && (
+                              {shouldShowGroupRatio(group.ratio) && (
                                 <>
                                   {' · '}
                                   {t('Ratio: {{value}}', {
@@ -568,20 +576,199 @@ export const ModelGroupSelector: React.FC<ModelGroupSelectorProps> = ({
   className,
   disabled = false,
 }) => {
-  return (
-    <div className={cn('flex items-center gap-2', className)}>
-      <GroupSelector
-        selectedGroup={selectedGroup}
-        groups={groups}
-        onGroupChange={onGroupChange}
-        disabled={disabled}
-      />
-      <ModelSelector
-        selectedModel={selectedModel}
-        models={models}
-        onModelChange={onModelChange}
-        disabled={disabled}
-      />
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
+  const isMobile = useIsMobile()
+
+  const currentModel = useMemo(
+    () => models.find((model) => model.value === selectedModel),
+    [models, selectedModel]
+  )
+  const currentGroup = useMemo(
+    () => groups.find((group) => group.value === selectedGroup),
+    [groups, selectedGroup]
+  )
+  const filteredModels = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase()
+    if (!query) {
+      return models
+    }
+
+    return models.filter((model) => {
+      const searchableText = [
+        model.label,
+        model.value,
+        model.description || '',
+        model.category || '',
+      ]
+        .join(' ')
+        .toLowerCase()
+
+      return searchableText.includes(query)
+    })
+  }, [models, searchQuery])
+
+  const handleModelChange = useCallback(
+    (value: string) => {
+      onModelChange(value)
+      setOpen(false)
+      setSearchQuery('')
+    },
+    [onModelChange]
+  )
+
+  const handleGroupChange = useCallback(
+    (value: string) => {
+      onGroupChange(value)
+      setSearchQuery('')
+    },
+    [onGroupChange]
+  )
+
+  const renderTrigger = () => (
+    <Button
+      aria-expanded={open}
+      className={cn(
+        'h-8 max-w-[15rem] justify-start gap-2 border px-2.5 font-medium shadow-none',
+        'bg-background/80 hover:bg-accent/70 text-foreground',
+        'focus:!ring-0 focus:!outline-none',
+        className
+      )}
+      disabled={disabled}
+      role='combobox'
+      size='sm'
+      variant='outline'
+    >
+      <CpuIcon className='text-muted-foreground size-4 shrink-0' />
+      <span className='min-w-0 truncate text-xs'>
+        {currentModel?.label || t('Model')}
+      </span>
+      <span className='bg-muted text-muted-foreground hidden max-w-20 shrink-0 rounded px-1.5 py-0.5 text-[10px] sm:inline-flex'>
+        {currentGroup?.label || t('Group')}
+      </span>
+      <ChevronsUpDown className='text-muted-foreground ml-auto size-3.5 shrink-0 opacity-60' />
+    </Button>
+  )
+
+  const renderGroupList = () => (
+    <div className='flex min-w-0 flex-col gap-2'>
+      <div className='text-muted-foreground px-1 text-[11px] leading-4 font-medium'>
+        {t('Model Group')}
+      </div>
+      <div className='grid gap-1'>
+        {groups.map((group) => {
+          const isSelected = selectedGroup === group.value
+
+          return (
+            <button
+              className={cn(
+                'flex min-w-0 items-center justify-between gap-2 rounded-md px-2.5 py-2 text-left text-[12px] leading-4 transition-colors',
+                isSelected
+                  ? 'bg-primary/10 text-foreground'
+                  : 'text-muted-foreground hover:bg-accent hover:text-foreground'
+              )}
+              disabled={disabled}
+              key={group.value}
+              onClick={() => handleGroupChange(group.value)}
+              type='button'
+            >
+              <span className='min-w-0 truncate font-medium'>
+                {group.label}
+              </span>
+              <Check
+                className={cn(
+                  'size-3.5 shrink-0',
+                  isSelected ? 'opacity-100' : 'opacity-0'
+                )}
+              />
+            </button>
+          )
+        })}
+      </div>
     </div>
+  )
+
+  const renderModelList = () => (
+    <Command
+      className='min-w-0 rounded-lg border-0 bg-transparent p-1'
+      filter={() => 1}
+      shouldFilter={false}
+    >
+      <CommandInput
+        className='h-8 text-[13px]'
+        onValueChange={setSearchQuery}
+        placeholder={t('Search models...')}
+        value={searchQuery}
+      />
+      <CommandList className={isMobile ? 'max-h-[45vh]' : 'max-h-[20rem]'}>
+        {filteredModels.length === 0 ? (
+          <div className='text-muted-foreground px-3 py-8 text-center text-[12px] leading-5'>
+            {t('No model found.')}
+          </div>
+        ) : (
+          <CommandGroup className='p-1'>
+            {filteredModels.map((model) => (
+              <CommandItem
+                className='mb-0.5 flex items-center justify-between rounded-md px-2 py-1.5 text-[12px] leading-4 transition-colors'
+                key={model.value}
+                onSelect={handleModelChange}
+                value={model.value}
+              >
+                <span className='min-w-0 truncate font-medium'>
+                  {model.label}
+                </span>
+                <Check
+                  className={cn(
+                    'size-3.5 shrink-0',
+                    selectedModel === model.value ? 'opacity-100' : 'opacity-0'
+                  )}
+                />
+              </CommandItem>
+            ))}
+          </CommandGroup>
+        )}
+      </CommandList>
+    </Command>
+  )
+
+  const renderContent = () => (
+    <div className='grid gap-3 p-2 md:grid-cols-[9.5rem_minmax(0,1fr)]'>
+      {renderGroupList()}
+      <div className='min-w-0 overflow-hidden rounded-lg border'>
+        {renderModelList()}
+      </div>
+    </div>
+  )
+
+  return (
+    <>
+      {isMobile ? (
+        <Drawer open={open} onOpenChange={setOpen}>
+          <DrawerTrigger asChild>{renderTrigger()}</DrawerTrigger>
+          <DrawerContent className='flex max-h-[80vh] min-h-[60vh] flex-col'>
+            <DrawerHeader className='pb-3 text-left'>
+              <DrawerTitle>{t('Select Model')}</DrawerTitle>
+            </DrawerHeader>
+            <div className='min-h-0 flex-1 overflow-y-auto px-4 pb-5'>
+              {renderContent()}
+            </div>
+          </DrawerContent>
+        </Drawer>
+      ) : (
+        <Popover open={open} onOpenChange={setOpen}>
+          <PopoverTrigger render={renderTrigger()} />
+          <PopoverContent
+            align='end'
+            className='bg-popover z-50 w-[34rem] max-w-[calc(100vw-2rem)] rounded-xl border p-0 shadow-lg'
+            collisionPadding={8}
+            side='top'
+            sideOffset={8}
+          >
+            {renderContent()}
+          </PopoverContent>
+        </Popover>
+      )}
+    </>
   )
 }

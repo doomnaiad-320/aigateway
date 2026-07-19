@@ -1,4 +1,4 @@
-<div align="center">
+﻿<div align="center">
 
 ![max-api](/web/default/public/logo.png)
 
@@ -9,7 +9,7 @@
 <p align="center">
   <strong>简体中文</strong> |
   <a href="./README.zh_TW.md">繁體中文</a> |
-  <a href="./README.md">English</a> |
+  <a href="./README.en.md">English</a> |
   <a href="./README.fr.md">Français</a> |
   <a href="./README.ja.md">日本語</a>
 </p>
@@ -52,6 +52,8 @@
 
 MAX API 是由来自科研机构和高校的 AGI 爱好者组织发起、维护和长期运营的 AI 模型治理、AgentOps 与应用服务基础设施项目，面向开发者、研究者、团队和组织提供稳定、可复用的服务层能力。项目关注 AI 应用落地后的持续运营问题：模型越来越多、供应商接口频繁变化、Agent 调用链路变长、成本和审计压力增加。MAX API 在应用、Agent、用户、组织和上游模型服务之间提供统一的接入、鉴权、路由、计费、观测和治理层，让 AI 应用更稳定、更可控地运行。
 
+换句话说，MAX API 不只是请求转发器，而是面向 AI-ready 应用和 Agent 工作负载的可运营网关：在统一模型协议与供应商差异的同时，把突发流量、长流式响应、大请求体、多节点缓存、成本审计和性能观测放进同一套治理边界。
+
 持续投入方向：
 
 - **AI 模型治理**：持续跟踪 OpenAI、Azure OpenAI、AWS Bedrock、Vertex AI、Ollama，以及 DeepSeek、通义千问 / 阿里云百炼、智谱 GLM、Kimi、豆包 / 火山引擎、腾讯混元、百度文心 / 千帆、讯飞星火、MiniMax、零一万物、硅基流动等模型与平台的模型更新、接口变化、参数差异、价格规则和任务协议；同时关注 Dify、RAGFlow、Kling、Seedance 等应用和多模态生态的接入形态，通过渠道、模型映射、协议转换、路径覆盖和可配置任务协议，把分散模型能力纳入统一治理。
@@ -83,6 +85,7 @@ MAX API 当前版本发布分为正式版和 Preview 预览版。Preview 预览�
 - **渠道配置平面**：通过能力矩阵、表单校验、模型发现和协议模板，降低新增上游渠道、迁移供应商和维护非标准接口时的误配置风险。
 - **协议与供应商适配层**：持续跟踪海外官方接口、国产模型平台接口（DeepSeek、通义、智谱、火山引擎、百度千帆等）以及各类 OpenAI 兼容 / 非标准接口的变化，并规范化为稳定的应用侧接口。
 - **成本、额度与可靠性治理**：支持渠道路由、加权分发、失败重试、限流、预扣费、失败退款，以及表达式计费、固定价格、任务 rate-card、倍率计费和用量统计。
+- **性能与可扩展性治理**：通过 Redis / 内存缓存、模型请求限流、流式超时与大响应缓冲、请求体上限、磁盘缓存、Pyroscope 性能采样和优雅关闭，支撑单机到多节点部署的稳定运行。
 - **组织级运营与审计层**：为团队、研究机构、企业和社区服务提供用户管理、分组管理、私有化部署、数据留存、审计和持续运营优化能力。
 - **可复用治理模板**：沉淀渠道模板、任务协议模板、价格配置、部署实践和运维经验，降低新模型、新供应商和新 Agent 场景的接入成本。
 
@@ -98,7 +101,7 @@ MAX API 的设计把 AI 模型和 AI Agent 的运行过程纳入可配置、可�
 | 上游渠道 | 供应商渠道、权重、分组、状态、密钥、Base URL、路径覆盖、能力矩阵、配置校验、模型发现和失败重试 | 降低单一供应商不可用、涨价、限流、误配置或接口变化带来的风险 |
 | 协议格式 | OpenAI Compatible、Responses、Claude Messages、Gemini、Realtime、通用视频任务协议等协议入口和转换 | 让应用侧尽量面对稳定接口，而不是直接承担各家协议差异 |
 | Agent 令牌 | API Key、令牌分组、模型范围、额度限制、过期时间和访问控制 | 为 Agent、工作流和工具调用分配独立、可回收、可限额的访问凭据 |
-| 用量与成本 | 请求日志、用量统计、表达式计费、分阶段计费 JSON、任务 rate-card、预扣费和失败退款 | 把模型调用成本拆到用户、令牌、模型、渠道和分组维度 |
+| 用量与成本 | 请求日志、用量统计、表达式计费、分阶段计费 JSON、任务 rate-card、预扣费和失败退款 | 把模型调用成本拆到用户、分组、令牌、模型、渠道和节点维度 |
 | 异步任务 | 视频等任务提交、轮询、状态映射、结果代理和任务计费 | 统一治理长耗时、多状态、多上游格式的多模态任务 |
 | 审计与安全 | 管理员侧日志审计、错误日志、请求限制、流式超时、登录与权限控制 | 在私有化部署和合规场景中提供可控的审计边界，敏感内容审计集中放在安全与限制中管理 |
 | 组织运营 | 用户、分组、余额、支付、系统设置、数据看板和运维配置 | 支撑团队、研究机构、企业或社区服务的持续运营 |
@@ -119,6 +122,9 @@ MAX API 的设计把 AI 模型和 AI Agent 的运行过程纳入可配置、可�
 ## 🚀 快速开始
 
 默认使用 SQLite，本地体验无需额外数据库。
+
+> [!WARNING]
+> SQLite 仅适合本地体验、开发和小规模测试。正式/生产环境不建议使用 SQLite：在并发请求、多实例部署、大量日志与用量数据、数据库迁移、备份恢复或长事务场景下，可能出现锁等待、写入阻塞、迁移耗时或失败，以及可用性和数据维护问题。正式环境请使用 MySQL ≥ 5.7.8 或 PostgreSQL ≥ 9.6，并配置可靠的备份与恢复方案。
 
 ```bash
 # 1. 拉取镜像
@@ -163,8 +169,8 @@ docker compose up -d
 | 渠道能力矩阵 | 渠道编辑界面展示 `chat/completions`、`responses`、`Claude Messages`、`Gemini native`、`embeddings`、`images`、`audio`、`rerank`、`video tasks`、`model discovery` 等能力状态，减少管理员对渠道能力的猜测 |
 | 渠道配置校验 | 在保存前检查 API Key、模型列表、Base URL、额外配置、JSON 对象、Vertex AI 区域、Codex 凭证、模型发现能力和视频任务路径占位符等常见问题 |
 | 多模态模型治理 | 支持聊天、图像、视频、音频、嵌入、重排序、实时对话等场景，并对视频等异步任务提供提交、轮询、状态映射和结果代理 |
-| 通用视频任务协议 | 支持将不同视频上游的任务提交、查询、进度、状态映射、错误消息和结果 URL 路径统一配置到渠道中，默认使用 `/v1/videos/create` 与 `/v1/videos/{task_id}` |
-| 协议转换与自定义上游 | 支持 OpenAI Compatible、Claude Messages、Gemini 等格式之间的转换与适配，也支持配置合法授权的上游地址、路径覆盖和任务协议解析规则 |
+| 通用视频任务协议 | 支持将不同视频上游的任务提交、查询、进度、状态映射、错误消息和结果 URL 路径统一配置到渠道中；请求体透传和改写复用渠道设置，默认路径为 `/v1/videos/create` 与 `/v1/videos/{task_id}` |
+| 协议转换与自定义上游 | 支持 OpenAI Compatible、Responses、Chat Completions、Claude Messages、Gemini 等格式之间的转换与适配，也支持配置合法授权的上游地址、路径覆盖和任务协议解析规则 |
 
 ### AI Agent 治理 / AgentOps
 
@@ -173,7 +179,7 @@ docker compose up -d
 | Agent 令牌隔离 | 可为 Agent、工作流、插件、工具调用或用户创建独立 API Key，并配置模型范围、额度、过期时间和分组 |
 | 模型访问控制 | 通过用户、令牌、分组、模型限制和渠道策略控制 Agent 能调用哪些模型、走哪些渠道、消耗多少额度 |
 | 调用链路观测 | 提供请求日志、用量统计、渠道命中、耗时、错误和重试信息，帮助定位 Agent 调用失败、成本异常和上游波动 |
-| 成本归因 | 支持按模型、渠道、用户、分组和令牌维度统计成本与用量，方便核算不同 Agent 或业务线成本 |
+| 成本归因 | 支持按模型、渠道、用户、分组、令牌和节点维度统计成本与用量，方便核算不同 Agent、业务线或部署节点成本 |
 | 管理员审计 | 私有部署场景可按合规要求启用管理员侧日志审计能力，普通用户日志接口会过滤管理员专用审计字段 |
 | 运营看板 | 提供面向管理员的统计分析、用户管理、渠道管理、系统设置和运维分析能力 |
 
@@ -195,6 +201,17 @@ docker compose up -d
 - 支持渠道加权随机、失败重试、禁用渠道绕过和模型级路由，降低上游异常对应用和 Agent 的影响。
 - 支持 Redis 缓存与内存缓存，适配单机和多机部署。
 
+### 性能与可扩展性治理
+
+| 能力 | 说明 |
+|------|------|
+| 缓存与多节点扩展 | 单机可使用内存缓存，多机可接入 Redis；用户、令牌、渠道亲和、额度相关缓存减少重复数据库访问，并通过 `SESSION_SECRET`、`CRYPTO_SECRET`、`NODE_NAME` 保持会话、加密和日志归属一致 |
+| 请求限流与容量保护 | 支持全局 API / Web 限流、关键接口限流、搜索限流、模型请求限流和按分组配置的模型请求配额；可使用 Redis 或内存计数器 |
+| 流式与大请求控制 | 支持 `STREAMING_TIMEOUT`、`STREAM_SCANNER_MAX_BUFFER_MB`、`MAX_REQUEST_BODY_MB`、`MAX_FILE_DOWNLOAD_MB` 等配置，控制长流式响应、大行 SSE、解压后请求体和远程文件下载大小 |
+| 中继连接调优 | 支持 `RELAY_TIMEOUT`、`RELAY_IDLE_CONN_TIMEOUT`、`RELAY_MAX_IDLE_CONNS`、`RELAY_MAX_IDLE_CONNS_PER_HOST` 配置上游 HTTP 连接池与超时策略 |
+| 磁盘缓存与性能观测 | 系统性能设置可启用大请求体磁盘缓存、配置缓存阈值和容量；运维接口可查看 / 清理磁盘缓存，并可通过 Pyroscope 采集 CPU、内存、goroutine、mutex 和 block profile |
+| 平滑退出与数据落盘 | 关闭进程时支持 `SHUTDOWN_TIMEOUT_SECONDS` 和 `QUOTA_DATA_CACHE_SAVE_TIMEOUT_SECONDS`，尽量在退出前完成 HTTP 关闭和额度缓存保存 |
+
 ### 安全与组织管理
 
 - 支持 JWT、WebAuthn/Passkeys、OAuth、OIDC、Telegram、Discord、LinuxDO 等登录方式。
@@ -213,6 +230,7 @@ docker compose up -d
 | Agent 访问 | Agent 直接持有上游 Key，难以回收和限额 | 为 Agent 分配独立令牌，并限制模型、额度、过期时间和分组 |
 | 协议差异 | 应用自行适配 Claude、Gemini、Responses 等格式 | 网关统一做协议转换和供应商适配 |
 | 失败处理 | 应用自行实现重试、降级和错误归一 | 渠道失败自动重试、加权路由和错误处理 |
+| 性能与扩展 | 应用自行处理超时、限流、连接池和缓存 | 网关集中提供流式超时、请求限制、Redis / 内存缓存、连接池调优和性能观测 |
 | 成本统计 | 各平台账单分散，难以按用户或 Agent 核算 | 统一额度、计费、用量统计和消费日志，可按令牌和模型归因 |
 | 审计边界 | 应用侧分散记录，权限和留存策略不统一 | 管理员侧统一审计入口，普通用户日志过滤管理员专用字段 |
 | 私有化 | 密钥、日志和计费策略分散 | 自托管，自主掌控密钥、数据、日志和策略 |
@@ -275,17 +293,17 @@ flowchart LR
 | 类型 | 说明 |
 |------|------|
 | OpenAI-Compatible | Chat Completions、Embeddings、Images、Audio 等兼容接口，可作为多数应用和 Agent 的通用模型入口 |
-| OpenAI Responses | Responses 格式请求、中继与兼容能力，适合逐步接入新的 OpenAI 应用协议 |
+| OpenAI Responses | Responses 格式请求、中继与 Responses ↔ Chat Completions 兼容转换，适合逐步接入新的 OpenAI 应用协议 |
 | Claude Messages | Claude Messages 格式与 OpenAI 兼容格式转换，降低应用侧多协议维护成本 |
-| Google Gemini | Gemini 聊天、文本和部分转换能力 |
+| Google Gemini | Gemini 聊天、文本，以及 `/v1/responses` 兼容转换能力 |
 | Azure OpenAI | Azure OpenAI 与 Realtime 相关接口 |
 | AWS Bedrock | Bedrock Runtime 相关模型接入 |
 | 上游平台和应用生态 | AWS、Azure、Vertex、Ollama、Codex、Dify、RAGFlow、Kling、Seedance 等平台或应用形态可按渠道能力接入治理 |
 | 国产模型与平台 | 内置 DeepSeek、通义千问 / 阿里云百炼、智谱 GLM、Kimi、豆包 / 火山引擎、腾讯混元、百度文心 / 千帆、讯飞星火、MiniMax、零一万物、硅基流动等适配器或兼容接入能力 |
 | `rerank` | Cohere、Jina 等重排序模型，可用于检索增强和 Agent 检索链路 |
 | Midjourney / Suno / Dify | 图像、音乐、工作流等服务适配 |
-| 视频任务接口 | 支持 `/v1/videos/create`、`/v1/videos/{task_id}` 等视频生成任务的提交、轮询、状态映射、结果代理和参数化任务计费 |
-| 自定义上游 | 支持配置合法授权的上游接口地址、协议适配规则、路径覆盖、状态映射、错误消息路径和任务结果解析 |
+| 视频任务接口 | 支持 `/v1/videos/create`、`/v1/videos/{task_id}` 等视频生成任务的提交、请求体透传或参数覆盖、轮询、状态映射、结果代理和参数化任务计费 |
+| 自定义上游 | 支持配置合法授权的上游接口地址、协议适配规则、Responses / Chat 转换、路径覆盖、状态映射、错误消息路径和任务结果解析 |
 
 ### 支持的主要接口
 
@@ -365,10 +383,11 @@ flowchart LR
 
 视频模型供应商的接口经常在路径、任务 ID、状态字段、进度字段、错误字段和结果 URL 字段上不一致。MAX API 将原先面向单一模型的任务协议能力扩展为通用视频任务协议，适用于 OpenAI、Ali、Gemini、MiniMax、Vertex AI、VolcEngine、Kling、Jimeng、Vidu、Doubao Video、Sora 等视频任务渠道。
 
-支持两种配置层级：
+支持的配置层级：
 
 - **仅路径覆盖**：只配置 `submit_path` 和 `query_path`，系统仍使用对应渠道的官方响应解析逻辑，适合只改上游路径的兼容渠道。
 - **完整协议解析**：设置 `task_protocol = "generic_video_task"`，同时配置任务 ID、状态、进度、结果 URL、错误消息和状态映射路径，适合非标准视频任务响应。
+- **请求体处理**：通用视频任务协议不再单独定义请求体生成模式。需要原样透传客户端 JSON 时使用渠道设置里的 `Pass Through Body`；需要字段改写、默认值或 header 联动时使用已有的 `Param Override`。
 
 默认任务路径：
 
@@ -408,6 +427,8 @@ flowchart LR
 
 - **分阶段计费 JSON**：通过 `Tiered billing JSON` 统一维护多个模型的 `{ enabled, expr }` 配置，保存时同步更新 `billing_mode` 与 `billing_expr`。
 - **任务 rate-card JSON**：通过 `task_billing_setting.rate_cards` 统一维护异步任务计费规则，可按 `vendor` 分区维护 Sora、Veo、Seedance、Kling 等视频模型的不同计费表。
+
+Seedance 2.0 等视频模型可按分辨率、视频输入等请求参数参与倍率或 rate-card 计算；使用透传或参数覆盖时，应确保最终提交给上游的字段与计费字段保持一致。
 
 示例结构：
 
@@ -469,10 +490,11 @@ flowchart LR
 | 组件 | 要求 |
 |------|------|
 | 容器引擎 | Docker / Docker Compose |
-| 本地数据库 | SQLite，Docker 部署时需挂载 `/data` |
-| 远程数据库 | MySQL ≥ 5.7.8 或 PostgreSQL ≥ 9.6 |
+| 本地数据库 | SQLite，仅用于本地体验、开发或小规模测试；Docker 部署时需挂载 `/data` |
+| 正式环境数据库 | MySQL ≥ 5.7.8 或 PostgreSQL ≥ 9.6，并配置可靠的备份与恢复方案 |
 | 缓存 | 单机可使用内存缓存，多机部署建议使用 Redis |
 | 前端构建 | 使用 Bun workspace，需保留 `web/package.json` 与 `web/bun.lock` |
+| 源码构建 | 使用仓库 `go.mod` 声明的 Go 版本（当前 Go 1.25.1+）和 `go.sum`；依赖或安全更新后运行 `go mod download`、`go mod verify` 并重新构建 |
 
 ### 推荐环境变量
 
@@ -490,7 +512,7 @@ flowchart LR
 | `MAX_REQUEST_BODY_MB` | 请求体最大大小，按解压后大小计算，超出返回 `413` | `32` |
 | `AZURE_DEFAULT_API_VERSION` | Azure API 默认版本 | `2025-04-01-preview` |
 | `ERROR_LOG_ENABLED` | 错误日志开关 | `false` |
-| `NODE_NAME` | 节点名称，多机部署时便于日志定位 | - |
+| `NODE_NAME` | 节点名称，多机部署时用于日志定位和异步任务结算归属 | - |
 | `PYROSCOPE_URL` | Pyroscope 服务地址 | - |
 | `PYROSCOPE_APP_NAME` | Pyroscope 应用名 | `max-api` |
 | `PYROSCOPE_BASIC_AUTH_USER` | Pyroscope Basic Auth 用户名 | - |
@@ -545,6 +567,9 @@ cd MAX-API
 docker build -t cscitechtop/max-api:latest .
 ```
 
+> [!NOTE]
+> `Dockerfile` 会在镜像构建中下载 Go 模块。宿主机直接构建或依赖 / 安全更新后，请保持 `go.mod` 与 `go.sum` 成对提交，先运行 `go mod download && go mod verify`，再重新构建二进制或镜像；需要刷新基础镜像时可使用 `docker build --pull --no-cache -t cscitechtop/max-api:latest .`。
+
 > [!TIP]
 > 前端使用 Bun workspace。构建上下文中必须保留 `web/package.json`、`web/bun.lock` 和 `web/default/package.json`，否则 `catalog:` 依赖无法解析。
 
@@ -553,7 +578,7 @@ docker build -t cscitechtop/max-api:latest .
 > [!WARNING]
 > - 必须设置相同的 `SESSION_SECRET`，否则不同节点之间登录状态不一致。
 > - 使用共享 Redis 时必须设置相同的 `CRYPTO_SECRET`，否则加密数据无法解密。
-> - 多节点建议设置 `NODE_NAME`，便于在日志和审计信息中定位来源节点。
+> - 多节点建议设置稳定的 `NODE_NAME`，便于在日志、审计信息和异步任务结算中定位来源节点。
 > - 生产环境应使用外部数据库、外部 Redis、HTTPS 反向代理和可靠的备份策略。
 
 ---
@@ -676,6 +701,44 @@ MAX API 不替代 Dify、LangChain、MCP Server、工作流引擎或业务 Agent
 | 最新发布 | [Releases](https://github.com/MAX-API-Next/MAX-API/releases) |
 | DeepWiki | [Ask DeepWiki](https://deepwiki.com/MAX-API-Next/MAX-API) |
 
+### 二次开发与社区鸣谢
+
+如果你基于本项目进行二次开发并仅供自用，欢迎在项目主页、页脚或“关于”页面等明显位置，任选一种方式保留项目来源或社区鸣谢：
+
+- 添加项目地址：[MAX-API-Next/MAX-API](https://github.com/MAX-API-Next/MAX-API)
+- 鸣谢社区：[MAX-API-Next](https://github.com/MAX-API-Next)
+
+参考前端嵌入代码（React / Tailwind CSS，可按需保留其中一项）：
+
+```tsx
+<p className='text-sm text-muted-foreground'>
+  基于{' '}
+  <a
+    href='https://github.com/MAX-API-Next/MAX-API'
+    target='_blank'
+    rel='noopener noreferrer'
+    className='font-medium underline underline-offset-4'
+  >
+    MAX-API-Next/MAX-API
+  </a>{' '}
+  二次开发 · 感谢{' '}
+  <a
+    href='https://github.com/MAX-API-Next'
+    target='_blank'
+    rel='noopener noreferrer'
+    className='font-medium underline underline-offset-4'
+  >
+    MAX-API-Next 社区
+  </a>
+</p>
+```
+
+满足上述任一展示要求并保持链接清晰可见，即自动获得本项目的临时商用授权，无需另行申请或等待确认。该授权为非永久授权，仅在持续满足展示要求期间有效；有效期及后续调整以项目方在本 README 或官方社区发布的最新说明为准。
+
+本项目基于 [One API](https://github.com/songquanpeng/one-api) 和 [New API](https://github.com/QuantumNous/new-api) 开发。现阶段，MAX API 主要在上述项目基础上持续增强 AI API 网关与治理能力、扩展功能并修复问题。商业使用本项目时，还须分别遵守 One API 的 MIT 许可证与 New API 的 AGPLv3 许可证，具体以各上游项目的 `LICENSE` 文件为准；本项目提供的临时商用授权不替代、也不免除相关上游项目的开源许可义务。
+
+如不再满足展示要求，或临时授权到期、被公告调整或终止，仍需按 AGPLv3 或项目方另行书面授权使用本项目。如需长期商用授权，请联系：maxapi@max-api.ai。
+
 欢迎提交 Issue、改进文档、补充供应商适配经验、完善部署方案或贡献代码。
 
 ---
@@ -683,6 +746,8 @@ MAX API 不替代 Dify、LangChain、MCP Server、工作流引擎或业务 Agent
 ## 📜 许可证
 
 本项目采用 [GNU Affero 通用公共许可证 v3.0 (AGPLv3)](./LICENSE) 授权。
+
+除默认的 AGPLv3 授权外，符合上文“二次开发与社区鸣谢”条件的自用二开项目，可按该说明自动获得非永久的临时商用授权。该临时授权仅覆盖 MAX API 项目方有权授权的新增与修改部分，并不包含或代替 One API、New API 等上游项目的许可授权。
 
 如果你修改并通过网络向用户提供本项目服务，请理解并遵守 AGPLv3 对应源码提供等义务。商业合作、机构合作或其他授权问题，请联系：maxapi@max-api.ai。
 

@@ -319,7 +319,7 @@ func (a *TaskAdaptor) EstimateTaskBilling(c *gin.Context, info *relaycommon.Rela
 	if err != nil {
 		return nil, err
 	}
-	body, err := a.convertToRequestPayload(&req, info)
+	body, err := a.resolveBillingRequestPayload(c, &req, info)
 	if err != nil {
 		return nil, err
 	}
@@ -380,7 +380,7 @@ func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq, in
 		Prompt:         req.Prompt,
 		Image:          req.Image,
 		Mode:           taskcommon.DefaultString(req.Mode, "std"),
-		Duration:       fmt.Sprintf("%d", taskcommon.DefaultInt(req.Duration, 5)),
+		Duration:       fmt.Sprintf("%d", taskcommon.DefaultInt(req.DurationValue(), 5)),
 		ModelName:      info.UpstreamModelName,
 		StaticMask:     "",
 		DynamicMasks:   []DynamicMask{},
@@ -399,6 +399,25 @@ func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq, in
 		return nil, errors.Wrap(err, "unmarshal metadata failed")
 	}
 	return &r, nil
+}
+
+func (a *TaskAdaptor) resolveBillingRequestPayload(c *gin.Context, req *relaycommon.TaskSubmitReq, info *relaycommon.RelayInfo) (*requestPayload, error) {
+	if finalBody, ok := relaycommon.GetTaskSubmitRequestBody(c); ok {
+		var body requestPayload
+		if err := common.Unmarshal(finalBody, &body); err == nil && looksLikeKlingRequestPayload(&body) {
+			return &body, nil
+		}
+	}
+	return a.convertToRequestPayload(req, info)
+}
+
+func looksLikeKlingRequestPayload(body *requestPayload) bool {
+	return body != nil && (strings.TrimSpace(body.ModelName) != "" ||
+		strings.TrimSpace(body.Model) != "" ||
+		strings.TrimSpace(body.Prompt) != "" ||
+		strings.TrimSpace(body.Duration) != "" ||
+		len(body.ImageList) > 0 ||
+		len(body.VideoList) > 0)
 }
 
 func (a *TaskAdaptor) getAspectRatio(size string) string {
@@ -483,7 +502,7 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 			taskInfo.Url = video.Url
 		}
 		if tokens, err := strconv.ParseFloat(resPayload.Data.FinalUnitDeduction, 64); err == nil {
-			rounded := int(math.Ceil(tokens))
+			rounded := common.QuotaFromFloat(math.Ceil(tokens))
 			if rounded > 0 {
 				taskInfo.CompletionTokens = rounded
 				taskInfo.TotalTokens = rounded

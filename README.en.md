@@ -1,4 +1,4 @@
-<div align="center">
+﻿<div align="center">
 
 ![max-api](/web/default/public/logo.png)
 
@@ -52,6 +52,8 @@
 
 MAX API is an AI model governance, AgentOps, and application service infrastructure project initiated, maintained, and operated long term by AGI enthusiasts from research institutions and universities. It provides developers, researchers, teams, and organizations with a stable and reusable service layer. The project focuses on the operational problems that appear after AI applications move into real use: more models, frequent upstream API changes, longer Agent call chains, and rising pressure around cost and auditability. MAX API provides a unified access, authentication, routing, billing, observability, and governance layer between applications, Agents, users, organizations, and upstream model providers, helping AI applications run with greater stability and control.
 
+In practice, MAX API is more than a request forwarder. It is an operable gateway for AI-ready applications and Agent workloads, bringing protocol normalization, provider differences, traffic bursts, long streaming responses, large request bodies, multi-node cache, cost audit, and performance observability under one governance boundary.
+
 Ongoing investment areas:
 
 - **AI model governance**: continuously tracks model updates, API changes, parameter differences, pricing rules, and task protocols across OpenAI, Azure OpenAI, AWS Bedrock, Vertex AI, Ollama, and domestic platforms such as DeepSeek, Qwen / Alibaba Cloud Model Studio, Zhipu GLM, Kimi, Doubao / Volcano Engine, Tencent Hunyuan, Baidu ERNIE / Qianfan, iFlytek Spark, MiniMax, 01.AI, and SiliconFlow. It also tracks application and multimodal ecosystems such as Dify, RAGFlow, Kling, and Seedance, bringing distributed model capabilities into unified governance through channels, model mapping, protocol conversion, path overrides, and configurable task protocols.
@@ -83,6 +85,7 @@ In the AGI application era, MAX API focuses on open AI model governance and AI A
 - **Channel configuration plane**: reduces misconfiguration risk when adding upstream channels, migrating providers, or maintaining non-standard APIs through capability matrices, form validation, model discovery, and protocol templates.
 - **Protocol and provider adaptation layer**: continuously tracks official overseas APIs, domestic model platform APIs, and OpenAI-compatible / non-standard interface changes, then normalizes them into stable application-side APIs.
 - **Cost, quota, and reliability governance**: supports channel routing, weighted distribution, retry, rate limiting, pre-charge, failure refund, expression billing, fixed pricing, task rate-cards, multiplier billing, and usage statistics.
+- **Performance and scalability governance**: uses Redis / in-memory cache, model request rate limits, streaming timeouts and large-response buffers, request body limits, disk cache, Pyroscope profiling, and graceful shutdown to support stable single-node and multi-node deployments.
 - **Organization operations and audit layer**: provides user management, group management, private deployment, data retention, audit, and continuous operations optimization for teams, research institutions, enterprises, and community services.
 - **Reusable governance templates**: accumulates channel templates, task protocol templates, pricing configuration, deployment practices, and operations experience to reduce onboarding cost for new models, providers, and Agent scenarios.
 
@@ -98,7 +101,7 @@ MAX API brings AI model and AI Agent execution into a configurable, observable, 
 | Upstream channels | Provider channels, weights, groups, status, keys, Base URL, path overrides, capability matrix, configuration validation, model discovery, and failure retry | Reduce risks from single-provider outages, price changes, rate limits, misconfiguration, or API changes |
 | Protocol formats | OpenAI Compatible, Responses, Claude Messages, Gemini, Realtime, generic video task protocol, and protocol conversion | Let applications face stable interfaces instead of directly handling provider-specific protocol differences |
 | Agent tokens | API keys, token groups, model scopes, quota limits, expiration, and access control | Assign independent, revocable, and quota-limited credentials to Agents, workflows, and tool calls |
-| Usage and cost | Request logs, usage statistics, expression billing, tiered billing JSON, task rate-cards, pre-charge, and failure refund | Attribute model costs to users, tokens, models, channels, and groups |
+| Usage and cost | Request logs, usage statistics, expression billing, tiered billing JSON, task rate-cards, pre-charge, and failure refund | Attribute model costs to users, groups, tokens, models, channels, and nodes |
 | Asynchronous tasks | Video task submission, polling, status mapping, result proxying, and task billing | Govern long-running, multi-state, multi-provider multimodal tasks uniformly |
 | Audit and security | Admin-side log audit, error logs, request limits, streaming timeout, login, and permission control | Provide controlled audit boundaries in private deployment and compliance scenarios; sensitive content audit is managed under Security & Limits |
 | Organization operations | Users, groups, balance, payment, system settings, dashboards, and operations configuration | Support continuous operations for teams, research institutions, enterprises, or community services |
@@ -119,6 +122,9 @@ MAX API brings AI model and AI Agent execution into a configurable, observable, 
 ## 🚀 Quick Start
 
 SQLite is used by default, so local evaluation does not require an external database.
+
+> [!WARNING]
+> SQLite is intended only for local evaluation, development, and small-scale testing. It is not recommended for production: concurrent requests, multi-instance deployments, large log or usage datasets, database migrations, backup and restore operations, and long transactions can cause lock contention, blocked writes, slow or failed migrations, and other availability or data-maintenance problems. Use MySQL ≥ 5.7.8 or PostgreSQL ≥ 9.6 with a reliable backup and recovery plan in production.
 
 ```bash
 # 1. Pull the image
@@ -163,8 +169,8 @@ docker compose up -d
 | Channel capability matrix | Channel editing view shows capability status for `chat/completions`, `responses`, `Claude Messages`, `Gemini native`, `embeddings`, `images`, `audio`, `rerank`, `video tasks`, `model discovery`, and more |
 | Channel configuration validation | Checks API Key, model list, Base URL, extra configuration, JSON objects, Vertex AI region, Codex credentials, model discovery capability, and video task path placeholders before saving |
 | Multimodal model governance | Supports chat, images, video, audio, embeddings, rerank, realtime conversation, and submission/polling/status mapping/result proxying for asynchronous video tasks |
-| Generic video task protocol | Allows task submission, query, progress, status mapping, error message, and result URL paths from different video upstreams to be configured uniformly in a channel; default paths are `/v1/videos/create` and `/v1/videos/{task_id}` |
-| Protocol conversion and custom upstreams | Supports conversion and adaptation among OpenAI Compatible, Claude Messages, Gemini, and other formats, as well as legally authorized upstream URLs, path overrides, and task protocol parsing rules |
+| Generic video task protocol | Allows task submission, query, progress, status mapping, error message, and result URL paths from different video upstreams to be configured uniformly in a channel; request-body passthrough and rewrites use the existing channel settings; default paths are `/v1/videos/create` and `/v1/videos/{task_id}` |
+| Protocol conversion and custom upstreams | Supports conversion and adaptation among OpenAI Compatible, Responses, Chat Completions, Claude Messages, Gemini, and other formats, as well as legally authorized upstream URLs, path overrides, and task protocol parsing rules |
 
 ### AI Agent Governance / AgentOps
 
@@ -173,7 +179,7 @@ docker compose up -d
 | Agent token isolation | Create independent API keys for Agents, workflows, plugins, tool calls, or users, with model scope, quota, expiration, and group settings |
 | Model access control | Control which models an Agent can call, which channels it can use, and how much quota it can consume through users, tokens, groups, model restrictions, and channel policies |
 | Call-chain observability | Provides request logs, usage statistics, channel hits, latency, errors, and retry information to diagnose Agent failures, cost anomalies, and upstream instability |
-| Cost attribution | Tracks cost and usage by model, channel, user, group, and token, making it easier to calculate costs for different Agents or business lines |
+| Cost attribution | Tracks cost and usage by model, channel, user, group, token, and node, making it easier to calculate costs for different Agents, business lines, or deployment nodes |
 | Admin audit | Private deployments can enable admin-side log audit according to compliance requirements; normal user log APIs filter admin-only audit fields |
 | Operations dashboard | Provides admin-facing analytics, user management, channel management, system settings, and operations analysis |
 
@@ -195,6 +201,17 @@ docker compose up -d
 - Supports weighted channel routing, failure retry, disabled-channel bypass, and model-level routing to reduce upstream impact on applications and Agents.
 - Supports Redis and in-memory cache for single-node and multi-node deployments.
 
+### Performance and Scalability Governance
+
+| Capability | Description |
+|------|------|
+| Cache and multi-node scaling | Single-node deployments can use in-memory cache, while multi-node deployments can use Redis; user, token, channel affinity, and quota-related caches reduce repeated database reads, while `SESSION_SECRET`, `CRYPTO_SECRET`, and `NODE_NAME` keep sessions, encryption, and log attribution consistent |
+| Rate limits and capacity protection | Supports global API / Web rate limits, critical endpoint limits, search limits, model request limits, and group-specific model request quotas; counters can use Redis or memory |
+| Streaming and large-request controls | Supports `STREAMING_TIMEOUT`, `STREAM_SCANNER_MAX_BUFFER_MB`, `MAX_REQUEST_BODY_MB`, `MAX_FILE_DOWNLOAD_MB`, and related settings for long streams, large SSE lines, decompressed request bodies, and remote file downloads |
+| Relay connection tuning | Supports `RELAY_TIMEOUT`, `RELAY_IDLE_CONN_TIMEOUT`, `RELAY_MAX_IDLE_CONNS`, and `RELAY_MAX_IDLE_CONNS_PER_HOST` for upstream HTTP timeout and connection-pool behavior |
+| Disk cache and performance observability | System performance settings can enable disk cache for large request bodies and configure cache threshold and capacity; operations endpoints can inspect / clear disk cache, and Pyroscope can collect CPU, memory, goroutine, mutex, and block profiles |
+| Graceful shutdown and data flush | Shutdown supports `SHUTDOWN_TIMEOUT_SECONDS` and `QUOTA_DATA_CACHE_SAVE_TIMEOUT_SECONDS` so the process can close HTTP handling and save quota cache before exit when possible |
+
 ### Security and Organization Management
 
 - Supports JWT, WebAuthn/Passkeys, OAuth, OIDC, Telegram, Discord, LinuxDO, and other login methods.
@@ -213,6 +230,7 @@ docker compose up -d
 | Agent access | Agents directly hold upstream keys, making revocation and quota control difficult | Assign independent tokens to Agents with model, quota, expiration, and group limits |
 | Protocol differences | Applications adapt Claude, Gemini, Responses, and other formats themselves | Gateway handles protocol conversion and provider adaptation |
 | Failure handling | Applications implement retry, fallback, and error normalization themselves | Channel failure retry, weighted routing, and error handling are built in |
+| Performance and scaling | Applications handle timeouts, rate limits, connection pools, and cache themselves | Gateway centralizes streaming timeouts, request limits, Redis / in-memory cache, connection-pool tuning, and performance observability |
 | Cost statistics | Bills are scattered across providers and hard to attribute by user or Agent | Unified quota, billing, usage statistics, and consumption logs, attributable by token and model |
 | Audit boundary | Application-side logging is fragmented and retention/permission policies differ | Unified admin audit entry with normal user logs filtering admin-only fields |
 | Private deployment | Keys, logs, and billing strategies are scattered | Self-hosted control over keys, data, logs, and policies |
@@ -275,17 +293,17 @@ flowchart LR
 | Type | Description |
 |------|------|
 | OpenAI-Compatible | Compatible APIs such as Chat Completions, Embeddings, Images, and Audio, usable as a general model entry point for most applications and Agents |
-| OpenAI Responses | Responses-format requests, relay, and compatibility support for gradually adopting newer OpenAI application protocols |
+| OpenAI Responses | Responses-format requests, relay, and Responses ↔ Chat Completions compatibility conversion for gradually adopting newer OpenAI application protocols |
 | Claude Messages | Conversion between Claude Messages and OpenAI-compatible formats to reduce multi-protocol maintenance on the application side |
-| Google Gemini | Gemini chat, text, and partial conversion capabilities |
+| Google Gemini | Gemini chat, text, and `/v1/responses` compatibility conversion |
 | Azure OpenAI | Azure OpenAI and Realtime related APIs |
 | AWS Bedrock | Bedrock Runtime model access |
 | Upstream platforms and application ecosystem | AWS, Azure, Vertex, Ollama, Codex, Dify, RAGFlow, Kling, Seedance, and similar platforms or applications can be governed according to channel capabilities |
 | Domestic models and platforms | Built-in adapters or compatible access for DeepSeek, Qwen / Alibaba Cloud Model Studio, Zhipu GLM, Kimi, Doubao / Volcano Engine, Tencent Hunyuan, Baidu ERNIE / Qianfan, iFlytek Spark, MiniMax, 01.AI, SiliconFlow, and more |
 | `rerank` | Reranking models such as Cohere and Jina for retrieval augmentation and Agent retrieval chains |
 | Midjourney / Suno / Dify | Adapters for image, music, workflow, and related services |
-| Video task APIs | Supports submission, polling, status mapping, result proxying, and parameterized billing for video generation tasks such as `/v1/videos/create` and `/v1/videos/{task_id}` |
-| Custom upstreams | Supports legally authorized upstream URLs, protocol adaptation rules, path overrides, status mapping, error message paths, and task result parsing |
+| Video task APIs | Supports submission, body passthrough or parameter overrides, polling, status mapping, result proxying, and parameterized billing for video generation tasks such as `/v1/videos/create` and `/v1/videos/{task_id}` |
+| Custom upstreams | Supports legally authorized upstream URLs, protocol adaptation rules, Responses / Chat conversion, path overrides, status mapping, error message paths, and task result parsing |
 
 ### Main Supported Interfaces
 
@@ -365,10 +383,11 @@ Validation covers common issues including:
 
 Video model providers often differ in paths, task IDs, status fields, progress fields, error fields, and result URL fields. MAX API extends the task protocol capability from a single-model feature into a generic video task protocol for OpenAI, Ali, Gemini, MiniMax, Vertex AI, VolcEngine, Kling, Jimeng, Vidu, Doubao Video, Sora, and other video task channels.
 
-Two configuration levels are supported:
+Supported configuration levels:
 
 - **Path override only**: configure only `submit_path` and `query_path`; the system still uses the official response parser of the corresponding channel. This is suitable for compatible channels that only change upstream paths.
 - **Full protocol parsing**: set `task_protocol = "generic_video_task"` and configure paths for task ID, status, progress, result URL, error message, and status mapping. This is suitable for non-standard video task responses.
+- **Request-body handling**: the generic video task protocol no longer defines a separate request-body generation mode. Use the channel-level `Pass Through Body` setting to forward client JSON as-is, and use the existing `Param Override` feature for field rewrites, defaults, or header coordination.
 
 Default task paths:
 
@@ -408,6 +427,8 @@ Model billing in system settings supports two unified JSON maintenance entries:
 
 - **Tiered billing JSON**: maintain `{ enabled, expr }` configuration for multiple models in one `Tiered billing JSON` window; saving updates `billing_mode` and `billing_expr` together.
 - **Task rate-card JSON**: maintain asynchronous task billing rules through `task_billing_setting.rate_cards`, with `vendor` partitions for video models such as Sora, Veo, Seedance, and Kling.
+
+Video models such as Seedance 2.0 can use request parameters such as resolution and video input in multiplier or rate-card billing. When using passthrough or parameter overrides, keep the final upstream request fields aligned with the billing fields.
 
 Example structure:
 
@@ -469,10 +490,11 @@ A task rate-card can match prices by request parameters:
 | Component | Requirement |
 |------|------|
 | Container engine | Docker / Docker Compose |
-| Local database | SQLite; mount `/data` when deploying with Docker |
-| Remote database | MySQL ≥ 5.7.8 or PostgreSQL ≥ 9.6 |
+| Local database | SQLite, only for local evaluation, development, or small-scale testing; mount `/data` when using Docker |
+| Production database | MySQL ≥ 5.7.8 or PostgreSQL ≥ 9.6 with a reliable backup and recovery plan |
 | Cache | In-memory cache for single-node deployments; Redis recommended for multi-node deployments |
 | Frontend build | Bun workspace; keep `web/package.json` and `web/bun.lock` |
+| Source build | Use the Go version declared in `go.mod` (currently Go 1.25.1+) with the repository `go.sum`; after dependency or security updates, run `go mod download`, `go mod verify`, and rebuild |
 
 ### Recommended Environment Variables
 
@@ -490,7 +512,7 @@ A task rate-card can match prices by request parameters:
 | `MAX_REQUEST_BODY_MB` | Maximum request body size after decompression; returns `413` when exceeded | `32` |
 | `AZURE_DEFAULT_API_VERSION` | Default Azure API version | `2025-04-01-preview` |
 | `ERROR_LOG_ENABLED` | Error log switch | `false` |
-| `NODE_NAME` | Node name for multi-node log identification | - |
+| `NODE_NAME` | Node name for multi-node log identification and asynchronous task settlement attribution | - |
 | `PYROSCOPE_URL` | Pyroscope service URL | - |
 | `PYROSCOPE_APP_NAME` | Pyroscope application name | `max-api` |
 | `PYROSCOPE_BASIC_AUTH_USER` | Pyroscope Basic Auth username | - |
@@ -545,6 +567,9 @@ cd MAX-API
 docker build -t cscitechtop/max-api:latest .
 ```
 
+> [!NOTE]
+> `Dockerfile` downloads Go modules during the image build. For host builds or dependency/security updates, keep `go.mod` and `go.sum` committed together, run `go mod download && go mod verify`, then rebuild the binary or image; use `docker build --pull --no-cache -t cscitechtop/max-api:latest .` when base images need to be refreshed.
+
 > [!TIP]
 > The frontend uses Bun workspace. The build context must keep `web/package.json`, `web/bun.lock`, and `web/default/package.json`; otherwise `catalog:` dependencies cannot be resolved.
 
@@ -553,7 +578,7 @@ docker build -t cscitechtop/max-api:latest .
 > [!WARNING]
 > - All nodes must use the same `SESSION_SECRET`; otherwise login state will be inconsistent across nodes.
 > - If shared Redis is used, all nodes must use the same `CRYPTO_SECRET`; otherwise encrypted data cannot be decrypted.
-> - Set `NODE_NAME` for each node to locate source nodes in logs and audit information.
+> - Set a stable `NODE_NAME` for each node to locate source nodes in logs, audit information, and asynchronous task settlement.
 > - Production environments should use an external database, external Redis, HTTPS reverse proxy, and reliable backup strategy.
 
 ---
@@ -676,6 +701,44 @@ The frontend uses Bun workspace, and `catalog:` dependencies are defined in `web
 | Latest releases | [Releases](https://github.com/MAX-API-Next/MAX-API/releases) |
 | DeepWiki | [Ask DeepWiki](https://deepwiki.com/MAX-API-Next/MAX-API) |
 
+### Derivative Use and Community Acknowledgement
+
+If you build a derivative version of this project for your own use, you are welcome to keep the project source or a community acknowledgement clearly visible on the homepage, in the footer, or on the About page by choosing either option below:
+
+- Link to the project: [MAX-API-Next/MAX-API](https://github.com/MAX-API-Next/MAX-API)
+- Acknowledge the community: [MAX-API-Next](https://github.com/MAX-API-Next)
+
+Reference frontend embed code (React / Tailwind CSS; keep either item as needed):
+
+```tsx
+<p className='text-sm text-muted-foreground'>
+  Built from{' '}
+  <a
+    href='https://github.com/MAX-API-Next/MAX-API'
+    target='_blank'
+    rel='noopener noreferrer'
+    className='font-medium underline underline-offset-4'
+  >
+    MAX-API-Next/MAX-API
+  </a>{' '}
+  · Thanks to the{' '}
+  <a
+    href='https://github.com/MAX-API-Next'
+    target='_blank'
+    rel='noopener noreferrer'
+    className='font-medium underline underline-offset-4'
+  >
+    MAX-API-Next community
+  </a>
+</p>
+```
+
+By meeting either attribution requirement above and keeping the link clearly visible, you automatically receive a temporary commercial license for this project, with no separate application or approval required. This is not a perpetual license and remains valid only while the display requirement continues to be met. Its validity period and any later changes are governed by the latest notice published in this README or by the official community.
+
+This project is developed from [One API](https://github.com/songquanpeng/one-api) and [New API](https://github.com/QuantumNous/new-api). At this stage, MAX API builds on those foundations by strengthening its AI API gateway and governance capabilities, expanding features, and fixing bugs. Commercial use must also comply with the One API MIT License and the New API AGPLv3 License, subject to each upstream project's current `LICENSE` file. The temporary commercial license provided by this project does not replace or waive any upstream open-source license obligations.
+
+If the display requirement is no longer met, or the temporary license expires, is amended, or is terminated by notice, you must comply with AGPLv3 or obtain separate written authorization. For a long-term commercial license, contact: maxapi@max-api.ai.
+
 Issues, documentation improvements, provider adaptation experience, deployment practices, and code contributions are welcome.
 
 ---
@@ -683,6 +746,8 @@ Issues, documentation improvements, provider adaptation experience, deployment p
 ## 📜 License
 
 This project is licensed under the [GNU Affero General Public License v3.0 (AGPLv3)](./LICENSE).
+
+In addition to the default AGPLv3 license, self-use derivative projects that meet the “Derivative Use and Community Acknowledgement” conditions above automatically receive the non-perpetual temporary commercial license described there. This temporary license covers only additions and modifications that the MAX API project maintainers have the right to license; it does not include or replace licensing from upstream projects such as One API and New API.
 
 If you modify this project and provide it to users over a network, please understand and comply with AGPLv3 source availability obligations. For commercial cooperation, institutional cooperation, or other licensing questions, contact: maxapi@max-api.ai.
 

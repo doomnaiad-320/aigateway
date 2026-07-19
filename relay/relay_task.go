@@ -126,14 +126,14 @@ func ResolveOriginTask(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskErr
 			if seconds <= 0 {
 				seconds = 4
 			}
-			sizeStr, _ := taskData["size"].(string)
-			if info.PriceData.OtherRatios == nil {
-				info.PriceData.OtherRatios = map[string]float64{}
+			if seconds > relaycommon.MaxTaskDurationSeconds {
+				seconds = relaycommon.MaxTaskDurationSeconds
 			}
-			info.PriceData.OtherRatios["seconds"] = float64(seconds)
-			info.PriceData.OtherRatios["size"] = 1
+			sizeStr, _ := taskData["size"].(string)
+			info.PriceData.AddOtherRatio("seconds", float64(seconds))
+			info.PriceData.AddOtherRatio("size", 1)
 			if sizeStr == "1792x1024" || sizeStr == "1024x1792" {
-				info.PriceData.OtherRatios["size"] = 1.666667
+				info.PriceData.AddOtherRatio("size", 1.666667)
 			}
 		}
 	}
@@ -181,7 +181,13 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		info.PublicTaskID = model.GenerateTaskID()
 	}
 
-	// 4. 价格计算：基础模型价格
+	// 4. 构建最终请求体（含 Param Override），并暴露给任务计费估算。
+	requestBody, taskErr := prepareTaskSubmitRequestBody(c, info, adaptor)
+	if taskErr != nil {
+		return nil, taskErr
+	}
+
+	// 5. 价格计算：基础模型价格
 	info.OriginModelName = modelName
 	priceData, err := helper.ModelPriceHelperPerCall(c, info)
 	if err != nil {
@@ -189,19 +195,17 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}
 	info.PriceData = priceData
 
-	// 5. Prefer a parameterized rate card when the adaptor can normalize the
+	// 6. Prefer a parameterized rate card when the adaptor can normalize the
 	// request. Legacy task models continue to use OtherRatios.
 	taskBillingOverride := false
-	if estimator, ok := adaptor.(taskBillingEstimator); ok {
-		taskBilling, err := estimator.EstimateTaskBilling(c, info)
-		if err != nil {
-			return nil, service.TaskErrorWrapper(err, "task_billing_rule_error", http.StatusBadRequest)
-		}
-		if taskBilling != nil {
-			info.TaskBilling = taskBilling
-			info.PriceData.Quota = taskBilling.Quota
-			taskBillingOverride = true
-		}
+	taskBilling, err := estimateTaskBilling(c, info, adaptor, platform)
+	if err != nil {
+		return nil, service.TaskErrorWrapper(err, "task_billing_rule_error", http.StatusBadRequest)
+	}
+	if taskBilling != nil {
+		info.TaskBilling = taskBilling
+		info.PriceData.Quota = taskBilling.Quota
+		taskBillingOverride = true
 	}
 
 	if !taskBillingOverride {
@@ -212,11 +216,15 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		}
 
 		if !common.StringsContains(constant.TaskPricePatches, modelName) {
+			quotaWithRatios := float64(info.PriceData.Quota)
 			for _, ra := range info.PriceData.OtherRatios {
 				if ra != 1.0 {
-					info.PriceData.Quota = int(float64(info.PriceData.Quota) * ra)
+					quotaWithRatios *= ra
 				}
 			}
+			quota, clamp := common.QuotaFromFloatChecked(quotaWithRatios)
+			info.PriceData.Quota = quota
+			noteTaskQuotaClamp(info, clamp)
 		}
 	}
 
@@ -228,15 +236,12 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		}
 	}
 
-	// 8. 构建请求体
-	requestBody, err := adaptor.BuildRequestBody(c, info)
-	if err != nil {
-		return nil, service.TaskErrorWrapper(err, "build_request_failed", http.StatusInternalServerError)
-	}
-
 	// 9. 发送请求
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
+		if taskErr := taskErrorFromLocalRelayError(err); taskErr != nil {
+			return nil, taskErr
+		}
 		return nil, service.TaskErrorWrapper(err, "do_request_failed", http.StatusInternalServerError)
 	}
 	if resp != nil && resp.StatusCode != http.StatusOK {
@@ -278,25 +283,110 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}, nil
 }
 
+func estimateTaskBilling(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.TaskAdaptor, platform constant.TaskPlatform) (*types.TaskBillingResult, error) {
+	if estimator, ok := adaptor.(taskBillingEstimator); ok {
+		taskBilling, err := estimator.EstimateTaskBilling(c, info)
+		if err != nil || taskBilling != nil {
+			return taskBilling, err
+		}
+	}
+	channelName := ""
+	if adaptor != nil {
+		channelName = adaptor.GetChannelName()
+	}
+	if channelName == "" {
+		channelName = string(platform)
+	}
+	return taskcommon.EstimateGenericTaskBilling(c, info, channelName)
+}
+
+func prepareTaskSubmitRequestBody(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.TaskAdaptor) (io.Reader, *dto.TaskError) {
+	relaycommon.ClearTaskSubmitRequestBody(c)
+	requestBody, err := buildTaskSubmitRequestBody(c, info, adaptor)
+	if err != nil {
+		return nil, taskErrorFromBuildRequestError(err)
+	}
+	if c == nil || c.Request == nil {
+		return requestBody, nil
+	}
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(c.GetHeader("Content-Type"))), "application/json") &&
+		(info == nil || len(info.ParamOverride) == 0) {
+		return requestBody, nil
+	}
+	bodyBytes, err := io.ReadAll(requestBody)
+	if err != nil {
+		return nil, service.TaskErrorWrapper(err, "build_request_failed", http.StatusInternalServerError)
+	}
+	if err := taskcommon.SyncTaskRequestContext(c, bodyBytes); err != nil {
+		return nil, service.TaskErrorWrapper(err, "build_request_failed", http.StatusInternalServerError)
+	}
+	return bytes.NewReader(bodyBytes), nil
+}
+
+func taskErrorFromBuildRequestError(err error) *dto.TaskError {
+	if taskcommon.IsTaskParamOverrideError(err) {
+		return service.TaskErrorLocalFromAPIError(maxAPIErrorFromParamOverride(err))
+	}
+	return service.TaskErrorWrapper(err, "build_request_failed", http.StatusInternalServerError)
+}
+
+func taskErrorFromLocalRelayError(err error) *dto.TaskError {
+	var maxAPIError *types.MaxAPIError
+	if !errors.As(err, &maxAPIError) {
+		return nil
+	}
+	switch maxAPIError.GetErrorCode() {
+	case types.ErrorCodeChannelParamOverrideInvalid, types.ErrorCodeChannelHeaderOverrideInvalid:
+		return service.TaskErrorLocalFromAPIError(maxAPIError)
+	default:
+		return nil
+	}
+}
+
+func buildTaskSubmitRequestBody(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.TaskAdaptor) (io.Reader, error) {
+	requestBody, handled, err := taskcommon.BuildConfiguredTaskPassThroughBody(c, info)
+	if err != nil {
+		return nil, err
+	}
+	if !handled {
+		requestBody, err = adaptor.BuildRequestBody(c, info)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return taskcommon.ApplyTaskParamOverride(requestBody, info)
+}
+
 // recalcQuotaFromRatios 根据 adjustedRatios 重新计算 quota。
 // 公式: baseQuota × ∏(ratio) — 其中 baseQuota 是不含 OtherRatios 的基础额度。
 func recalcQuotaFromRatios(info *relaycommon.RelayInfo, ratios map[string]float64) int {
 	// 从 PriceData 获取不含 OtherRatios 的基础价格
-	baseQuota := info.PriceData.Quota
+	baseQuota := float64(info.PriceData.Quota)
 	// 先除掉原有的 OtherRatios 恢复基础额度
 	for _, ra := range info.PriceData.OtherRatios {
 		if ra != 1.0 && ra > 0 {
-			baseQuota = int(float64(baseQuota) / ra)
+			baseQuota /= ra
 		}
 	}
 	// 应用新的 ratios
-	result := float64(baseQuota)
+	result := baseQuota
 	for _, ra := range ratios {
 		if ra != 1.0 {
 			result *= ra
 		}
 	}
-	return int(result)
+	quota, clamp := common.QuotaFromFloatChecked(result)
+	noteTaskQuotaClamp(info, clamp)
+	return quota
+}
+
+func noteTaskQuotaClamp(info *relaycommon.RelayInfo, clamp *common.QuotaClamp) {
+	if clamp == nil || info == nil {
+		return
+	}
+	if info.QuotaClamp == nil {
+		info.QuotaClamp = clamp
+	}
 }
 
 var fetchRespBuilders = map[int]func(c *gin.Context) (respBody []byte, taskResp *dto.TaskError){

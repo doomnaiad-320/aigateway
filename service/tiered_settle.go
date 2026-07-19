@@ -22,7 +22,7 @@ func BuildTieredTokenParams(usage *dto.Usage, isClaudeUsageSemantic bool, usedVa
 	p := float64(usage.PromptTokens)
 	c := float64(usage.CompletionTokens)
 	cr := float64(usage.PromptTokensDetails.CachedTokens)
-	cc5m := float64(usage.PromptTokensDetails.CachedCreationTokens)
+	cc5m := float64(usage.PromptTokensDetails.CacheCreationTokensTotal())
 	cc1h := float64(0)
 
 	if usage.UsageSemantic == "anthropic" {
@@ -88,6 +88,20 @@ func BuildTieredTokenParams(usage *dto.Usage, isClaudeUsageSemantic bool, usedVa
 	}
 }
 
+func BuildRealtimeTieredTokenParams(usage *dto.RealtimeUsage, usedVars map[string]bool) billingexpr.TokenParams {
+	if usage == nil {
+		return billingexpr.TokenParams{}
+	}
+	normalized := &dto.Usage{
+		PromptTokens:           usage.InputTokens,
+		CompletionTokens:       usage.OutputTokens,
+		TotalTokens:            usage.TotalTokens,
+		PromptTokensDetails:    usage.InputTokenDetails,
+		CompletionTokenDetails: usage.OutputTokenDetails,
+	}
+	return BuildTieredTokenParams(normalized, false, usedVars)
+}
+
 // TryTieredSettle checks if the request uses tiered_expr billing and, if so,
 // computes the actual quota using the frozen BillingSnapshot. Returns:
 //   - ok=true, quota, result  when tiered billing applies
@@ -111,6 +125,8 @@ func TryTieredSettle(relayInfo *relaycommon.RelayInfo, params billingexpr.TokenP
 		}
 		return true, quota, nil
 	}
+
+	noteQuotaClamp(relayInfo, tr.Clamp)
 
 	return true, tr.ActualQuotaAfterGroup, &tr
 }

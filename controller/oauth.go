@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -17,6 +18,62 @@ import (
 // providerParams returns map with Provider key for i18n templates
 func providerParams(name string) map[string]any {
 	return map[string]any{"Provider": name}
+}
+
+func oauthProviderUserUpdateField(provider oauth.Provider) (model.UserUpdateField, bool) {
+	switch provider.(type) {
+	case *oauth.GitHubProvider:
+		return model.UserUpdateFieldGitHubId, true
+	case *oauth.DiscordProvider:
+		return model.UserUpdateFieldDiscordId, true
+	case *oauth.OIDCProvider:
+		return model.UserUpdateFieldOidcId, true
+	case *oauth.LinuxDOProvider:
+		return model.UserUpdateFieldLinuxDOId, true
+	default:
+		return "", false
+	}
+}
+
+func handleOAuthUserLookupError(c *gin.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, model.ErrUserDeleted) {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": "用户已注销"})
+	} else {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+	}
+	return true
+}
+
+type oauthIdentityLookupError struct {
+	provider string
+	err      error
+}
+
+func (e *oauthIdentityLookupError) Error() string {
+	return "OAuth identity lookup failed"
+}
+
+func (e *oauthIdentityLookupError) Unwrap() error {
+	return e.err
+}
+
+func handleOAuthIdentityLookupError(c *gin.Context, provider string, err error) bool {
+	if err == nil {
+		return false
+	}
+	var lookupErr *oauthIdentityLookupError
+	if errors.As(err, &lookupErr) {
+		if lookupErr.provider != "" {
+			provider = lookupErr.provider
+		}
+		err = lookupErr.err
+	}
+	common.SysError(fmt.Sprintf("OAuth identity lookup failed (provider=%s): %v", provider, err))
+	common.ApiErrorI18n(c, i18n.MsgOAuthGetUserErr)
+	return true
 }
 
 // GenerateOAuthCode generates a state code for OAuth CSRF protection
@@ -106,11 +163,18 @@ func HandleOAuth(c *gin.Context) {
 	// 7. Find or create user
 	user, err := findOrCreateOAuthUser(c, provider, oauthUser, session)
 	if err != nil {
+		var lookupErr *oauthIdentityLookupError
+		if errors.As(err, &lookupErr) {
+			handleOAuthIdentityLookupError(c, provider.GetName(), lookupErr)
+			return
+		}
 		switch err.(type) {
 		case *OAuthUserDeletedError:
 			common.ApiErrorI18n(c, i18n.MsgOAuthUserDeleted)
 		case *OAuthRegistrationDisabledError:
 			common.ApiErrorI18n(c, i18n.MsgUserRegisterDisabled)
+		case *OAuthEmailAlreadyTakenError:
+			common.ApiErrorI18n(c, i18n.MsgUserEmailAlreadyTaken)
 		default:
 			common.ApiError(c, err)
 		}
@@ -150,13 +214,21 @@ func handleOAuthBind(c *gin.Context, provider oauth.Provider) {
 	}
 
 	// Check if this OAuth account is already bound (check both new ID and legacy ID)
-	if provider.IsUserIDTaken(oauthUser.ProviderUserID) {
+	taken, err := provider.IsUserIDTaken(oauthUser.ProviderUserID)
+	if handleOAuthIdentityLookupError(c, provider.GetName(), err) {
+		return
+	}
+	if taken {
 		common.ApiErrorI18n(c, i18n.MsgOAuthAlreadyBound, providerParams(provider.GetName()))
 		return
 	}
 	// Also check legacy ID to prevent duplicate bindings during migration period
 	if legacyID, ok := oauthUser.Extra["legacy_id"].(string); ok && legacyID != "" {
-		if provider.IsUserIDTaken(legacyID) {
+		legacyTaken, lookupErr := provider.IsUserIDTaken(legacyID)
+		if handleOAuthIdentityLookupError(c, provider.GetName(), lookupErr) {
+			return
+		}
+		if legacyTaken {
 			common.ApiErrorI18n(c, i18n.MsgOAuthAlreadyBound, providerParams(provider.GetName()))
 			return
 		}
@@ -164,8 +236,12 @@ func handleOAuthBind(c *gin.Context, provider oauth.Provider) {
 
 	// Get current user from session
 	session := sessions.Default(c)
-	id := session.Get("id")
-	user := model.User{Id: id.(int)}
+	id, ok := sessionUserID(session.Get("id"))
+	if !ok {
+		common.ApiErrorMsg(c, "用户未登录或登录状态已失效")
+		return
+	}
+	user := model.User{Id: id}
 	err = user.FillUserById()
 	if err != nil {
 		common.ApiError(c, err)
@@ -183,7 +259,12 @@ func handleOAuthBind(c *gin.Context, provider oauth.Provider) {
 	} else {
 		// Built-in provider: update user record directly
 		provider.SetProviderUserID(&user, oauthUser.ProviderUserID)
-		err = user.Update(false)
+		updateField, ok := oauthProviderUserUpdateField(provider)
+		if !ok {
+			common.ApiError(c, fmt.Errorf("unsupported built-in OAuth provider: %s", provider.GetName()))
+			return
+		}
+		err = user.UpdateFields(false, updateField)
 		if err != nil {
 			common.ApiError(c, err)
 			return
@@ -200,9 +281,16 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 	user := &model.User{}
 
 	// Check if user already exists with new ID
-	if provider.IsUserIDTaken(oauthUser.ProviderUserID) {
+	taken, err := provider.IsUserIDTaken(oauthUser.ProviderUserID)
+	if err != nil {
+		return nil, &oauthIdentityLookupError{provider: provider.GetName(), err: err}
+	}
+	if taken {
 		err := provider.FillUserByProviderID(user, oauthUser.ProviderUserID)
 		if err != nil {
+			if errors.Is(err, model.ErrUserDeleted) {
+				return nil, &OAuthUserDeletedError{}
+			}
 			return nil, err
 		}
 		// Check if user has been deleted
@@ -214,9 +302,16 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 
 	// Try to find user with legacy ID (for GitHub migration from login to numeric ID)
 	if legacyID, ok := oauthUser.Extra["legacy_id"].(string); ok && legacyID != "" {
-		if provider.IsUserIDTaken(legacyID) {
+		legacyTaken, lookupErr := provider.IsUserIDTaken(legacyID)
+		if lookupErr != nil {
+			return nil, &oauthIdentityLookupError{provider: provider.GetName(), err: lookupErr}
+		}
+		if legacyTaken {
 			err := provider.FillUserByProviderID(user, legacyID)
 			if err != nil {
+				if errors.Is(err, model.ErrUserDeleted) {
+					return nil, &OAuthUserDeletedError{}
+				}
 				return nil, err
 			}
 			if user.Id != 0 {
@@ -257,7 +352,13 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 		user.DisplayName = provider.GetName() + " User"
 	}
 	if oauthUser.Email != "" {
-		user.Email = oauthUser.Email
+		user.Email = model.NormalizeEmail(oauthUser.Email)
+		if err := model.EnsureEmailAvailable(user.Email, 0); err != nil {
+			if errors.Is(err, model.ErrEmailAlreadyTaken) {
+				return nil, &OAuthEmailAlreadyTakenError{}
+			}
+			return nil, err
+		}
 	}
 	user.Role = common.RoleCommonUser
 	user.Status = common.UserStatusEnabled
@@ -272,7 +373,7 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 	// Use transaction to ensure user creation and OAuth binding are atomic
 	if genericProvider, ok := provider.(*oauth.GenericOAuthProvider); ok {
 		// Custom provider: create user and binding in a transaction
-		err := model.DB.Transaction(func(tx *gorm.DB) error {
+		err := model.WithNormalizedEmailWriteTx(user.Email, func(tx *gorm.DB) error {
 			// Create user
 			if err := user.InsertWithTx(tx, inviterId); err != nil {
 				return err
@@ -298,7 +399,7 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 		user.FinalizeOAuthUserCreation(inviterId)
 	} else {
 		// Built-in provider: create user and update provider ID in a transaction
-		err := model.DB.Transaction(func(tx *gorm.DB) error {
+		err := model.WithUserOAuthIdentityWriteTx(user.Email, func(tx *gorm.DB) error {
 			// Create user
 			if err := user.InsertWithTx(tx, inviterId); err != nil {
 				return err
@@ -306,6 +407,9 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 
 			// Set the provider user ID on the user model and update
 			provider.SetProviderUserID(user, oauthUser.ProviderUserID)
+			if err := user.ValidateOAuthIdentityLengths(); err != nil {
+				return err
+			}
 			if err := tx.Model(user).Updates(map[string]interface{}{
 				"github_id":   user.GitHubId,
 				"discord_id":  user.DiscordId,
@@ -341,6 +445,12 @@ type OAuthRegistrationDisabledError struct{}
 
 func (e *OAuthRegistrationDisabledError) Error() string {
 	return "registration is disabled"
+}
+
+type OAuthEmailAlreadyTakenError struct{}
+
+func (e *OAuthEmailAlreadyTakenError) Error() string {
+	return "email is already in use"
 }
 
 // handleOAuthError handles OAuth errors and returns translated message

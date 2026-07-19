@@ -61,6 +61,64 @@ func ParseRedisOption() *redis.Options {
 	return opt
 }
 
+var redisIncrWithTTLScript = redis.NewScript(`
+local ttl = redis.call("PTTL", KEYS[1])
+if ttl > 0 then
+	redis.call("INCRBY", KEYS[1], ARGV[1])
+	redis.call("PEXPIRE", KEYS[1], ttl)
+	return 1
+end
+return 0
+`)
+
+var redisHIncrByWithTTLScript = redis.NewScript(`
+local ttl = redis.call("PTTL", KEYS[1])
+if ttl > 0 then
+	redis.call("HINCRBY", KEYS[1], ARGV[1], ARGV[2])
+	redis.call("PEXPIRE", KEYS[1], ttl)
+	return 1
+end
+return 0
+`)
+
+const redisCacheVersionSequenceKey = "cache-version:sequence"
+
+var redisGetOrInitCacheVersionScript = redis.NewScript(`
+local current = redis.call("GET", KEYS[1])
+if current then
+	return current
+end
+local next = redis.call("INCR", KEYS[2])
+redis.call("SET", KEYS[1], next)
+return next
+`)
+
+var redisInvalidateVersionedHashScript = redis.NewScript(`
+local current = tonumber(redis.call("GET", KEYS[1]) or "0")
+local sequence = tonumber(redis.call("GET", KEYS[2]) or "0")
+if current > sequence then
+	redis.call("SET", KEYS[2], current)
+	sequence = current
+end
+local next = redis.call("INCR", KEYS[2])
+redis.call("SET", KEYS[1], next)
+redis.call("DEL", KEYS[3])
+return next
+`)
+
+var redisDeleteVersionedHashScript = redis.NewScript(`
+local current = tonumber(redis.call("GET", KEYS[1]) or "0")
+local sequence = tonumber(redis.call("GET", KEYS[2]) or "0")
+if current > sequence then
+	redis.call("SET", KEYS[2], current)
+end
+redis.call("DEL", KEYS[3])
+redis.call("DEL", KEYS[1])
+return 1
+`)
+
+var errRedisCacheVersionChanged = errors.New("redis cache version changed")
+
 func RedisSet(key string, value string, expiration time.Duration) error {
 	if DebugEnabled {
 		SysLog(fmt.Sprintf("Redis SET: key=%s, value=%s, expiration=%v", key, value, expiration))
@@ -110,10 +168,34 @@ func RedisHSetObj(key string, obj interface{}, expiration time.Duration) error {
 	}
 	ctx := context.Background()
 
-	data := make(map[string]interface{})
+	data, err := redisHashData(obj)
+	if err != nil {
+		return err
+	}
 
-	// 使用反射遍历结构体字段
-	v := reflect.ValueOf(obj).Elem()
+	txn := RDB.TxPipeline()
+	txn.HSet(ctx, key, data)
+
+	// 只有在 expiration 大于 0 时才设置过期时间
+	if expiration > 0 {
+		txn.Expire(ctx, key, expiration)
+	}
+
+	_, err = txn.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to execute transaction: %w", err)
+	}
+	return nil
+}
+
+func redisHashData(obj interface{}) (map[string]interface{}, error) {
+	value := reflect.ValueOf(obj)
+	if value.Kind() != reflect.Ptr || value.IsNil() || value.Elem().Kind() != reflect.Struct {
+		return nil, fmt.Errorf("obj must be a non-nil pointer to a struct, got %T", obj)
+	}
+
+	data := make(map[string]interface{})
+	v := value.Elem()
 	t := v.Type()
 	for i := 0; i < v.NumField(); i++ {
 		field := t.Field(i)
@@ -142,20 +224,94 @@ func RedisHSetObj(key string, obj interface{}, expiration time.Duration) error {
 		// 其他类型直接转换为字符串
 		data[field.Name] = fmt.Sprintf("%v", value.Interface())
 	}
+	return data, nil
+}
 
-	txn := RDB.TxPipeline()
-	txn.HSet(ctx, key, data)
+// RedisGetCacheVersion reads a version used to fence cache-aside refills.
+// A missing key is initialized from one shared monotonic sequence so deleting
+// an entity's version marker never reuses its prior generation.
+func RedisGetCacheVersion(key string) (int64, error) {
+	result, err := redisGetOrInitCacheVersionScript.Run(
+		context.Background(), RDB, []string{key, redisCacheVersionSequenceKey},
+	).Int64()
+	return result, err
+}
 
-	// 只有在 expiration 大于 0 时才设置过期时间
-	if expiration > 0 {
-		txn.Expire(ctx, key, expiration)
-	}
-
-	_, err := txn.Exec(ctx)
+// RedisHSetObjIfVersion stores a DB snapshot only while its cache generation
+// is unchanged. WATCH makes the comparison and write safe across processes.
+func RedisHSetObjIfVersion(key, versionKey string, expectedVersion int64, obj interface{}, expiration time.Duration) (bool, error) {
+	data, err := redisHashData(obj)
 	if err != nil {
-		return fmt.Errorf("failed to execute transaction: %w", err)
+		return false, err
 	}
-	return nil
+	return redisHSetIfVersion(key, versionKey, expectedVersion, data, expiration)
+}
+
+// RedisHSetFieldIfVersion is the field-level variant used by narrow cache
+// refills that must not overwrite unrelated hash fields.
+func RedisHSetFieldIfVersion(key, versionKey string, expectedVersion int64, field string, value interface{}, expiration time.Duration) (bool, error) {
+	return redisHSetIfVersion(key, versionKey, expectedVersion, map[string]interface{}{field: value}, expiration)
+}
+
+func redisHSetIfVersion(key, versionKey string, expectedVersion int64, data map[string]interface{}, expiration time.Duration) (bool, error) {
+	stored := false
+	ctx := context.Background()
+	err := RDB.Watch(ctx, func(tx *redis.Tx) error {
+		version, err := tx.Get(ctx, versionKey).Int64()
+		if errors.Is(err, redis.Nil) {
+			// A deleted version key must not reset the fence to the initial
+			// generation. All live cache readers obtain a non-negative version;
+			// treating a missing key as -1 rejects stale in-flight refills.
+			version, err = -1, nil
+		}
+		if err != nil {
+			return err
+		}
+		if version != expectedVersion {
+			return errRedisCacheVersionChanged
+		}
+
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.HSet(ctx, key, data)
+			if expiration > 0 {
+				pipe.Expire(ctx, key, expiration)
+			}
+			return nil
+		})
+		if err == nil {
+			stored = true
+		}
+		return err
+	}, versionKey)
+	if errors.Is(err, errRedisCacheVersionChanged) || errors.Is(err, redis.TxFailedErr) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return stored, nil
+}
+
+// RedisInvalidateVersionedHash advances the shared generation and removes the
+// cached hash atomically, preventing older DB snapshots from refilling it.
+func RedisInvalidateVersionedHash(key, versionKey string) error {
+	_, err := redisInvalidateVersionedHashScript.Run(
+		context.Background(), RDB,
+		[]string{versionKey, redisCacheVersionSequenceKey, key},
+	).Result()
+	return err
+}
+
+// RedisDeleteVersionedHash removes an entity cache and its generation marker.
+// This is reserved for permanent entity deletion. Cache refills treat a missing
+// generation as a fence miss, so deleting the marker cannot re-admit a snapshot
+// captured before the entity was removed.
+func RedisDeleteVersionedHash(key, versionKey string) error {
+	_, err := redisDeleteVersionedHashScript.Run(
+		context.Background(), RDB,
+		[]string{versionKey, redisCacheVersionSequenceKey, key},
+	).Result()
+	return err
 }
 
 func RedisHGetObj(key string, obj interface{}) error {
@@ -243,31 +399,9 @@ func RedisIncr(key string, delta int64) error {
 	if DebugEnabled {
 		SysLog(fmt.Sprintf("Redis INCR: key=%s, delta=%d", key, delta))
 	}
-	// 检查键的剩余生存时间
-	ttlCmd := RDB.TTL(context.Background(), key)
-	ttl, err := ttlCmd.Result()
-	if err != nil && !errors.Is(err, redis.Nil) {
-		return fmt.Errorf("failed to get TTL: %w", err)
-	}
-
-	// 只有在 key 存在且有 TTL 时才需要特殊处理
-	if ttl > 0 {
-		ctx := context.Background()
-		// 开始一个Redis事务
-		txn := RDB.TxPipeline()
-
-		// 减少余额
-		decrCmd := txn.IncrBy(ctx, key, delta)
-		if err := decrCmd.Err(); err != nil {
-			return err // 如果减少失败，则直接返回错误
-		}
-
-		// 重新设置过期时间，使用原来的过期时间
-		txn.Expire(ctx, key, ttl)
-
-		// 执行事务
-		_, err = txn.Exec(ctx)
-		return err
+	ctx := context.Background()
+	if _, err := redisIncrWithTTLScript.Run(ctx, RDB, []string{key}, delta).Result(); err != nil {
+		return fmt.Errorf("failed to increment key: %w", err)
 	}
 	return nil
 }
@@ -276,25 +410,9 @@ func RedisHIncrBy(key, field string, delta int64) error {
 	if DebugEnabled {
 		SysLog(fmt.Sprintf("Redis HINCRBY: key=%s, field=%s, delta=%d", key, field, delta))
 	}
-	ttlCmd := RDB.TTL(context.Background(), key)
-	ttl, err := ttlCmd.Result()
-	if err != nil && !errors.Is(err, redis.Nil) {
-		return fmt.Errorf("failed to get TTL: %w", err)
-	}
-
-	if ttl > 0 {
-		ctx := context.Background()
-		txn := RDB.TxPipeline()
-
-		incrCmd := txn.HIncrBy(ctx, key, field, delta)
-		if err := incrCmd.Err(); err != nil {
-			return err
-		}
-
-		txn.Expire(ctx, key, ttl)
-
-		_, err = txn.Exec(ctx)
-		return err
+	ctx := context.Background()
+	if _, err := redisHIncrByWithTTLScript.Run(ctx, RDB, []string{key}, field, delta).Result(); err != nil {
+		return fmt.Errorf("failed to increment hash field: %w", err)
 	}
 	return nil
 }

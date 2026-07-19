@@ -1,10 +1,10 @@
 package controller
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"strconv"
 	"strings"
@@ -23,6 +23,7 @@ import (
 
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 type LoginRequest struct {
@@ -30,13 +31,22 @@ type LoginRequest struct {
 	Password string `json:"password"`
 }
 
+var (
+	errUserPasswordUnset    = errors.New("user password is not set")
+	errOriginalPasswordFail = errors.New("original password is incorrect")
+)
+
+// User quota crosses the JSON boundary as a JavaScript number in the default
+// frontend, so management operations must stay within its exact integer range.
+const maxUserQuotaValue = int64(1<<53 - 1)
+
 func Login(c *gin.Context) {
 	if !common.PasswordLoginEnabled {
 		common.ApiErrorI18n(c, i18n.MsgUserPasswordLoginDisabled)
 		return
 	}
 	var loginRequest LoginRequest
-	err := json.NewDecoder(c.Request.Body).Decode(&loginRequest)
+	err := common.DecodeJson(c.Request.Body, &loginRequest)
 	if err != nil {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
@@ -128,6 +138,11 @@ func recordLoginAudit(user *model.User, c *gin.Context) {
 func setupLogin(user *model.User, c *gin.Context) {
 	model.UpdateUserLastLoginAt(user.Id)
 	session := sessions.Default(c)
+	session.Delete(SecureVerificationSessionKey)
+	session.Delete(secureVerificationMethodSessionKey)
+	session.Delete(secureVerificationUserSessionKey)
+	session.Delete(secureVerificationScopeSessionKey)
+	session.Delete(PasskeyReadySessionKey)
 	session.Set("id", user.Id)
 	session.Set("username", user.Username)
 	session.Set("role", user.Role)
@@ -180,8 +195,14 @@ func Register(c *gin.Context) {
 		return
 	}
 	var user model.User
-	err := json.NewDecoder(c.Request.Body).Decode(&user)
+	err := common.DecodeJson(c.Request.Body, &user)
 	if err != nil {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	user.Username = strings.TrimSpace(user.Username)
+	user.Email = model.NormalizeEmail(user.Email)
+	if user.Username == "" {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
@@ -198,8 +219,20 @@ func Register(c *gin.Context) {
 			common.ApiErrorI18n(c, i18n.MsgUserVerificationCodeError)
 			return
 		}
+		if err := model.EnsureEmailAvailable(user.Email, 0); err != nil {
+			if errors.Is(err, model.ErrEmailAlreadyTaken) {
+				common.ApiErrorI18n(c, i18n.MsgUserEmailAlreadyTaken)
+				return
+			}
+			common.ApiErrorI18n(c, i18n.MsgDatabaseError)
+			return
+		}
 	}
-	exist, err := model.CheckUserExistOrDeleted(user.Username, user.Email)
+	emailForExistCheck := ""
+	if common.EmailVerificationEnabled {
+		emailForExistCheck = user.Email
+	}
+	exist, err := model.CheckUserExistOrDeleted(user.Username, emailForExistCheck)
 	if err != nil {
 		common.ApiErrorI18n(c, i18n.MsgDatabaseError)
 		common.SysLog(fmt.Sprintf("CheckUserExistOrDeleted error: %v", err))
@@ -222,8 +255,15 @@ func Register(c *gin.Context) {
 		cleanUser.Email = user.Email
 	}
 	if err := cleanUser.Insert(inviterId); err != nil {
+		if errors.Is(err, model.ErrEmailAlreadyTaken) {
+			common.ApiErrorI18n(c, i18n.MsgUserEmailAlreadyTaken)
+			return
+		}
 		common.ApiError(c, err)
 		return
+	}
+	if common.EmailVerificationEnabled {
+		common.DeleteKey(user.Email, common.EmailVerificationPurpose)
 	}
 
 	// 获取插入后的用户ID
@@ -253,7 +293,7 @@ func Register(c *gin.Context) {
 			ModelLimitsEnabled: false,
 		}
 		if setting.DefaultUseAutoGroup {
-			token.Group = "auto"
+			token.Group = setting.GetDefaultAutoRouteKey()
 		}
 		if err := token.Insert(); err != nil {
 			common.ApiErrorI18n(c, i18n.MsgCreateDefaultTokenErr)
@@ -362,7 +402,7 @@ func GenerateAccessToken(c *gin.Context) {
 		return
 	}
 
-	if err := user.Update(false); err != nil {
+	if err := user.UpdateFields(false, model.UserUpdateFieldAccessToken); err != nil {
 		common.ApiError(c, err)
 		return
 	}
@@ -376,7 +416,7 @@ func GenerateAccessToken(c *gin.Context) {
 }
 
 type TransferAffQuotaRequest struct {
-	Quota int `json:"quota" binding:"required"`
+	Quota int64 `json:"quota" binding:"required"`
 }
 
 func TransferAffQuota(c *gin.Context) {
@@ -412,7 +452,7 @@ func GetAffCode(c *gin.Context) {
 	}
 	if user.AffCode == "" {
 		user.AffCode = common.GetRandomString(4)
-		if err := user.Update(false); err != nil {
+		if err := user.UpdateFields(false, model.UserUpdateFieldAffCode); err != nil {
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,
 				"message": err.Error(),
@@ -563,7 +603,7 @@ func generateDefaultSidebarConfig(userRole int) string {
 	// 普通用户不包含admin区域
 
 	// 转换为JSON字符串
-	configBytes, err := json.Marshal(defaultConfig)
+	configBytes, err := common.Marshal(defaultConfig)
 	if err != nil {
 		common.SysLog("生成默认边栏配置失败: " + err.Error())
 		return ""
@@ -583,6 +623,25 @@ func GetUserModels(c *gin.Context) {
 		return
 	}
 	groups := service.GetUserUsableGroups(user.Group)
+	group := c.Query("group")
+	if group != "" {
+		if _, ok := groups[group]; !ok {
+			c.JSON(http.StatusOK, gin.H{
+				"success": true,
+				"message": "",
+				"data":    []string{},
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "",
+			"data":    model.GetGroupEnabledModels(group),
+		})
+		return
+	}
+
 	var models []string
 	for group := range groups {
 		for _, g := range model.GetGroupEnabledModels(group) {
@@ -601,8 +660,13 @@ func GetUserModels(c *gin.Context) {
 
 func UpdateUser(c *gin.Context) {
 	var updatedUser model.User
-	err := json.NewDecoder(c.Request.Body).Decode(&updatedUser)
+	err := common.DecodeJson(c.Request.Body, &updatedUser)
 	if err != nil || updatedUser.Id == 0 {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	updatedUser.Username = strings.TrimSpace(updatedUser.Username)
+	if updatedUser.Username == "" {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
@@ -689,8 +753,7 @@ func AdminClearUserBinding(c *gin.Context) {
 
 func UpdateSelf(c *gin.Context) {
 	var requestData map[string]interface{}
-	err := json.NewDecoder(c.Request.Body).Decode(&requestData)
-	if err != nil {
+	if err := common.DecodeJson(c.Request.Body, &requestData); err != nil {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
@@ -712,9 +775,7 @@ func UpdateSelf(c *gin.Context) {
 			currentSetting.SidebarModules = sidebarModulesStr
 		}
 
-		// 保存更新后的设置
-		user.SetSetting(currentSetting)
-		if err := user.Update(false); err != nil {
+		if err := model.UpdateUserSetting(user.Id, currentSetting); err != nil {
 			common.ApiErrorI18n(c, i18n.MsgUpdateFailed)
 			return
 		}
@@ -740,9 +801,7 @@ func UpdateSelf(c *gin.Context) {
 			currentSetting.Language = langStr
 		}
 
-		// 保存更新后的设置
-		user.SetSetting(currentSetting)
-		if err := user.Update(false); err != nil {
+		if err := model.UpdateUserSetting(user.Id, currentSetting); err != nil {
 			common.ApiErrorI18n(c, i18n.MsgUpdateFailed)
 			return
 		}
@@ -753,13 +812,12 @@ func UpdateSelf(c *gin.Context) {
 
 	// 原有的用户信息更新逻辑
 	var user model.User
-	requestDataBytes, err := json.Marshal(requestData)
+	requestDataBytes, err := common.Marshal(requestData)
 	if err != nil {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
-	err = json.Unmarshal(requestDataBytes, &user)
-	if err != nil {
+	if err = common.Unmarshal(requestDataBytes, &user); err != nil {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
@@ -774,9 +832,16 @@ func UpdateSelf(c *gin.Context) {
 
 	cleanUser := model.User{
 		Id:          c.GetInt("id"),
-		Username:    user.Username,
 		Password:    user.Password,
 		DisplayName: user.DisplayName,
+	}
+	updateFields := make([]model.UserUpdateField, 0, 2)
+	if _, ok := requestData["display_name"]; ok {
+		updateFields = append(updateFields, model.UserUpdateFieldDisplayName)
+	}
+	if _, ok := requestData["username"]; ok && user.Username != "" {
+		cleanUser.Username = user.Username
+		updateFields = append(updateFields, model.UserUpdateFieldUsername)
 	}
 	if user.Password == "$I_LOVE_U" {
 		user.Password = "" // rollback to what it should be
@@ -784,10 +849,18 @@ func UpdateSelf(c *gin.Context) {
 	}
 	updatePassword, err := checkUpdatePassword(user.OriginalPassword, user.Password, cleanUser.Id)
 	if err != nil {
+		if errors.Is(err, errUserPasswordUnset) {
+			common.ApiErrorI18n(c, i18n.MsgUserPasswordUnset)
+			return
+		}
+		if errors.Is(err, errOriginalPasswordFail) {
+			common.ApiErrorI18n(c, i18n.MsgUserOriginalPasswordError)
+			return
+		}
 		common.ApiError(c, err)
 		return
 	}
-	if err := cleanUser.Update(updatePassword); err != nil {
+	if err := cleanUser.UpdateFields(updatePassword, updateFields...); err != nil {
 		common.ApiError(c, err)
 		return
 	}
@@ -800,19 +873,21 @@ func UpdateSelf(c *gin.Context) {
 }
 
 func checkUpdatePassword(originalPassword string, newPassword string, userId int) (updatePassword bool, err error) {
+	if newPassword == "" {
+		return
+	}
 	var currentUser *model.User
 	currentUser, err = model.GetUserById(userId, true)
 	if err != nil {
 		return
 	}
 
-	// 密码不为空,需要验证原密码
-	// 支持第一次账号绑定时原密码为空的情况
-	if !common.ValidatePasswordAndHash(originalPassword, currentUser.Password) && currentUser.Password != "" {
-		err = fmt.Errorf("原密码错误")
+	if currentUser.Password == "" {
+		err = errUserPasswordUnset
 		return
 	}
-	if newPassword == "" {
+	if !common.ValidatePasswordAndHash(originalPassword, currentUser.Password) {
+		err = errOriginalPasswordFail
 		return
 	}
 	updatePassword = true
@@ -880,7 +955,7 @@ func DeleteSelf(c *gin.Context) {
 
 func CreateUser(c *gin.Context) {
 	var user model.User
-	err := json.NewDecoder(c.Request.Body).Decode(&user)
+	err := common.DecodeJson(c.Request.Body, &user)
 	user.Username = strings.TrimSpace(user.Username)
 	if err != nil || user.Username == "" || user.Password == "" {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
@@ -924,26 +999,50 @@ func CreateUser(c *gin.Context) {
 type ManageRequest struct {
 	Id     int    `json:"id"`
 	Action string `json:"action"`
-	Value  int    `json:"value"`
+	Value  int64  `json:"value"`
 	Mode   string `json:"mode"`
+}
+
+func isValidQuotaOverride(value int64) bool {
+	return value >= 0 && value <= maxUserQuotaValue
+}
+
+func isValidQuotaAddition(current int64, delta int64) bool {
+	if current < -maxUserQuotaValue || current > maxUserQuotaValue || delta <= 0 || delta > maxUserQuotaValue {
+		return false
+	}
+	return current <= maxUserQuotaValue-delta
+}
+
+func isValidQuotaSubtraction(current int64, delta int64) bool {
+	if current < -maxUserQuotaValue || current > maxUserQuotaValue || delta <= 0 || delta > maxUserQuotaValue {
+		return false
+	}
+	return current >= -maxUserQuotaValue+delta
 }
 
 // ManageUser Only admin user can do this
 func ManageUser(c *gin.Context) {
 	var req ManageRequest
-	err := json.NewDecoder(c.Request.Body).Decode(&req)
+	err := common.DecodeJson(c.Request.Body, &req)
 
 	if err != nil {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
-	user := model.User{
-		Id: req.Id,
+	if req.Id <= 0 {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
 	}
+
+	var user model.User
 	// Fill attributes
-	model.DB.Unscoped().Where(&user).First(&user)
-	if user.Id == 0 {
-		common.ApiErrorI18n(c, i18n.MsgUserNotExists)
+	if err := model.DB.Unscoped().Where("id = ?", req.Id).First(&user).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			common.ApiErrorI18n(c, i18n.MsgUserNotExists)
+			return
+		}
+		common.ApiError(c, err)
 		return
 	}
 	myRole := c.GetInt("role")
@@ -1004,6 +1103,10 @@ func ManageUser(c *gin.Context) {
 				common.ApiErrorI18n(c, i18n.MsgUserQuotaChangeZero)
 				return
 			}
+			if !isValidQuotaAddition(user.Quota, req.Value) {
+				common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+				return
+			}
 			if err := model.IncreaseUserQuota(user.Id, req.Value, true); err != nil {
 				common.ApiError(c, err)
 				return
@@ -1016,6 +1119,10 @@ func ManageUser(c *gin.Context) {
 				common.ApiErrorI18n(c, i18n.MsgUserQuotaChangeZero)
 				return
 			}
+			if !isValidQuotaSubtraction(user.Quota, req.Value) {
+				common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+				return
+			}
 			if err := model.DecreaseUserQuota(user.Id, req.Value, true); err != nil {
 				common.ApiError(c, err)
 				return
@@ -1024,10 +1131,17 @@ func ManageUser(c *gin.Context) {
 				"quota": logger.LogQuota(req.Value),
 			})
 		case "override":
+			if !isValidQuotaOverride(req.Value) {
+				common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+				return
+			}
 			oldQuota := user.Quota
 			if err := model.DB.Model(&model.User{}).Where("id = ?", user.Id).Update("quota", req.Value).Error; err != nil {
 				common.ApiError(c, err)
 				return
+			}
+			if err := model.InvalidateUserCache(user.Id); err != nil {
+				common.SysLog(fmt.Sprintf("failed to invalidate user cache for user %d: %s", user.Id, err.Error()))
 			}
 			recordManageAuditFor(c, user.Id, "user.quota_override", map[string]interface{}{
 				"from": logger.LogQuota(oldQuota),
@@ -1044,7 +1158,14 @@ func ManageUser(c *gin.Context) {
 		return
 	}
 
-	if err := user.Update(false); err != nil {
+	var updateFields []model.UserUpdateField
+	switch req.Action {
+	case "disable", "enable":
+		updateFields = []model.UserUpdateField{model.UserUpdateFieldStatus}
+	case "promote", "demote":
+		updateFields = []model.UserUpdateField{model.UserUpdateFieldRole}
+	}
+	if err := user.UpdateFields(false, updateFields...); err != nil {
 		common.ApiError(c, err)
 		return
 	}
@@ -1088,26 +1209,31 @@ func EmailBind(c *gin.Context) {
 		common.ApiError(c, errors.New("invalid request body"))
 		return
 	}
-	email := req.Email
+	email := model.NormalizeEmail(req.Email)
 	code := req.Code
 	if !common.VerifyCodeWithKey(email, code, common.EmailVerificationPurpose) {
 		common.ApiErrorI18n(c, i18n.MsgUserVerificationCodeError)
 		return
 	}
 	session := sessions.Default(c)
-	id := session.Get("id")
+	id, ok := sessionUserID(session.Get("id"))
+	if !ok {
+		common.ApiErrorMsg(c, "用户未登录或登录状态已失效")
+		return
+	}
 	user := model.User{
-		Id: id.(int),
+		Id: id,
 	}
 	err := user.FillUserById()
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	user.Email = email
-	// no need to check if this email already taken, because we have used verification code to check it
-	err = user.Update(false)
-	if err != nil {
+	if err := model.BindEmailToUser(&user, email); err != nil {
+		if errors.Is(err, model.ErrEmailAlreadyTaken) {
+			common.ApiErrorI18n(c, i18n.MsgUserEmailAlreadyTaken)
+			return
+		}
 		common.ApiError(c, err)
 		return
 	}
@@ -1124,6 +1250,11 @@ type topUpRequest struct {
 
 var topUpLocks sync.Map
 var topUpCreateLock sync.Mutex
+
+type topUpLockEntry struct {
+	lock *topUpTryLock
+	refs int
+}
 
 type topUpTryLock struct {
 	ch chan struct{}
@@ -1149,18 +1280,29 @@ func (l *topUpTryLock) Unlock() {
 	}
 }
 
-func getTopUpLock(userID int) *topUpTryLock {
-	if v, ok := topUpLocks.Load(userID); ok {
-		return v.(*topUpTryLock)
-	}
+func acquireTopUpLock(userID int) *topUpLockEntry {
 	topUpCreateLock.Lock()
 	defer topUpCreateLock.Unlock()
 	if v, ok := topUpLocks.Load(userID); ok {
-		return v.(*topUpTryLock)
+		entry := v.(*topUpLockEntry)
+		entry.refs++
+		return entry
 	}
-	l := newTopUpTryLock()
-	topUpLocks.Store(userID, l)
-	return l
+	entry := &topUpLockEntry{lock: newTopUpTryLock(), refs: 1}
+	topUpLocks.Store(userID, entry)
+	return entry
+}
+
+func releaseTopUpLock(userID int, entry *topUpLockEntry) {
+	topUpCreateLock.Lock()
+	defer topUpCreateLock.Unlock()
+	entry.refs--
+	if entry.refs > 0 {
+		return
+	}
+	if current, ok := topUpLocks.Load(userID); ok && current == entry {
+		topUpLocks.Delete(userID)
+	}
 }
 
 func TopUp(c *gin.Context) {
@@ -1170,12 +1312,13 @@ func TopUp(c *gin.Context) {
 	}
 
 	id := c.GetInt("id")
-	lock := getTopUpLock(id)
-	if !lock.TryLock() {
+	lockEntry := acquireTopUpLock(id)
+	defer releaseTopUpLock(id, lockEntry)
+	if !lockEntry.lock.TryLock() {
 		common.ApiErrorI18n(c, i18n.MsgUserTopUpProcessing)
 		return
 	}
-	defer lock.Unlock()
+	defer lockEntry.lock.Unlock()
 	req := topUpRequest{}
 	err := c.ShouldBindJSON(&req)
 	if err != nil {
@@ -1213,6 +1356,21 @@ type UpdateUserSettingRequest struct {
 	RecordIpLog                      bool    `json:"record_ip_log"`
 }
 
+func normalizeNotificationEmail(email string) (string, bool) {
+	email = strings.TrimSpace(email)
+	addr, err := mail.ParseAddress(email)
+	if err != nil || addr.Address != email {
+		return "", false
+	}
+	local, domain, ok := strings.Cut(addr.Address, "@")
+	if !ok || local == "" || domain == "" ||
+		strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") ||
+		strings.Contains(domain, "..") || !strings.Contains(domain, ".") {
+		return "", false
+	}
+	return addr.Address, true
+}
+
 func UpdateUserSetting(c *gin.Context) {
 	var req UpdateUserSettingRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1247,11 +1405,12 @@ func UpdateUserSetting(c *gin.Context) {
 
 	// 如果是邮件类型，验证邮箱地址
 	if req.QuotaWarningType == dto.NotifyTypeEmail && req.NotificationEmail != "" {
-		// 验证邮箱格式
-		if !strings.Contains(req.NotificationEmail, "@") {
+		email, ok := normalizeNotificationEmail(req.NotificationEmail)
+		if !ok {
 			common.ApiErrorI18n(c, i18n.MsgSettingEmailInvalid)
 			return
 		}
+		req.NotificationEmail = email
 	}
 
 	// 如果是Bark类型，验证Bark URL
@@ -1307,13 +1466,19 @@ func UpdateUserSetting(c *gin.Context) {
 	}
 
 	// 构建设置
-	settings := dto.UserSetting{
-		NotifyType:                       req.QuotaWarningType,
-		QuotaWarningThreshold:            req.QuotaWarningThreshold,
-		UpstreamModelUpdateNotifyEnabled: upstreamModelUpdateNotifyEnabled,
-		AcceptUnsetRatioModel:            req.AcceptUnsetModelRatioModel,
-		RecordIpLog:                      req.RecordIpLog,
-	}
+	settings := existingSettings
+	settings.NotifyType = req.QuotaWarningType
+	settings.QuotaWarningThreshold = req.QuotaWarningThreshold
+	settings.UpstreamModelUpdateNotifyEnabled = upstreamModelUpdateNotifyEnabled
+	settings.AcceptUnsetRatioModel = req.AcceptUnsetModelRatioModel
+	settings.RecordIpLog = req.RecordIpLog
+	settings.WebhookUrl = ""
+	settings.WebhookSecret = ""
+	settings.NotificationEmail = ""
+	settings.BarkUrl = ""
+	settings.GotifyUrl = ""
+	settings.GotifyToken = ""
+	settings.GotifyPriority = 0
 
 	// 如果是webhook类型,添加webhook相关设置
 	if req.QuotaWarningType == dto.NotifyTypeWebhook {
@@ -1345,9 +1510,7 @@ func UpdateUserSetting(c *gin.Context) {
 		}
 	}
 
-	// 更新用户设置
-	user.SetSetting(settings)
-	if err := user.Update(false); err != nil {
+	if err := model.UpdateUserSetting(user.Id, settings); err != nil {
 		common.ApiErrorI18n(c, i18n.MsgUpdateFailed)
 		return
 	}

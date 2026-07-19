@@ -132,13 +132,13 @@ func OidcAuth(c *gin.Context) {
 	user := model.User{
 		OidcId: oidcUser.OpenID,
 	}
-	if model.IsOidcIdAlreadyTaken(user.OidcId) {
+	taken, err := model.IsOidcIdAlreadyTaken(user.OidcId)
+	if handleOAuthIdentityLookupError(c, "OIDC", err) {
+		return
+	}
+	if taken {
 		err := user.FillUserByOidcId()
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": err.Error(),
-			})
+		if handleOAuthUserLookupError(c, err) {
 			return
 		}
 	} else {
@@ -198,7 +198,11 @@ func OidcBind(c *gin.Context) {
 	user := model.User{
 		OidcId: oidcUser.OpenID,
 	}
-	if model.IsOidcIdAlreadyTaken(user.OidcId) {
+	taken, err := model.IsOidcIdAlreadyTaken(user.OidcId)
+	if handleOAuthIdentityLookupError(c, "OIDC", err) {
+		return
+	}
+	if taken {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "该 OIDC 账户已被绑定",
@@ -206,16 +210,19 @@ func OidcBind(c *gin.Context) {
 		return
 	}
 	session := sessions.Default(c)
-	id := session.Get("id")
-	// id := c.GetInt("id")  // critical bug!
-	user.Id = id.(int)
+	id, ok := sessionUserID(session.Get("id"))
+	if !ok {
+		common.ApiErrorMsg(c, "用户未登录或登录状态已失效")
+		return
+	}
+	user.Id = id
 	err = user.FillUserById()
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
 	user.OidcId = oidcUser.OpenID
-	err = user.Update(false)
+	err = user.UpdateFields(false, model.UserUpdateFieldOidcId)
 	if err != nil {
 		common.ApiError(c, err)
 		return

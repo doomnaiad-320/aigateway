@@ -130,6 +130,7 @@ export type AuthSettings = {
   EmailDomainRestrictionEnabled: boolean
   EmailAliasRestrictionEnabled: boolean
   EmailDomainWhitelist: string
+  ServerAddress: string
   GitHubOAuthEnabled: boolean
   GitHubClientId: string
   GitHubClientSecret: string
@@ -224,6 +225,7 @@ export type ModelSettings = {
   UserUsableGroups: string
   GroupGroupRatio: string
   AutoGroups: string
+  AutoGroupRoutes: string
   DefaultUseAutoGroup: boolean
   'group_ratio_setting.group_special_usable_group': string
   'channel_affinity_setting.enabled': boolean
@@ -269,6 +271,7 @@ export type BillingSettings = {
   UserUsableGroups: string
   GroupGroupRatio: string
   AutoGroups: string
+  AutoGroupRoutes: string
   DefaultUseAutoGroup: boolean
   'group_ratio_setting.group_special_usable_group': string
   PayAddress: string

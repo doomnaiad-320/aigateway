@@ -1,13 +1,14 @@
 package controller
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/MAX-API-Next/MAX-API/common"
 	"github.com/MAX-API-Next/MAX-API/constant"
+	"github.com/MAX-API-Next/MAX-API/i18n"
 	"github.com/MAX-API-Next/MAX-API/logger"
 	"github.com/MAX-API-Next/MAX-API/middleware"
 	"github.com/MAX-API-Next/MAX-API/model"
@@ -92,6 +93,7 @@ func GetStatus(c *gin.Context) {
 		"password_login_enabled":        common.PasswordLoginEnabled,
 		"password_register_enabled":     common.PasswordRegisterEnabled,
 		"default_use_auto_group":        setting.DefaultUseAutoGroup,
+		"default_auto_route":            setting.GetDefaultAutoRouteKey(),
 		"log_audit_enabled":             common.LogRequestContentEnabled || common.LogResponseContentEnabled,
 		"log_request_content_enabled":   common.LogRequestContentEnabled,
 		"log_response_content_enabled":  common.LogResponseContentEnabled,
@@ -237,12 +239,9 @@ func GetHomePageContent(c *gin.Context) {
 }
 
 func SendEmailVerification(c *gin.Context) {
-	email := c.Query("email")
+	email := model.NormalizeEmail(c.Query("email"))
 	if err := common.Validate.Var(email, "required,email"); err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无效的参数",
-		})
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
 	parts := strings.Split(email, "@")
@@ -283,10 +282,7 @@ func SendEmailVerification(c *gin.Context) {
 	}
 
 	if model.IsEmailAlreadyTaken(email) {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "邮箱地址已被占用",
-		})
+		common.ApiErrorI18n(c, i18n.MsgUserEmailAlreadyTaken)
 		return
 	}
 	code := common.GenerateVerificationCode(6)
@@ -308,15 +304,12 @@ func SendEmailVerification(c *gin.Context) {
 }
 
 func SendPasswordResetEmail(c *gin.Context) {
-	email := c.Query("email")
+	email := model.NormalizeEmail(c.Query("email"))
 	if err := common.Validate.Var(email, "required,email"); err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无效的参数",
-		})
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
-	if model.IsEmailAlreadyTaken(email) {
+	if _, err := model.GetUniqueUserByEmail(email); err == nil {
 		code := common.GenerateVerificationCode(0)
 		common.RegisterVerificationCodeWithKey(email, code, common.PasswordResetPurpose)
 		link := fmt.Sprintf("%s/user/reset?email=%s&token=%s", system_setting.ServerAddress, email, code)
@@ -327,8 +320,10 @@ func SendPasswordResetEmail(c *gin.Context) {
 			"<p>重置链接 %d 分钟内有效，如果不是本人操作，请忽略。</p>", common.SystemName, link, link, common.VerificationValidMinutes)
 		err := common.SendEmail(subject, email, content)
 		if err != nil {
-			logger.LogError(c.Request.Context(), fmt.Sprintf("failed to send password reset email to %s: %s", email, err.Error()))
+			logger.LogError(c.Request.Context(), fmt.Sprintf("failed to send password reset email to %s: %s", common.MaskEmail(email), err.Error()))
 		}
+	} else if !errors.Is(err, model.ErrEmailNotFound) {
+		logger.LogWarn(c.Request.Context(), fmt.Sprintf("skip password reset email for %s: %s", common.MaskEmail(email), err.Error()))
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
@@ -343,28 +338,32 @@ type PasswordResetRequest struct {
 
 func ResetPassword(c *gin.Context) {
 	var req PasswordResetRequest
-	err := json.NewDecoder(c.Request.Body).Decode(&req)
-	if req.Email == "" || req.Token == "" {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无效的参数",
-		})
-		return
-	}
-	if !common.VerifyCodeWithKey(req.Email, req.Token, common.PasswordResetPurpose) {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "重置链接非法或已过期",
-		})
-		return
-	}
-	password := common.GenerateVerificationCode(12)
-	err = model.ResetUserPasswordByEmail(req.Email, password)
+	err := common.DecodeJson(c.Request.Body, &req)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	common.DeleteKey(req.Email, common.PasswordResetPurpose)
+	req.Email = model.NormalizeEmail(req.Email)
+	if req.Email == "" || req.Token == "" {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	password := common.GenerateVerificationCode(12)
+	verified, err := common.VerifyCodeWithKeyAndRun(req.Email, req.Token, common.PasswordResetPurpose, func() error {
+		return model.ResetUserPasswordByEmail(req.Email, password)
+	})
+	if !verified {
+		common.ApiErrorI18n(c, i18n.MsgUserPasswordResetLinkInvalid)
+		return
+	}
+	if err != nil {
+		if errors.Is(err, model.ErrEmailNotFound) || errors.Is(err, model.ErrEmailAmbiguous) {
+			common.ApiErrorI18n(c, i18n.MsgUserPasswordResetLinkInvalid)
+			return
+		}
+		common.ApiError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",

@@ -17,7 +17,7 @@ func insertUserForPaymentGuardTest(t *testing.T, id int, quota int) {
 		Id:       id,
 		Username: "payment_guard_user",
 		Status:   common.UserStatusEnabled,
-		Quota:    quota,
+		Quota:    int64(quota),
 	}
 	require.NoError(t, DB.Create(user).Error)
 }
@@ -89,7 +89,7 @@ func countTopUpsForPaymentGuardTest(t *testing.T, tradeNo string) int64 {
 	return count
 }
 
-func getUserQuotaForPaymentGuardTest(t *testing.T, userID int) int {
+func getUserQuotaForPaymentGuardTest(t *testing.T, userID int) int64 {
 	t.Helper()
 	var user User
 	require.NoError(t, DB.Select("quota").Where("id = ?", userID).First(&user).Error)
@@ -108,7 +108,7 @@ func TestRechargeWaffoPancake_RejectsMismatchedPaymentMethod(t *testing.T) {
 	topUp := GetTopUpByTradeNo("waffo-pancake-guard")
 	require.NotNil(t, topUp)
 	assert.Equal(t, common.TopUpStatusPending, topUp.Status)
-	assert.Equal(t, 0, getUserQuotaForPaymentGuardTest(t, 101))
+	assert.EqualValues(t, 0, getUserQuotaForPaymentGuardTest(t, 101))
 }
 
 func TestUpdatePendingTopUpStatus_RejectsMismatchedPaymentProvider(t *testing.T) {
@@ -212,8 +212,29 @@ func TestPurchaseSubscriptionWithBalance_InsufficientQuotaDoesNotOverdraw(t *tes
 
 	err = PurchaseSubscriptionWithBalance(505, plan.Id)
 	require.Error(t, err)
-	assert.Equal(t, requiredQuota-1, getUserQuotaForPaymentGuardTest(t, 505))
+	assert.EqualValues(t, requiredQuota-1, getUserQuotaForPaymentGuardTest(t, 505))
 	assert.Zero(t, countUserSubscriptionsForPaymentGuardTest(t, 505))
+}
+
+func TestPurchaseSubscriptionWithBalanceRetriesCommittedUserCacheInvalidation(t *testing.T) {
+	truncateTables(t)
+
+	insertUserForPaymentGuardTest(t, 506, 10)
+	plan := insertSubscriptionPlanForPaymentGuardTest(t, 602)
+	plan.PriceAmount = 0
+	plan.UpgradeGroup = "premium"
+	require.NoError(t, DB.Model(plan).Select("price_amount", "upgrade_group").Updates(plan).Error)
+
+	client, _ := useFailingCacheMutationRedis(t, 1)
+	cacheUserForRetryTest(t, client, User{
+		Id: 506, Username: "payment_guard_user", Group: "default", Quota: 10, Status: common.UserStatusEnabled,
+	})
+
+	require.NoError(t, PurchaseSubscriptionWithBalance(506, plan.Id))
+	requireCacheKeyDeletedEventually(t, client, getUserCacheKey(506))
+	var stored User
+	require.NoError(t, DB.First(&stored, 506).Error)
+	assert.Equal(t, "premium", stored.Group)
 }
 
 func TestRedeem_UsedCodeDoesNotDoubleCredit(t *testing.T) {
@@ -235,7 +256,7 @@ func TestRedeem_UsedCodeDoesNotDoubleCredit(t *testing.T) {
 	quota, err = Redeem("redeem-guard-code", 606)
 	require.ErrorIs(t, err, ErrRedeemFailed)
 	assert.Zero(t, quota)
-	assert.Equal(t, 123, getUserQuotaForPaymentGuardTest(t, 606))
+	assert.EqualValues(t, 123, getUserQuotaForPaymentGuardTest(t, 606))
 
 	var reloaded Redemption
 	require.NoError(t, DB.Where("id = ?", redemption.Id).First(&reloaded).Error)
@@ -282,7 +303,7 @@ func TestRedeemRejectsNonPositiveQuotaWithoutUsingCode(t *testing.T) {
 	quota, err := Redeem("redeem-zero-quota", 609)
 	require.ErrorIs(t, err, ErrRedeemFailed)
 	assert.Zero(t, quota)
-	assert.Equal(t, 0, getUserQuotaForPaymentGuardTest(t, 609))
+	assert.EqualValues(t, 0, getUserQuotaForPaymentGuardTest(t, 609))
 
 	var reloaded Redemption
 	require.NoError(t, DB.Where("id = ?", redemption.Id).First(&reloaded).Error)
@@ -309,7 +330,40 @@ func TestRechargeCreemRejectsZeroQuotaBeforeCompletingOrder(t *testing.T) {
 	err := RechargeCreem("creem-zero-quota", "", "", "127.0.0.1")
 	require.Error(t, err)
 	assert.Equal(t, common.TopUpStatusPending, getTopUpStatusForPaymentGuardTest(t, "creem-zero-quota"))
-	assert.Equal(t, 0, getUserQuotaForPaymentGuardTest(t, 610))
+	assert.EqualValues(t, 0, getUserQuotaForPaymentGuardTest(t, 610))
+}
+
+func TestRechargeCreemSkipsDuplicateCustomerEmailBinding(t *testing.T) {
+	truncateTables(t)
+
+	require.NoError(t, DB.Create(&User{
+		Id:       611,
+		Username: "creem-email-owner",
+		Email:    "taken@example.com",
+		AffCode:  "creem611",
+		Status:   common.UserStatusEnabled,
+	}).Error)
+	require.NoError(t, DB.Create(&User{
+		Id:       612,
+		Username: "creem-empty-email",
+		AffCode:  "creem612",
+		Status:   common.UserStatusEnabled,
+	}).Error)
+	insertTopUpForPaymentGuardTest(t, "creem-duplicate-email", 612, PaymentProviderCreem)
+
+	err := RechargeCreem("creem-duplicate-email", " Taken@Example.COM ", "", "127.0.0.1")
+	require.NoError(t, err)
+
+	var got User
+	require.NoError(t, DB.First(&got, 612).Error)
+	assert.Empty(t, got.Email)
+	assert.Empty(t, got.NormalizedEmail)
+	assert.EqualValues(t, 2, got.Quota)
+	assert.Equal(t, common.TopUpStatusSuccess, getTopUpStatusForPaymentGuardTest(t, "creem-duplicate-email"))
+
+	count, err := CountUsersByEmail("taken@example.com")
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, count)
 }
 
 func TestRefundSubscriptionPreConsume_IdempotentDoesNotDoubleRefund(t *testing.T) {

@@ -665,12 +665,14 @@ func buildOpenAIStyleUsageFromClaudeUsage(usage *dto.Usage) dto.Usage {
 		return dto.Usage{}
 	}
 	clone := *usage
+	clone.BillingUsage = dto.CloneBillingUsage(usage.BillingUsage)
 	clone.ClaudeCacheCreation5mTokens, clone.ClaudeCacheCreation1hTokens = service.NormalizeCacheCreationSplit(
 		usage.PromptTokensDetails.CachedCreationTokens,
 		usage.ClaudeCacheCreation5mTokens,
 		usage.ClaudeCacheCreation1hTokens,
 	)
 	cacheCreationTokens := cacheCreationTokensForOpenAIUsage(usage)
+	clone.PromptTokensDetails.CacheWriteTokens = cacheCreationTokens
 	totalInputTokens := usage.PromptTokens + usage.PromptTokensDetails.CachedTokens + cacheCreationTokens
 	clone.PromptTokens = totalInputTokens
 	clone.InputTokens = totalInputTokens
@@ -692,6 +694,9 @@ func buildMessageDeltaPatchUsage(claudeResponse *dto.ClaudeResponse, claudeInfo 
 
 	if usage.InputTokens == 0 && claudeInfo.Usage.PromptTokens > 0 {
 		usage.InputTokens = claudeInfo.Usage.PromptTokens
+	}
+	if usage.OutputTokens == 0 && claudeInfo.Usage.CompletionTokens > 0 {
+		usage.OutputTokens = claudeInfo.Usage.CompletionTokens
 	}
 	if usage.CacheReadInputTokens == 0 && claudeInfo.Usage.PromptTokensDetails.CachedTokens > 0 {
 		usage.CacheReadInputTokens = claudeInfo.Usage.PromptTokensDetails.CachedTokens
@@ -739,6 +744,7 @@ func patchClaudeMessageDeltaUsageData(data string, usage *dto.ClaudeUsage) strin
 	}
 
 	data = setMessageDeltaUsageInt(data, "usage.input_tokens", usage.InputTokens)
+	data = setMessageDeltaUsageInt(data, "usage.output_tokens", usage.OutputTokens)
 	data = setMessageDeltaUsageInt(data, "usage.cache_read_input_tokens", usage.CacheReadInputTokens)
 	data = setMessageDeltaUsageInt(data, "usage.cache_creation_input_tokens", usage.CacheCreationInputTokens)
 
@@ -908,6 +914,9 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 	if claudeInfo.Usage != nil {
 		claudeInfo.Usage.UsageSemantic = "anthropic"
 	}
+	if claudeInfo.Usage != nil && claudeInfo.Usage.BillingUsage == nil {
+		claudeInfo.Usage.BillingUsage = dto.NewClaudeMessagesBillingUsage(buildMessageDeltaPatchUsage(nil, claudeInfo))
+	}
 
 	if info.RelayFormat == types.RelayFormatClaude {
 		//
@@ -968,6 +977,7 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		claudeInfo.Usage.CompletionTokens = claudeResponse.Usage.OutputTokens
 		claudeInfo.Usage.TotalTokens = claudeResponse.Usage.InputTokens + claudeResponse.Usage.OutputTokens
 		claudeInfo.Usage.UsageSemantic = "anthropic"
+		claudeInfo.Usage.BillingUsage = dto.NewClaudeMessagesBillingUsage(claudeResponse.Usage)
 		claudeInfo.Usage.PromptTokensDetails.CachedTokens = claudeResponse.Usage.CacheReadInputTokens
 		claudeInfo.Usage.PromptTokensDetails.CachedCreationTokens = claudeResponse.Usage.CacheCreationInputTokens
 		claudeInfo.Usage.ClaudeCacheCreation5mTokens = claudeResponse.Usage.GetCacheCreation5mTokens()

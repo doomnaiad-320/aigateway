@@ -73,20 +73,13 @@ func WeChatAuth(c *gin.Context) {
 	user := model.User{
 		WeChatId: wechatId,
 	}
-	if model.IsWeChatIdAlreadyTaken(wechatId) {
+	taken, err := model.IsWeChatIdAlreadyTaken(wechatId)
+	if handleOAuthIdentityLookupError(c, "WeChat", err) {
+		return
+	}
+	if taken {
 		err := user.FillUserByWeChatId()
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": err.Error(),
-			})
-			return
-		}
-		if user.Id == 0 {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "用户已注销",
-			})
+		if handleOAuthUserLookupError(c, err) {
 			return
 		}
 	} else {
@@ -151,7 +144,11 @@ func WeChatBind(c *gin.Context) {
 		})
 		return
 	}
-	if model.IsWeChatIdAlreadyTaken(wechatId) {
+	taken, err := model.IsWeChatIdAlreadyTaken(wechatId)
+	if handleOAuthIdentityLookupError(c, "WeChat", err) {
+		return
+	}
+	if taken {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "该微信账号已被绑定",
@@ -159,9 +156,13 @@ func WeChatBind(c *gin.Context) {
 		return
 	}
 	session := sessions.Default(c)
-	id := session.Get("id")
+	id, ok := sessionUserID(session.Get("id"))
+	if !ok {
+		common.ApiErrorMsg(c, "用户未登录或登录状态已失效")
+		return
+	}
 	user := model.User{
-		Id: id.(int),
+		Id: id,
 	}
 	err = user.FillUserById()
 	if err != nil {
@@ -169,7 +170,7 @@ func WeChatBind(c *gin.Context) {
 		return
 	}
 	user.WeChatId = wechatId
-	err = user.Update(false)
+	err = user.UpdateFields(false, model.UserUpdateFieldWeChatId)
 	if err != nil {
 		common.ApiError(c, err)
 		return

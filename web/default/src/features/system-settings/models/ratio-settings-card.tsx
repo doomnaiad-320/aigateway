@@ -23,6 +23,14 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
+import {
+  type AutoGroupRoutesConfig,
+  getDefaultAutoRouteGroups,
+  parseAutoGroupRoutesConfig,
+  parseAutoGroupRoutesConfigStrict,
+  stringifyAutoGroupRoutesConfig,
+  validateAutoGroupRoutesConfigString,
+} from '@/lib/auto-routes'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { resetModelRatios } from '../api'
@@ -183,6 +191,15 @@ const groupSchema = z.object({
       })
     }
   }),
+  AutoGroupRoutes: z.string().superRefine((value, ctx) => {
+    const result = validateAutoGroupRoutesConfigString(value)
+    if (!result.valid) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: result.message || 'Invalid auto route config',
+      })
+    }
+  }),
   DefaultUseAutoGroup: z.boolean(),
   GroupSpecialUsableGroup: z.string().superRefine((value, ctx) => {
     const result = validateJsonString(value)
@@ -197,7 +214,31 @@ const groupSchema = z.object({
 
 type ModelFormValues = z.infer<typeof modelSchema>
 type GroupFormValues = z.infer<typeof groupSchema>
-type RatioTabId = 'models' | 'groups' | 'tool-prices' | 'upstream-sync'
+type RatioTabId =
+  | 'models'
+  | 'unset-models'
+  | 'groups'
+  | 'tool-prices'
+  | 'upstream-sync'
+
+function normalizeAutoGroupRoutesString(
+  autoGroupRoutes: string,
+  autoGroups: string
+) {
+  return stringifyAutoGroupRoutesConfig(
+    parseAutoGroupRoutesConfig(autoGroupRoutes, autoGroups)
+  )
+}
+
+function formatAutoGroupRoutesForTextarea(
+  autoGroupRoutes: string,
+  autoGroups: string
+) {
+  return stringifyAutoGroupRoutesConfig(
+    parseAutoGroupRoutesConfig(autoGroupRoutes, autoGroups),
+    2
+  )
+}
 
 type RatioSettingsCardProps = {
   modelDefaults: ModelFormValues
@@ -235,7 +276,7 @@ export function RatioSettingsCard({
     },
   })
 
-  const modelNormalizedDefaults = useRef({
+  const initialModelNormalizedDefaults = {
     ModelPrice: normalizeJsonString(modelDefaults.ModelPrice),
     ModelRatio: normalizeJsonString(modelDefaults.ModelRatio),
     CacheRatio: normalizeJsonString(modelDefaults.CacheRatio),
@@ -249,7 +290,11 @@ export function RatioSettingsCard({
     ExposeRatioEnabled: modelDefaults.ExposeRatioEnabled,
     BillingMode: normalizeJsonString(modelDefaults.BillingMode),
     BillingExpr: normalizeJsonString(modelDefaults.BillingExpr),
-  })
+  }
+  const modelNormalizedDefaults = useRef(initialModelNormalizedDefaults)
+  const [savedModelValues, setSavedModelValues] = useState(
+    initialModelNormalizedDefaults
+  )
 
   const groupNormalizedDefaults = useRef({
     GroupRatio: normalizeJsonString(groupDefaults.GroupRatio),
@@ -257,6 +302,10 @@ export function RatioSettingsCard({
     UserUsableGroups: normalizeJsonString(groupDefaults.UserUsableGroups),
     GroupGroupRatio: normalizeJsonString(groupDefaults.GroupGroupRatio),
     AutoGroups: normalizeJsonString(groupDefaults.AutoGroups),
+    AutoGroupRoutes: normalizeAutoGroupRoutesString(
+      groupDefaults.AutoGroupRoutes,
+      groupDefaults.AutoGroups
+    ),
     DefaultUseAutoGroup: groupDefaults.DefaultUseAutoGroup,
     GroupSpecialUsableGroup: normalizeJsonString(
       groupDefaults.GroupSpecialUsableGroup
@@ -293,6 +342,10 @@ export function RatioSettingsCard({
       UserUsableGroups: formatJsonForTextarea(groupDefaults.UserUsableGroups),
       GroupGroupRatio: formatJsonForTextarea(groupDefaults.GroupGroupRatio),
       AutoGroups: formatJsonForTextarea(groupDefaults.AutoGroups),
+      AutoGroupRoutes: formatAutoGroupRoutesForTextarea(
+        groupDefaults.AutoGroupRoutes,
+        groupDefaults.AutoGroups
+      ),
       GroupSpecialUsableGroup: formatJsonForTextarea(
         groupDefaults.GroupSpecialUsableGroup
       ),
@@ -315,6 +368,7 @@ export function RatioSettingsCard({
       BillingMode: normalizeJsonString(modelDefaults.BillingMode),
       BillingExpr: normalizeJsonString(modelDefaults.BillingExpr),
     }
+    setSavedModelValues(modelNormalizedDefaults.current)
 
     modelForm.reset({
       ...modelDefaults,
@@ -340,6 +394,10 @@ export function RatioSettingsCard({
       UserUsableGroups: normalizeJsonString(groupDefaults.UserUsableGroups),
       GroupGroupRatio: normalizeJsonString(groupDefaults.GroupGroupRatio),
       AutoGroups: normalizeJsonString(groupDefaults.AutoGroups),
+      AutoGroupRoutes: normalizeAutoGroupRoutesString(
+        groupDefaults.AutoGroupRoutes,
+        groupDefaults.AutoGroups
+      ),
       DefaultUseAutoGroup: groupDefaults.DefaultUseAutoGroup,
       GroupSpecialUsableGroup: normalizeJsonString(
         groupDefaults.GroupSpecialUsableGroup
@@ -353,6 +411,10 @@ export function RatioSettingsCard({
       UserUsableGroups: formatJsonForTextarea(groupDefaults.UserUsableGroups),
       GroupGroupRatio: formatJsonForTextarea(groupDefaults.GroupGroupRatio),
       AutoGroups: formatJsonForTextarea(groupDefaults.AutoGroups),
+      AutoGroupRoutes: formatAutoGroupRoutesForTextarea(
+        groupDefaults.AutoGroupRoutes,
+        groupDefaults.AutoGroups
+      ),
       GroupSpecialUsableGroup: formatJsonForTextarea(
         groupDefaults.GroupSpecialUsableGroup
       ),
@@ -395,18 +457,35 @@ export function RatioSettingsCard({
         const apiKey = apiKeyMap[key as string] || (key as string)
         await updateOption.mutateAsync({ key: apiKey, value: normalized[key] })
       }
+
+      modelNormalizedDefaults.current = normalized
+      setSavedModelValues(normalized)
     },
     [t, updateOption]
   )
 
   const saveGroupRatios = useCallback(
     async (values: GroupFormValues) => {
+      let autoRoutesConfig: AutoGroupRoutesConfig
+      try {
+        autoRoutesConfig = parseAutoGroupRoutesConfigStrict(
+          values.AutoGroupRoutes
+        )
+      } catch (error) {
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : t('Invalid auto route config')
+        )
+        return
+      }
       const normalized = {
         GroupRatio: normalizeJsonString(values.GroupRatio),
         TopupGroupRatio: normalizeJsonString(values.TopupGroupRatio),
         UserUsableGroups: normalizeJsonString(values.UserUsableGroups),
         GroupGroupRatio: normalizeJsonString(values.GroupGroupRatio),
-        AutoGroups: normalizeJsonString(values.AutoGroups),
+        AutoGroups: JSON.stringify(getDefaultAutoRouteGroups(autoRoutesConfig)),
+        AutoGroupRoutes: stringifyAutoGroupRoutesConfig(autoRoutesConfig),
         DefaultUseAutoGroup: values.DefaultUseAutoGroup,
         GroupSpecialUsableGroup: normalizeJsonString(
           values.GroupSpecialUsableGroup
@@ -430,7 +509,7 @@ export function RatioSettingsCard({
         await updateOption.mutateAsync({ key: apiKey, value: normalized[key] })
       }
     },
-    [updateOption]
+    [t, updateOption]
   )
 
   const handleResetRatios = useCallback(() => {
@@ -444,6 +523,7 @@ export function RatioSettingsCard({
 
   const tabLabels: Record<RatioTabId, string> = {
     models: 'Model prices',
+    'unset-models': 'Unset price models',
     groups: 'Group ratios',
     'tool-prices': 'Tool prices',
     'upstream-sync': 'Upstream price sync',
@@ -454,18 +534,21 @@ export function RatioSettingsCard({
       2: 'grid-cols-2',
       3: 'grid-cols-3',
       4: 'grid-cols-4',
+      5: 'grid-cols-5',
     }[visibleTabs.length] ?? 'grid-cols-4'
   const defaultTab = visibleTabs[0] ?? 'models'
 
   const renderTabContent = (tab: RatioTabId) => {
-    if (tab === 'models') {
+    if (tab === 'models' || tab === 'unset-models') {
       return (
         <ModelRatioForm
           form={modelForm}
+          savedValues={savedModelValues}
           onSave={saveModelRatios}
           onReset={handleResetRatios}
           isSaving={updateOption.isPending}
           isResetting={resetMutation.isPending}
+          variant={tab === 'unset-models' ? 'unset' : 'default'}
         />
       )
     }

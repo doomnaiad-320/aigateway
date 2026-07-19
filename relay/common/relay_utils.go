@@ -64,6 +64,35 @@ func StoreTaskRequest(c *gin.Context, info *RelayInfo, action string, requestObj
 	storeTaskRequest(c, info, action, requestObj)
 }
 
+func StoreTaskSubmitRequestBody(c *gin.Context, body []byte) {
+	if c == nil {
+		return
+	}
+	c.Set("task_submit_request_body", append([]byte(nil), body...))
+}
+
+func GetTaskSubmitRequestBody(c *gin.Context) ([]byte, bool) {
+	if c == nil {
+		return nil, false
+	}
+	v, exists := c.Get("task_submit_request_body")
+	if !exists {
+		return nil, false
+	}
+	body, ok := v.([]byte)
+	if !ok {
+		return nil, false
+	}
+	return body, true
+}
+
+func ClearTaskSubmitRequestBody(c *gin.Context) {
+	if c == nil || c.Keys == nil {
+		return
+	}
+	delete(c.Keys, "task_submit_request_body")
+}
+
 func GetTaskRequest(c *gin.Context) (TaskSubmitReq, error) {
 	v, exists := c.Get("task_request")
 	if !exists {
@@ -79,6 +108,21 @@ func GetTaskRequest(c *gin.Context) (TaskSubmitReq, error) {
 func validatePrompt(prompt string) *dto.TaskError {
 	if strings.TrimSpace(prompt) == "" {
 		return createTaskError(fmt.Errorf("prompt is required"), "invalid_request", http.StatusBadRequest, true)
+	}
+	return nil
+}
+
+// MaxTaskDurationSeconds caps user-supplied video duration before it becomes
+// an OtherRatio billing multiplier.
+const MaxTaskDurationSeconds = 3600
+
+func validateTaskDurationBounds(req TaskSubmitReq) *dto.TaskError {
+	seconds, err := req.ResolvedSeconds()
+	if err != nil {
+		return createTaskError(err, "invalid_seconds", http.StatusBadRequest, true)
+	}
+	if seconds < 0 || seconds > MaxTaskDurationSeconds {
+		return createTaskError(fmt.Errorf("seconds must be between 0 and %d", MaxTaskDurationSeconds), "invalid_seconds", http.StatusBadRequest, true)
 	}
 	return nil
 }
@@ -101,7 +145,8 @@ func validateMultipartTaskRequest(c *gin.Context, info *RelayInfo, action string
 
 	if durationStr := formData.Get("seconds"); durationStr != "" {
 		if duration, err := strconv.Atoi(durationStr); err == nil {
-			req.Duration = duration
+			req.Duration = &duration
+			req.Seconds = durationStr
 		}
 	}
 
@@ -138,12 +183,15 @@ func ValidateMultipartDirect(c *gin.Context, info *RelayInfo) *dto.TaskError {
 	prompt = req.Prompt
 	model = req.Model
 	size = req.Size
-	seconds, _ = strconv.Atoi(req.Seconds)
-	if seconds == 0 {
-		seconds = req.Duration
+	resolvedSeconds, err := req.ResolvedSeconds()
+	if err != nil {
+		return createTaskError(err, "invalid_seconds", http.StatusBadRequest, true)
 	}
-	if req.InputReference != "" {
-		req.Images = []string{req.InputReference}
+	seconds = resolvedSeconds
+	if inputReference := strings.TrimSpace(req.InputReference); inputReference != "" {
+		req.Images = []string{inputReference}
+	} else if len(req.Images) == 0 && strings.TrimSpace(req.Image) != "" {
+		req.Images = []string{strings.TrimSpace(req.Image)}
 	}
 
 	if strings.TrimSpace(req.Model) == "" {
@@ -155,6 +203,10 @@ func ValidateMultipartDirect(c *gin.Context, info *RelayInfo) *dto.TaskError {
 	}
 
 	if taskErr := validatePrompt(prompt); taskErr != nil {
+		return taskErr
+	}
+
+	if taskErr := validateTaskDurationBounds(req); taskErr != nil {
 		return taskErr
 	}
 
@@ -219,9 +271,13 @@ func ValidateBasicTaskRequest(c *gin.Context, info *RelayInfo, action string) *d
 		return taskErr
 	}
 
+	if taskErr := validateTaskDurationBounds(req); taskErr != nil {
+		return taskErr
+	}
+
 	if len(req.Images) == 0 && strings.TrimSpace(req.Image) != "" {
 		// 兼容单图上传
-		req.Images = []string{req.Image}
+		req.Images = []string{strings.TrimSpace(req.Image)}
 	}
 
 	storeTaskRequest(c, info, action, req)

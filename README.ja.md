@@ -1,4 +1,4 @@
-<div align="center">
+﻿<div align="center">
 
 ![max-api](/web/default/public/logo.png)
 
@@ -9,7 +9,7 @@
 <p align="center">
   <a href="./README.zh_CN.md">简体中文</a> |
   <a href="./README.zh_TW.md">繁體中文</a> |
-  <a href="./README.md">English</a> |
+  <a href="./README.en.md">English</a> |
   <a href="./README.fr.md">Français</a> |
   <strong>日本語</strong>
 </p>
@@ -44,6 +44,8 @@
 
 MAX API は、研究機関と大学に所属する AGI 愛好者によって立ち上げられ、長期的に保守・運営されている AI モデルガバナンス、AgentOps、アプリケーションサービス基盤プロジェクトです。開発者、研究者、チーム、組織に対して、安定して再利用可能なサービスレイヤーを提供します。AI アプリケーションが実運用に入ると、モデル数の増加、上流 API の頻繁な変更、Agent の呼び出しチェーンの長大化、コストと監査の負担増加が発生します。MAX API は、アプリケーション、Agent、ユーザー、組織、上流モデルサービスの間に、アクセス、認証、ルーティング、課金、可観測性、ガバナンスの統一レイヤーを提供します。
 
+実運用では、MAX API は単なるリクエスト転送ではありません。AI-ready アプリケーションと Agent ワークロード向けの運用可能なゲートウェイとして、プロトコル正規化、プロバイダー差分、トラフィック集中、長時間ストリーミング、大きなリクエストボディ、複数ノードキャッシュ、コスト監査、性能観測を同じガバナンス境界にまとめます。
+
 継続的に注力する領域：
 
 - **AI モデルガバナンス**：OpenAI、Azure OpenAI、AWS Bedrock、Vertex AI、Ollama、および DeepSeek、Qwen / Alibaba Cloud Model Studio、Zhipu GLM、Kimi、Doubao / Volcano Engine、Tencent Hunyuan、Baidu ERNIE / Qianfan、iFlytek Spark、MiniMax、01.AI、SiliconFlow などのモデル更新、API 変更、パラメータ差分、価格ルール、タスクプロトコルを継続的に追跡します。Dify、RAGFlow、Kling、Seedance などのアプリケーション・マルチモーダルエコシステムも対象です。
@@ -75,6 +77,7 @@ AGI アプリケーション時代において、MAX API はオープンな AI �
 - **チャネル設定プレーン**：能力マトリクス、フォーム検証、モデル発見、プロトコルテンプレートによって、上流チャネル追加や非標準 API の保守における設定ミスを減らします。
 - **プロトコル・プロバイダー適応レイヤー**：海外公式 API、中国国内モデルプラットフォーム API、OpenAI-compatible / 非標準 API の変化を追跡し、安定したアプリケーション側インターフェースへ正規化します。
 - **コスト、クォータ、信頼性ガバナンス**：チャネルルーティング、重み付き分配、retry、レート制限、事前課金、失敗時返金、式ベース課金、固定価格、タスク rate-card、倍率課金、利用統計をサポートします。
+- **性能とスケーラビリティガバナンス**：Redis / メモリキャッシュ、モデルリクエスト制限、ストリーミング timeout、大きな応答バッファ、リクエストボディ上限、ディスクキャッシュ、Pyroscope profiling、graceful shutdown により、単一ノードから複数ノードまで安定運用を支えます。
 - **組織運用・監査レイヤー**：チーム、研究機関、企業、コミュニティ向けに、ユーザー管理、グループ管理、プライベートデプロイ、データ保持、監査、継続運用最適化を提供します。
 - **再利用可能なガバナンステンプレート**：チャネルテンプレート、タスクプロトコルテンプレート、価格設定、デプロイ実践、運用ノウハウを蓄積します。
 
@@ -90,7 +93,7 @@ MAX API は、AI モデルと AI Agent の実行プロセスを、設定可能�
 | 上流チャネル | プロバイダーチャネル、重み、グループ、状態、キー、Base URL、パス上書き、能力マトリクス、設定検証、モデル発見、失敗時 retry | 単一プロバイダー障害、値上げ、制限、設定ミス、API 変更のリスクを下げる |
 | プロトコル形式 | OpenAI Compatible、Responses、Claude Messages、Gemini、Realtime、汎用動画タスクプロトコルなど | アプリケーション側が各社の差分を直接負担しないようにする |
 | Agent トークン | API Key、トークングループ、モデル範囲、クォータ、期限、アクセス制御 | Agent、ワークフロー、ツール呼び出しに独立・回収可能・制限可能な認証情報を割り当てる |
-| 利用量とコスト | リクエストログ、利用統計、式ベース課金、段階課金 JSON、タスク rate-card、事前課金、失敗時返金 | コストをユーザー、トークン、モデル、チャネル、グループ単位に分解する |
+| 利用量とコスト | リクエストログ、利用統計、式ベース課金、段階課金 JSON、タスク rate-card、事前課金、失敗時返金 | コストをユーザー、グループ、トークン、モデル、チャネル、ノード単位に分解する |
 | 非同期タスク | 動画タスク送信、ポーリング、状態マッピング、結果プロキシ、タスク課金 | 長時間・多状態・多プロバイダー形式のマルチモーダルタスクを統一管理する |
 | 監査と安全 | 管理者側ログ監査、エラーログ、リクエスト制限、ストリーミング timeout、ログインと権限制御 | プライベートデプロイとコンプライアンス環境に制御可能な監査境界を提供する |
 | 組織運用 | ユーザー、グループ、残高、決済、システム設定、ダッシュボード、運用設定 | チーム、研究機関、企業、コミュニティサービスの継続運用を支える |
@@ -111,6 +114,9 @@ MAX API は、AI モデルと AI Agent の実行プロセスを、設定可能�
 ## 🚀 クイックスタート
 
 デフォルトでは SQLite を使用するため、ローカル評価に追加データベースは不要です。
+
+> [!WARNING]
+> SQLite はローカル評価、開発、小規模テスト専用です。本番環境での使用は推奨しません。同時リクエスト、複数インスタンス構成、大量のログ・使用量データ、データベース移行、バックアップ／リストア、長時間トランザクションでは、ロック競合、書き込み停止、移行の長時間化や失敗、可用性・データ保守上の問題が発生する可能性があります。本番環境では、信頼できるバックアップ／リカバリ計画とともに MySQL ≥ 5.7.8 または PostgreSQL ≥ 9.6 を使用してください。
 
 ```bash
 # 1. イメージを取得
@@ -155,8 +161,8 @@ docker compose up -d
 | チャネル能力マトリクス | `chat/completions`、`responses`、`Claude Messages`、`Gemini native`、`embeddings`、`images`、`audio`、`rerank`、`video tasks`、`model discovery` を表示 |
 | チャネル設定検証 | API Key、モデル一覧、Base URL、JSON、Vertex AI リージョン、Codex 認証情報、モデル発見、動画タスクパスを保存前に検証 |
 | マルチモーダル治理 | chat、images、video、audio、embeddings、rerank、realtime と非同期動画タスクを管理 |
-| 汎用動画タスクプロトコル | 送信、問い合わせ、進捗、状態マッピング、エラー、結果 URL のパスを統一設定。既定は `/v1/videos/create` と `/v1/videos/{task_id}` |
-| プロトコル変換とカスタム上流 | OpenAI Compatible、Claude Messages、Gemini 間の変換、合法的に認可された上流 URL、パス上書き、タスク解析ルール |
+| 汎用動画タスクプロトコル | 送信、問い合わせ、進捗、状態マッピング、エラー、結果 URL のパスを統一設定。body の透過送信と書き換えは既存のチャネル設定を利用します。既定は `/v1/videos/create` と `/v1/videos/{task_id}` |
+| プロトコル変換とカスタム上流 | OpenAI Compatible、Responses、Chat Completions、Claude Messages、Gemini 間の変換、合法的に認可された上流 URL、パス上書き、タスク解析ルール |
 
 ### AI Agent ガバナンス / AgentOps
 
@@ -165,7 +171,7 @@ docker compose up -d
 | Agent トークン分離 | Agent、ワークフロー、プラグイン、ツール呼び出し、ユーザーごとに独立 API Key を作成 |
 | モデルアクセス制御 | ユーザー、トークン、グループ、モデル制限、チャネルポリシーで利用可能モデル・チャネル・クォータを制御 |
 | 呼び出しチェーン観測 | リクエストログ、利用統計、チャネル命中、遅延、エラー、retry 情報 |
-| コスト帰属 | モデル、チャネル、ユーザー、グループ、トークン単位でコストと利用量を集計 |
+| コスト帰属 | モデル、チャネル、ユーザー、グループ、トークン、ノード単位でコストと利用量を集計 |
 | 管理者監査 | プライベートデプロイで管理者側ログ監査を有効化可能。通常ユーザーログ API は管理者専用フィールドを除外 |
 | 運用ダッシュボード | 管理者向け統計、ユーザー管理、チャネル管理、システム設定、運用分析 |
 
@@ -187,6 +193,17 @@ docker compose up -d
 - 重み付きチャネルルーティング、失敗時 retry、無効チャネル回避、モデルレベルルーティングをサポートします。
 - Redis キャッシュとメモリキャッシュにより、単一ノード・複数ノード構成に対応します。
 
+### 性能とスケーラビリティガバナンス
+
+| 機能 | 説明 |
+|------|------|
+| キャッシュと複数ノード拡張 | 単一ノードではメモリキャッシュ、複数ノードでは Redis を利用できます。ユーザー、トークン、チャネル affinity、クォータ関連キャッシュで DB 読み取りを減らし、`SESSION_SECRET`、`CRYPTO_SECRET`、`NODE_NAME` によりセッション、暗号化、ログ帰属を揃えます |
+| レート制限と容量保護 | グローバル API / Web、重要 endpoint、検索、モデルリクエスト、グループ別モデルリクエスト quota の制限をサポートし、Redis またはメモリカウンターを利用できます |
+| ストリーミングと大きなリクエスト制御 | `STREAMING_TIMEOUT`、`STREAM_SCANNER_MAX_BUFFER_MB`、`MAX_REQUEST_BODY_MB`、`MAX_FILE_DOWNLOAD_MB` で長時間 stream、大きな SSE 行、解凍後リクエストボディ、リモートファイル download を制御します |
+| リレー接続調整 | `RELAY_TIMEOUT`、`RELAY_IDLE_CONN_TIMEOUT`、`RELAY_MAX_IDLE_CONNS`、`RELAY_MAX_IDLE_CONNS_PER_HOST` で上流 HTTP timeout と connection pool を調整できます |
+| ディスクキャッシュと性能観測 | 性能設定で大きなリクエストボディ向けディスクキャッシュ、閾値、容量を設定できます。運用 endpoint で確認 / クリアでき、Pyroscope で CPU、メモリ、goroutine、mutex、block profile を収集できます |
+| Graceful shutdown とデータ保存 | `SHUTDOWN_TIMEOUT_SECONDS` と `QUOTA_DATA_CACHE_SAVE_TIMEOUT_SECONDS` により、可能な範囲で HTTP 処理を閉じ、クォータキャッシュを保存してから終了します |
+
 ### セキュリティと組織管理
 
 - JWT、WebAuthn/Passkeys、OAuth、OIDC、Telegram、Discord、LinuxDO などのログイン方式をサポートします。
@@ -205,6 +222,7 @@ docker compose up -d
 | Agent アクセス | Agent が上流 Key を直接保持し、回収や制限が難しい | Agent ごとに独立トークンを割り当て、モデル・クォータ・期限・グループを制限 |
 | プロトコル差分 | Claude、Gemini、Responses などをアプリ側で吸収 | ゲートウェイがプロトコル変換とプロバイダー適応を担当 |
 | 障害処理 | retry、fallback、エラー正規化をアプリ側で実装 | チャネル失敗時 retry、重み付きルーティング、エラー処理を内蔵 |
+| 性能と拡張 | timeout、レート制限、接続 pool、cache をアプリ側で処理 | ゲートウェイが streaming timeout、リクエスト制限、Redis / メモリ cache、接続 pool 調整、性能観測を集約 |
 | コスト統計 | 請求が各平台に分散し、ユーザーや Agent への帰属が難しい | クォータ、課金、利用統計、消費ログを統一し、トークンとモデル単位で帰属可能 |
 | 監査境界 | アプリ側ログが分散し、権限・保持ポリシーが不統一 | 管理者側統一監査入口、通常ユーザーには管理者専用フィールドを除外 |
 | プライベート化 | Key、ログ、課金ポリシーが分散 | 自己ホストで Key、データ、ログ、ポリシーを掌握 |
@@ -267,17 +285,17 @@ flowchart LR
 | 種別 | 説明 |
 |------|------|
 | OpenAI-Compatible | Chat Completions、Embeddings、Images、Audio などの互換 API |
-| OpenAI Responses | Responses 形式のリクエスト、relay、互換能力 |
+| OpenAI Responses | Responses 形式のリクエスト、relay、Responses ↔ Chat Completions 互換変換 |
 | Claude Messages | Claude Messages と OpenAI-compatible 形式の変換 |
-| Google Gemini | Gemini chat、text、一部変換能力 |
+| Google Gemini | Gemini chat、text、`/v1/responses` 互換変換 |
 | Azure OpenAI | Azure OpenAI と Realtime 関連 API |
 | AWS Bedrock | Bedrock Runtime モデル接続 |
 | 上流平台・アプリケーションエコシステム | AWS、Azure、Vertex、Ollama、Codex、Dify、RAGFlow、Kling、Seedance など |
 | 中国国内モデル・平台 | DeepSeek、Qwen / Alibaba Cloud Model Studio、Zhipu GLM、Kimi、Doubao / Volcano Engine、Tencent Hunyuan、Baidu ERNIE / Qianfan、iFlytek Spark、MiniMax、01.AI、SiliconFlow など |
 | `rerank` | Cohere、Jina などの rerank モデル。RAG や Agent 検索チェーンに利用 |
 | Midjourney / Suno / Dify | 画像、音楽、ワークフローなどのサービス適応 |
-| 動画タスク API | `/v1/videos/create`、`/v1/videos/{task_id}` による送信、ポーリング、状態マッピング、結果プロキシ、パラメータ化課金 |
-| カスタム上流 | 認可済み上流 URL、プロトコル適応、パス上書き、状態マッピング、エラー経路、結果解析 |
+| 動画タスク API | `/v1/videos/create`、`/v1/videos/{task_id}` による送信、body 透過送信またはパラメータ上書き、ポーリング、状態マッピング、結果プロキシ、パラメータ化課金 |
+| カスタム上流 | 認可済み上流 URL、プロトコル適応、Responses / Chat 変換、パス上書き、状態マッピング、エラー経路、結果解析 |
 
 ### 主な対応インターフェース
 
@@ -336,6 +354,7 @@ flowchart LR
 
 - **パス上書きのみ**：`submit_path` と `query_path` のみを設定し、公式レスポンスパーサーを継続利用します。
 - **完全プロトコル解析**：`task_protocol = "generic_video_task"` を設定し、task ID、状態、進捗、結果 URL、エラー、状態マッピングのパスを設定します。
+- **リクエスト body 処理**：汎用動画タスクプロトコルは個別の body 生成モードを持ちません。クライアント JSON をそのまま上流へ送る場合はチャネル設定の `Pass Through Body` を使い、フィールド書き換え、既定値、header 連動には既存の `Param Override` を使います。
 
 既定パス：
 
@@ -361,6 +380,8 @@ flowchart LR
 
 - **Tiered billing JSON**：複数モデルの `{ enabled, expr }` を一括管理し、`billing_mode` と `billing_expr` を同期更新します。
 - **Task rate-card JSON**：`task_billing_setting.rate_cards` で非同期タスク課金ルールを管理し、`vendor` で Sora、Veo、Seedance、Kling などを分けます。
+
+Seedance 2.0 などの動画モデルでは、解像度や動画入力などのリクエストパラメータを倍率または rate-card 課金に利用できます。透過送信またはパラメータ上書きを使う場合は、最終的に上流へ送るフィールドと課金フィールドを揃えてください。
 
 ```json
 {
@@ -406,10 +427,11 @@ flowchart LR
 | コンポーネント | 要件 |
 |------|------|
 | コンテナエンジン | Docker / Docker Compose |
-| ローカルデータベース | SQLite。Docker デプロイ時は `/data` をマウント |
-| リモートデータベース | MySQL ≥ 5.7.8 または PostgreSQL ≥ 9.6 |
+| ローカルデータベース | SQLite。ローカル評価、開発、小規模テスト専用。Docker 利用時は `/data` をマウント |
+| 本番データベース | MySQL ≥ 5.7.8 または PostgreSQL ≥ 9.6。信頼できるバックアップ／リカバリ計画を設定 |
 | キャッシュ | 単一ノードはメモリキャッシュ、複数ノードは Redis 推奨 |
 | フロントエンドビルド | Bun workspace。`web/package.json` と `web/bun.lock` を保持 |
+| ソースビルド | `go.mod` に記載された Go バージョン（現在は Go 1.25.1+）とリポジトリ内の `go.sum` を使用。依存関係またはセキュリティ更新後は `go mod download`、`go mod verify` を実行してから再ビルド |
 
 ### 推奨環境変数
 
@@ -427,7 +449,7 @@ flowchart LR
 | `MAX_REQUEST_BODY_MB` | 解凍後リクエストボディ最大サイズ。超過時 `413` | `32` |
 | `AZURE_DEFAULT_API_VERSION` | Azure API 既定バージョン | `2025-04-01-preview` |
 | `ERROR_LOG_ENABLED` | エラーログスイッチ | `false` |
-| `NODE_NAME` | 複数ノード時のノード名 | - |
+| `NODE_NAME` | 複数ノード時のログ識別と非同期タスク精算帰属に使うノード名 | - |
 | `PYROSCOPE_URL` | Pyroscope サービス URL | - |
 | `PYROSCOPE_APP_NAME` | Pyroscope アプリ名 | `max-api` |
 | `PYROSCOPE_BASIC_AUTH_USER` | Pyroscope Basic Auth ユーザー名 | - |
@@ -482,6 +504,9 @@ cd MAX-API
 docker build -t cscitechtop/max-api:latest .
 ```
 
+> [!NOTE]
+> `Dockerfile` はイメージビルド中に Go モジュールをダウンロードします。ホストで直接ビルドする場合、または依存関係 / セキュリティ更新後は、`go.mod` と `go.sum` を必ず一緒にコミットし、`go mod download && go mod verify` を実行してからバイナリまたはイメージを再ビルドしてください。ベースイメージを更新する必要がある場合は `docker build --pull --no-cache -t cscitechtop/max-api:latest .` を使用します。
+
 > [!TIP]
 > フロントエンドは Bun workspace を使用します。ビルドコンテキストには `web/package.json`、`web/bun.lock`、`web/default/package.json` を保持してください。そうしないと `catalog:` 依存関係を解決できません。
 
@@ -490,7 +515,7 @@ docker build -t cscitechtop/max-api:latest .
 > [!WARNING]
 > - 全ノードで同じ `SESSION_SECRET` を設定してください。異なるとログイン状態がノード間で一致しません。
 > - 共有 Redis を使用する場合は、全ノードで同じ `CRYPTO_SECRET` を設定してください。異なると暗号化データを復号できません。
-> - ログと監査情報でノードを特定しやすくするため、`NODE_NAME` を設定することを推奨します。
+> - ログ、監査情報、非同期タスク精算でノードを特定しやすくするため、安定した `NODE_NAME` を設定することを推奨します。
 > - 本番環境では外部データベース、外部 Redis、HTTPS リバースプロキシ、信頼できるバックアップ戦略を使用してください。
 
 ---
@@ -613,6 +638,45 @@ SQLite、MySQL ≥ 5.7.8、PostgreSQL ≥ 9.6 に対応しています。ロー�
 | 最新リリース | [Releases](https://github.com/MAX-API-Next/MAX-API/releases) |
 | DeepWiki | [Ask DeepWiki](https://deepwiki.com/MAX-API-Next/MAX-API) |
 
+### 二次開発とコミュニティへの謝辞
+
+本プロジェクトをベースに二次開発し、ご自身で利用する場合は、プロジェクトのホームページ、フッター、または「About」ページなどの目立つ場所に、次のいずれかの方法でプロジェクトの出典またはコミュニティへの謝辞を表示できます：
+
+- プロジェクトへのリンク：[MAX-API-Next/MAX-API](https://github.com/MAX-API-Next/MAX-API)
+- コミュニティへの謝辞：[MAX-API-Next](https://github.com/MAX-API-Next)
+
+フロントエンドへの埋め込み例（React / Tailwind CSS、必要に応じていずれか一方のみ残してください）：
+
+```tsx
+<p className='text-sm text-muted-foreground'>
+  {' '}
+  <a
+    href='https://github.com/MAX-API-Next/MAX-API'
+    target='_blank'
+    rel='noopener noreferrer'
+    className='font-medium underline underline-offset-4'
+  >
+    MAX-API-Next/MAX-API
+  </a>{' '}
+  を基に二次開発 ·{' '}
+  <a
+    href='https://github.com/MAX-API-Next'
+    target='_blank'
+    rel='noopener noreferrer'
+    className='font-medium underline underline-offset-4'
+  >
+    MAX-API-Next コミュニティ
+  </a>{' '}
+  に感謝
+</p>
+```
+
+上記いずれかの表示要件を満たし、リンクを明確に表示し続けることで、申請や承認を別途行うことなく、本プロジェクトの一時的な商用ライセンスを自動的に取得できます。このライセンスは永久ライセンスではなく、表示要件を継続して満たしている期間に限り有効です。有効期間および今後の変更は、本 README または公式コミュニティで公開される最新のお知らせに従います。
+
+本プロジェクトは [One API](https://github.com/songquanpeng/one-api) および [New API](https://github.com/QuantumNous/new-api) をベースに開発されています。現段階の MAX API は、これらを基盤として AI API ゲートウェイおよびガバナンス機能の強化、機能拡張、バグ修正を継続しています。商用利用にあたっては、各上流プロジェクトが現在公開している `LICENSE` ファイルに従い、One API の MIT ライセンスおよび New API の AGPLv3 ライセンスも遵守する必要があります。本プロジェクトが提供する一時的な商用ライセンスは、上流プロジェクトのオープンソースライセンス上の義務を置き換えたり免除したりするものではありません。
+
+表示要件を満たさなくなった場合、または一時的なライセンスが期限切れ、告知により変更もしくは終了した場合は、AGPLv3 に従うか、別途書面による許諾を取得する必要があります。長期商用ライセンスについては、maxapi@max-api.ai までお問い合わせください。
+
 Issue、ドキュメント改善、プロバイダー適応経験、デプロイ方案、コード貢献を歓迎します。
 
 ---
@@ -620,6 +684,8 @@ Issue、ドキュメント改善、プロバイダー適応経験、デプロイ
 ## 📜 ライセンス
 
 本プロジェクトは [GNU Affero General Public License v3.0 (AGPLv3)](./LICENSE) で提供されます。
+
+標準の AGPLv3 ライセンスに加え、上記「二次開発とコミュニティへの謝辞」の条件を満たす自己利用の二次開発プロジェクトには、そこで説明されている非永久の一時的な商用ライセンスが自動的に付与されます。この一時的なライセンスが対象とするのは、MAX API プロジェクト運営者がライセンスする権利を有する追加・変更部分のみであり、One API や New API などの上流プロジェクトのライセンスを含む、または代替するものではありません。
 
 本プロジェクトを変更し、ネットワーク経由でユーザーにサービスとして提供する場合は、AGPLv3 のソース提供義務などを理解し遵守してください。商用協力、機関協力、その他ライセンスに関する問い合わせは maxapi@max-api.ai までご連絡ください。
 

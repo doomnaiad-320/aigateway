@@ -32,7 +32,11 @@ func TelegramBind(c *gin.Context) {
 		return
 	}
 	telegramId := params["id"][0]
-	if model.IsTelegramIdAlreadyTaken(telegramId) {
+	taken, err := model.IsTelegramIdAlreadyTaken(telegramId)
+	if handleOAuthIdentityLookupError(c, "Telegram", err) {
+		return
+	}
+	if taken {
 		c.JSON(200, gin.H{
 			"message": "该 Telegram 账户已被绑定",
 			"success": false,
@@ -41,8 +45,12 @@ func TelegramBind(c *gin.Context) {
 	}
 
 	session := sessions.Default(c)
-	id := session.Get("id")
-	user := model.User{Id: id.(int)}
+	id, ok := sessionUserID(session.Get("id"))
+	if !ok {
+		common.ApiErrorMsg(c, "用户未登录或登录状态已失效")
+		return
+	}
+	user := model.User{Id: id}
 	if err := user.FillUserById(); err != nil {
 		c.JSON(200, gin.H{
 			"message": err.Error(),
@@ -58,7 +66,7 @@ func TelegramBind(c *gin.Context) {
 		return
 	}
 	user.TelegramId = telegramId
-	if err := user.Update(false); err != nil {
+	if err := user.UpdateFields(false, model.UserUpdateFieldTelegramId); err != nil {
 		c.JSON(200, gin.H{
 			"message": err.Error(),
 			"success": false,
@@ -88,11 +96,7 @@ func TelegramLogin(c *gin.Context) {
 
 	telegramId := params["id"][0]
 	user := model.User{TelegramId: telegramId}
-	if err := user.FillUserByTelegramId(); err != nil {
-		c.JSON(200, gin.H{
-			"message": err.Error(),
-			"success": false,
-		})
+	if err := user.FillUserByTelegramId(); handleOAuthUserLookupError(c, err) {
 		return
 	}
 	setupLogin(&user, c)

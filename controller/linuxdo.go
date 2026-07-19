@@ -47,7 +47,11 @@ func LinuxDoBind(c *gin.Context) {
 		LinuxDOId: strconv.Itoa(linuxdoUser.Id),
 	}
 
-	if model.IsLinuxDOIdAlreadyTaken(user.LinuxDOId) {
+	taken, err := model.IsLinuxDOIdAlreadyTaken(user.LinuxDOId)
+	if handleOAuthIdentityLookupError(c, "Linux DO", err) {
+		return
+	}
+	if taken {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "该 Linux DO 账户已被绑定",
@@ -56,8 +60,12 @@ func LinuxDoBind(c *gin.Context) {
 	}
 
 	session := sessions.Default(c)
-	id := session.Get("id")
-	user.Id = id.(int)
+	id, ok := sessionUserID(session.Get("id"))
+	if !ok {
+		common.ApiErrorMsg(c, "用户未登录或登录状态已失效")
+		return
+	}
+	user.Id = id
 
 	err = user.FillUserById()
 	if err != nil {
@@ -66,7 +74,7 @@ func LinuxDoBind(c *gin.Context) {
 	}
 
 	user.LinuxDOId = strconv.Itoa(linuxdoUser.Id)
-	err = user.Update(false)
+	err = user.UpdateFields(false, model.UserUpdateFieldLinuxDOId)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -203,20 +211,13 @@ func LinuxdoOAuth(c *gin.Context) {
 	}
 
 	// Check if user exists
-	if model.IsLinuxDOIdAlreadyTaken(user.LinuxDOId) {
+	taken, err := model.IsLinuxDOIdAlreadyTaken(user.LinuxDOId)
+	if handleOAuthIdentityLookupError(c, "Linux DO", err) {
+		return
+	}
+	if taken {
 		err := user.FillUserByLinuxDOId()
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": err.Error(),
-			})
-			return
-		}
-		if user.Id == 0 {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "用户已注销",
-			})
+		if handleOAuthUserLookupError(c, err) {
 			return
 		}
 	} else {

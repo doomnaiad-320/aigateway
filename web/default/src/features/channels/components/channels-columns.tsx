@@ -432,7 +432,7 @@ export function useChannelsColumns(): ColumnDef<Channel>[] {
           checked={table.getIsAllPageRowsSelected()}
           indeterminate={table.getIsSomePageRowsSelected()}
           onCheckedChange={(value) => table.toggleAllPageRowsSelected(!!value)}
-          aria-label='Select all'
+          aria-label={t('Select all')}
         />
       ),
       cell: ({ row }) => {
@@ -447,7 +447,7 @@ export function useChannelsColumns(): ColumnDef<Channel>[] {
           <Checkbox
             checked={row.getIsSelected()}
             onCheckedChange={(value) => row.toggleSelected(!!value)}
-            aria-label='Select row'
+            aria-label={t('Select row')}
           />
         )
       },
@@ -660,7 +660,11 @@ export function useChannelsColumns(): ColumnDef<Channel>[] {
                           e.stopPropagation()
                           if (!deploymentId) return
                           const targetUrl = `/models/deployments?dFilter=${encodeURIComponent(String(deploymentId))}`
-                          window.open(targetUrl, '_blank', 'noopener')
+                          window.open(
+                            targetUrl,
+                            '_blank',
+                            'noopener,noreferrer'
+                          )
                         }}
                       />
                     }
@@ -847,7 +851,9 @@ export function useChannelsColumns(): ColumnDef<Channel>[] {
           />
         ))
 
-        return <div className='flex max-w-full flex-wrap gap-1'>{modelBadges}</div>
+        return (
+          <div className='flex max-w-full flex-wrap gap-1'>{modelBadges}</div>
+        )
       },
       size: 200,
       enableSorting: false,

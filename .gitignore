@@ -26,8 +26,6 @@ plans
 .claude
 .cursor
 .agents/*
-!.agents/upstream-sync/
-!.agents/upstream-sync/**
 .codex
 .tmp
 

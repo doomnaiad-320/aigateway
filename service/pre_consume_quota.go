@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -31,6 +32,9 @@ func ReturnPreConsumedQuota(c *gin.Context, relayInfo *relaycommon.RelayInfo) {
 // PreConsumeQuota checks if the user has enough quota to pre-consume.
 // It returns the pre-consumed quota if successful, or an error if not.
 func PreConsumeQuota(c *gin.Context, preConsumedQuota int, relayInfo *relaycommon.RelayInfo) *types.MaxAPIError {
+	if apiErr := validatePreConsumedQuota(preConsumedQuota, relayInfo); apiErr != nil {
+		return apiErr
+	}
 	userQuota, err := model.GetUserQuota(relayInfo.UserId, false)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
@@ -38,19 +42,19 @@ func PreConsumeQuota(c *gin.Context, preConsumedQuota int, relayInfo *relaycommo
 	if userQuota <= 0 {
 		return types.NewErrorWithStatusCode(fmt.Errorf("用户额度不足, 剩余额度: %s", logger.FormatQuota(userQuota)), types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 	}
-	if userQuota-preConsumedQuota < 0 {
+	if userQuota-int64(preConsumedQuota) < 0 {
 		return types.NewErrorWithStatusCode(fmt.Errorf("预扣费额度失败, 用户剩余额度: %s, 需要预扣费额度: %s", logger.FormatQuota(userQuota), logger.FormatQuota(preConsumedQuota)), types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 	}
 
 	trustQuota := common.GetTrustQuota()
 
 	relayInfo.UserQuota = userQuota
-	if userQuota > trustQuota {
+	if userQuota > int64(trustQuota) {
 		// 用户额度充足，判断令牌额度是否充足
 		if !relayInfo.TokenUnlimited {
 			// 非无限令牌，判断令牌额度是否充足
-			tokenQuota := c.GetInt("token_quota")
-			if tokenQuota > trustQuota {
+			tokenQuota := c.GetInt64("token_quota")
+			if tokenQuota > int64(trustQuota) {
 				// 令牌额度充足，信任令牌
 				preConsumedQuota = 0
 				logger.LogInfo(c, fmt.Sprintf("用户 %d 剩余额度 %s 且令牌 %d 额度 %d 充足, 信任且不需要预扣费", relayInfo.UserId, logger.FormatQuota(userQuota), relayInfo.TokenId, tokenQuota))
@@ -64,15 +68,26 @@ func PreConsumeQuota(c *gin.Context, preConsumedQuota int, relayInfo *relaycommo
 	}
 
 	if preConsumedQuota > 0 {
-		err := PreConsumeTokenQuota(relayInfo, preConsumedQuota)
+		token, err := model.GetTokenByKey(relayInfo.TokenKey, false)
 		if err != nil {
 			return types.NewErrorWithStatusCode(err, types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 		}
-		err = model.DecreaseUserQuota(relayInfo.UserId, preConsumedQuota, false)
+		if !relayInfo.TokenUnlimited && token.RemainQuota < int64(preConsumedQuota) {
+			return types.NewErrorWithStatusCode(
+				fmt.Errorf("token quota is not enough, token remain quota: %s, need quota: %s", logger.FormatQuota(token.RemainQuota), logger.FormatQuota(preConsumedQuota)),
+				types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+		}
+		err = model.DecreaseTokenAndUserQuota(relayInfo.TokenId, relayInfo.UserId, relayInfo.TokenKey, preConsumedQuota)
+		if errors.Is(err, model.ErrTokenQuotaInsufficient) {
+			return types.NewErrorWithStatusCode(err, types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+		}
+		if errors.Is(err, model.ErrUserQuotaInsufficient) {
+			return types.NewErrorWithStatusCode(err, types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+		}
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
 		}
-		logger.LogInfo(c, fmt.Sprintf("用户 %d 预扣费 %s, 预扣费后剩余额度: %s", relayInfo.UserId, logger.FormatQuota(preConsumedQuota), logger.FormatQuota(userQuota-preConsumedQuota)))
+		logger.LogInfo(c, fmt.Sprintf("用户 %d 预扣费 %s, 预扣费后剩余额度: %s", relayInfo.UserId, logger.FormatQuota(preConsumedQuota), logger.FormatQuota(userQuota-int64(preConsumedQuota))))
 	}
 	relayInfo.FinalPreConsumedQuota = preConsumedQuota
 	return nil

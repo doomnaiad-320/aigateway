@@ -42,6 +42,12 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
+import {
   PromptInput,
   PromptInputButton,
   PromptInputFooter,
@@ -49,12 +55,6 @@ import {
   PromptInputTools,
   type PromptInputMessage,
 } from '@/components/ai-elements/prompt-input'
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from '@/components/ui/tooltip'
 import { Suggestion, Suggestions } from '@/components/ai-elements/suggestion'
 import { ModelGroupSelector } from '@/components/model-group-selector'
 import type { ModelOption, GroupOption } from '../types'
@@ -104,9 +104,7 @@ export function PlaygroundInput({
   const { t } = useTranslation()
   const [text, setText] = useState('')
 
-  const isModelSelectDisabled =
-    disabled || isModelLoading || models.length === 0
-  const isGroupSelectDisabled = disabled || groups.length === 0
+  const isSelectorDisabled = disabled || isModelLoading || groups.length === 0
   const isClearHistoryDisabled = disabled || isGenerating || !hasMessages
 
   const handleSubmit = (message: PromptInputMessage) => {
@@ -141,8 +139,8 @@ export function PlaygroundInput({
           value={text}
         />
 
-        <PromptInputFooter className='p-2.5'>
-          <PromptInputTools>
+        <PromptInputFooter className='flex-wrap p-2.5'>
+          <PromptInputTools className='min-w-0 flex-wrap'>
             <DropdownMenu>
               <DropdownMenuTrigger
                 render={
@@ -222,20 +220,21 @@ export function PlaygroundInput({
             </TooltipProvider>
           </PromptInputTools>
 
-          <div className='flex items-center gap-1.5 md:gap-2'>
+          <div className='ml-auto flex min-w-0 items-center gap-1.5 md:gap-2'>
             <ModelGroupSelector
+              className='min-w-0'
               selectedModel={modelValue}
               models={models}
               onModelChange={onModelChange}
               selectedGroup={groupValue}
               groups={groups}
               onGroupChange={onGroupChange}
-              disabled={isModelSelectDisabled || isGroupSelectDisabled}
+              disabled={isSelectorDisabled}
             />
 
             {isGenerating && onStop ? (
               <PromptInputButton
-                className='text-foreground font-medium'
+                className='text-foreground shrink-0 font-medium'
                 onClick={onStop}
                 variant='secondary'
               >
@@ -245,7 +244,7 @@ export function PlaygroundInput({
               </PromptInputButton>
             ) : (
               <PromptInputButton
-                className='text-foreground font-medium'
+                className='text-foreground shrink-0 font-medium'
                 disabled={disabled || isSubmitDisabled || !text.trim()}
                 type='submit'
                 variant='secondary'

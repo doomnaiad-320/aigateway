@@ -47,14 +47,14 @@ func hasCustomModelRatio(modelName string, currentRatio float64) bool {
 	return currentRatio != defaultRatio
 }
 
-func calculateAudioQuota(info QuotaInfo) int {
+func calculateAudioQuota(info QuotaInfo) (int, *common.QuotaClamp) {
 	if info.UsePrice {
 		modelPrice := decimal.NewFromFloat(info.ModelPrice)
 		quotaPerUnit := decimal.NewFromFloat(common.QuotaPerUnit)
 		groupRatio := decimal.NewFromFloat(info.GroupRatio)
 
 		quota := modelPrice.Mul(quotaPerUnit).Mul(groupRatio)
-		return int(quota.IntPart())
+		return common.QuotaFromDecimalChecked(quota)
 	}
 
 	completionRatio := decimal.NewFromFloat(ratio_setting.GetCompletionRatio(info.ModelName))
@@ -83,7 +83,7 @@ func calculateAudioQuota(info QuotaInfo) int {
 		quota = decimal.NewFromInt(1)
 	}
 
-	return int(quota.Round(0).IntPart())
+	return common.QuotaFromDecimalChecked(quota)
 }
 
 func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.RealtimeUsage) error {
@@ -136,13 +136,14 @@ func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usag
 		GroupRatio: actualGroupRatio,
 	}
 
-	quota := calculateAudioQuota(quotaInfo)
+	quota, clamp := calculateAudioQuota(quotaInfo)
+	noteQuotaClamp(relayInfo, clamp)
 
-	if userQuota < quota {
+	if userQuota < int64(quota) {
 		return fmt.Errorf("user quota is not enough, user quota: %s, need quota: %s", logger.FormatQuota(userQuota), logger.FormatQuota(quota))
 	}
 
-	if !token.UnlimitedQuota && token.RemainQuota < quota {
+	if !token.UnlimitedQuota && token.RemainQuota < int64(quota) {
 		return fmt.Errorf("token quota is not enough, token remain quota: %s, need quota: %s", logger.FormatQuota(token.RemainQuota), logger.FormatQuota(quota))
 	}
 
@@ -157,12 +158,12 @@ func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usag
 func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, modelName string,
 	usage *dto.RealtimeUsage, extraContent string) {
 
+	var tieredUsedVars map[string]bool
+	if snap := relayInfo.TieredBillingSnapshot; snap != nil {
+		tieredUsedVars = billingexpr.UsedVars(snap.ExprString)
+	}
 	var tieredResult *billingexpr.TieredResult
-	tieredOk, tieredQuota, tieredRes := TryTieredSettle(relayInfo, billingexpr.TokenParams{
-		P:   float64(usage.InputTokens),
-		C:   float64(usage.OutputTokens),
-		Len: float64(usage.InputTokens),
-	})
+	tieredOk, tieredQuota, tieredRes := TryTieredSettle(relayInfo, BuildRealtimeTieredTokenParams(usage, tieredUsedVars))
 	if tieredOk {
 		tieredResult = tieredRes
 	}
@@ -199,7 +200,8 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		GroupRatio: groupRatio,
 	}
 
-	quota := calculateAudioQuota(quotaInfo)
+	quota, clamp := calculateAudioQuota(quotaInfo)
+	noteQuotaClamp(relayInfo, clamp)
 	if tieredOk {
 		quota = tieredQuota
 	}
@@ -247,6 +249,7 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 	if tieredResult != nil {
 		InjectTieredBillingInfo(other, relayInfo, tieredResult)
 	}
+	attachQuotaSaturation(ctx, relayInfo, other)
 	model.RecordConsumeLog(ctx, relayInfo.UserId, model.RecordConsumeLogParams{
 		ChannelId:        relayInfo.ChannelId,
 		PromptTokens:     usage.InputTokens,
@@ -328,7 +331,8 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 		GroupRatio: groupRatio,
 	}
 
-	quota := calculateAudioQuota(quotaInfo)
+	quota, clamp := calculateAudioQuota(quotaInfo)
+	noteQuotaClamp(relayInfo, clamp)
 	if tieredOk {
 		quota = tieredQuota
 	}
@@ -376,6 +380,7 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 	if tieredResult != nil {
 		InjectTieredBillingInfo(other, relayInfo, tieredResult)
 	}
+	attachQuotaSaturation(ctx, relayInfo, other)
 	model.RecordConsumeLog(ctx, relayInfo.UserId, model.RecordConsumeLogParams{
 		ChannelId:        relayInfo.ChannelId,
 		PromptTokens:     usage.PromptTokens,
@@ -409,7 +414,7 @@ func PreConsumeTokenQuota(relayInfo *relaycommon.RelayInfo, quota int) error {
 	if err != nil {
 		return err
 	}
-	if !relayInfo.TokenUnlimited && token.RemainQuota < quota {
+	if !relayInfo.TokenUnlimited && token.RemainQuota < int64(quota) {
 		return fmt.Errorf("token quota is not enough, token remain quota: %s, need quota: %s", logger.FormatQuota(token.RemainQuota), logger.FormatQuota(quota))
 	}
 	err = model.DecreaseTokenQuota(relayInfo.TokenId, relayInfo.TokenKey, quota)
@@ -477,7 +482,7 @@ func checkAndSendQuotaNotify(relayInfo *relaycommon.RelayInfo, quota int, preCon
 		//noMoreQuota := userCache.Quota-(quota+preConsumedQuota) <= 0
 		quotaTooLow := false
 		consumeQuota := quota + preConsumedQuota
-		if relayInfo.UserQuota-consumeQuota < threshold {
+		if relayInfo.UserQuota-int64(consumeQuota) < int64(threshold) {
 			quotaTooLow = true
 		}
 		if quotaTooLow {

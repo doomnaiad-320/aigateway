@@ -117,7 +117,7 @@ type RelayInfo struct {
 	ReasoningEffort        string
 	UserSetting            dto.UserSetting
 	UserEmail              string
-	UserQuota              int
+	UserQuota              int64
 	RelayFormat            types.RelayFormat
 	SendResponseCount      int
 	ReceivedResponseCount  int
@@ -165,6 +165,10 @@ type RelayInfo struct {
 
 	PriceData   types.PriceData
 	TaskBilling *types.TaskBillingResult
+
+	// QuotaClamp is set when a quota conversion saturated at the int32 bound
+	// or fell back from NaN while computing this request's charge.
+	QuotaClamp *common.QuotaClamp
 
 	// TieredBillingSnapshot is a frozen snapshot of tiered billing rules
 	// captured at pre-consume time. Non-nil only when billing mode is "tiered_expr".
@@ -471,7 +475,7 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 		UserId:     common.GetContextKeyInt(c, constant.ContextKeyUserId),
 		UsingGroup: common.GetContextKeyString(c, constant.ContextKeyUsingGroup),
 		UserGroup:  common.GetContextKeyString(c, constant.ContextKeyUserGroup),
-		UserQuota:  common.GetContextKeyInt(c, constant.ContextKeyUserQuota),
+		UserQuota:  common.GetContextKeyInt64(c, constant.ContextKeyUserQuota),
 		UserEmail:  common.GetContextKeyString(c, constant.ContextKeyUserEmail),
 
 		OriginModelName: common.GetContextKeyString(c, constant.ContextKeyOriginalModel),
@@ -686,29 +690,77 @@ type TaskRelayInfo struct {
 }
 
 type TaskSubmitReq struct {
-	Prompt          string                 `json:"prompt"`
-	Model           string                 `json:"model,omitempty"`
-	Mode            string                 `json:"mode,omitempty"`
-	Image           string                 `json:"image,omitempty"`
-	Images          []string               `json:"images,omitempty"`
-	Size            string                 `json:"size,omitempty"`
-	Duration        int                    `json:"duration,omitempty"`
-	Seconds         string                 `json:"seconds,omitempty"`
-	InputReference  string                 `json:"input_reference,omitempty"`
-	AspectRatio     string                 `json:"aspect_ratio,omitempty"`
-	Capability      string                 `json:"capability,omitempty"`
-	ControlMode     string                 `json:"control_mode,omitempty"`
-	DurationSeconds *int                   `json:"duration_seconds,omitempty"`
-	EndImage        string                 `json:"end_image,omitempty"`
-	InputMode       string                 `json:"input_mode,omitempty"`
-	ReferenceImages []string               `json:"reference_images,omitempty"`
-	Resolution      string                 `json:"resolution,omitempty"`
-	WithAudio       *bool                  `json:"with_audio,omitempty"`
-	Metadata        map[string]interface{} `json:"metadata,omitempty"`
+	Prompt                string                 `json:"prompt"`
+	Model                 string                 `json:"model,omitempty"`
+	Mode                  string                 `json:"mode,omitempty"`
+	Image                 string                 `json:"image,omitempty"`
+	Images                []string               `json:"images,omitempty"`
+	Size                  string                 `json:"size,omitempty"`
+	Duration              *int                   `json:"duration,omitempty"`
+	Seconds               string                 `json:"seconds,omitempty"`
+	InputReference        string                 `json:"input_reference,omitempty"`
+	AspectRatio           string                 `json:"aspect_ratio,omitempty"`
+	Ratio                 *string                `json:"ratio,omitempty"`
+	Content               []map[string]any       `json:"content,omitempty"`
+	CallbackURL           *string                `json:"callback_url,omitempty"`
+	ReturnLastFrame       *bool                  `json:"return_last_frame,omitempty"`
+	ServiceTier           *string                `json:"service_tier,omitempty"`
+	ExecutionExpiresAfter *int                   `json:"execution_expires_after,omitempty"`
+	Capability            string                 `json:"capability,omitempty"`
+	ControlMode           string                 `json:"control_mode,omitempty"`
+	DurationSeconds       *int                   `json:"duration_seconds,omitempty"`
+	EndImage              string                 `json:"end_image,omitempty"`
+	InputMode             string                 `json:"input_mode,omitempty"`
+	ReferenceImages       []string               `json:"reference_images,omitempty"`
+	Resolution            string                 `json:"resolution,omitempty"`
+	WithAudio             *bool                  `json:"with_audio,omitempty"`
+	GenerateAudio         *bool                  `json:"generate_audio,omitempty"`
+	Draft                 *bool                  `json:"draft,omitempty"`
+	Tools                 []map[string]any       `json:"tools,omitempty"`
+	SafetyIdentifier      *string                `json:"safety_identifier,omitempty"`
+	Priority              *int                   `json:"priority,omitempty"`
+	Frames                *int                   `json:"frames,omitempty"`
+	Seed                  *int                   `json:"seed,omitempty"`
+	CameraFixed           *bool                  `json:"camera_fixed,omitempty"`
+	Watermark             *bool                  `json:"watermark,omitempty"`
+	Metadata              map[string]interface{} `json:"metadata,omitempty"`
 }
 
 func (t *TaskSubmitReq) GetPrompt() string {
 	return t.Prompt
+}
+
+func (t *TaskSubmitReq) DurationValue() int {
+	if t == nil || t.Duration == nil {
+		return 0
+	}
+	return *t.Duration
+}
+
+func (t *TaskSubmitReq) ResolvedSeconds() (int, error) {
+	if t == nil {
+		return 0, nil
+	}
+	seconds := t.DurationValue()
+	if seconds == 0 && t.Seconds != "" {
+		parsed, err := strconv.Atoi(t.Seconds)
+		if err != nil {
+			return 0, fmt.Errorf("invalid seconds value: %s", t.Seconds)
+		}
+		seconds = parsed
+	}
+	return seconds, nil
+}
+
+func (t *TaskSubmitReq) ResolvedSecondsOrDefault(defaultSeconds int) (int, error) {
+	seconds, err := t.ResolvedSeconds()
+	if err != nil {
+		return 0, err
+	}
+	if seconds <= 0 {
+		return defaultSeconds, nil
+	}
+	return seconds, nil
 }
 
 func (t *TaskSubmitReq) HasImage() bool {
@@ -732,12 +784,12 @@ func (t *TaskSubmitReq) UnmarshalJSON(data []byte) error {
 	if len(aux.Duration) > 0 {
 		var durationInt int
 		if err := common.Unmarshal(aux.Duration, &durationInt); err == nil {
-			t.Duration = durationInt
+			t.Duration = &durationInt
 		} else {
 			var durationStr string
 			if err := common.Unmarshal(aux.Duration, &durationStr); err == nil && durationStr != "" {
 				if v, err := strconv.Atoi(durationStr); err == nil {
-					t.Duration = v
+					t.Duration = &v
 				}
 			}
 		}

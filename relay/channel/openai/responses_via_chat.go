@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/MAX-API-Next/MAX-API/common"
 	"github.com/MAX-API-Next/MAX-API/dto"
@@ -73,7 +74,10 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			streamErr = types.NewOpenAIError(err, types.ErrorCodeJsonMarshalFailed, http.StatusInternalServerError)
 			return false
 		}
-		helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: event.Type}, string(data))
+		if err := helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: event.Type}, string(data)); err != nil {
+			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			return false
+		}
 		return true
 	}
 
@@ -83,12 +87,14 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			return
 		}
 
-		var errorResp dto.OpenAITextResponse
-		if err := common.UnmarshalJsonStr(data, &errorResp); err == nil {
-			if oaiError := errorResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
-				streamErr = types.WithOpenAIError(*oaiError, resp.StatusCode)
-				sr.Stop(streamErr)
-				return
+		if strings.Contains(data, `"error"`) {
+			var errorResp dto.OpenAITextResponse
+			if err := common.UnmarshalJsonStr(data, &errorResp); err == nil {
+				if oaiError := errorResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
+					streamErr = types.WithOpenAIError(*oaiError, resp.StatusCode)
+					sr.Stop(streamErr)
+					return
+				}
 			}
 		}
 

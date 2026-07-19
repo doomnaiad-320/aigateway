@@ -221,18 +221,20 @@ type CompletionsStreamResponse struct {
 }
 
 type Usage struct {
-	PromptTokens         int    `json:"prompt_tokens"`
-	CompletionTokens     int    `json:"completion_tokens"`
-	TotalTokens          int    `json:"total_tokens"`
-	PromptCacheHitTokens int    `json:"prompt_cache_hit_tokens,omitempty"`
-	UsageSemantic        string `json:"usage_semantic,omitempty"`
-	UsageSource          string `json:"usage_source,omitempty"`
+	PromptTokens         int           `json:"prompt_tokens"`
+	CompletionTokens     int           `json:"completion_tokens"`
+	TotalTokens          int           `json:"total_tokens"`
+	PromptCacheHitTokens int           `json:"prompt_cache_hit_tokens,omitempty"`
+	UsageSemantic        string        `json:"usage_semantic,omitempty"`
+	UsageSource          string        `json:"usage_source,omitempty"`
+	BillingUsage         *BillingUsage `json:"billing_usage,omitempty"`
 
-	PromptTokensDetails    InputTokenDetails  `json:"prompt_tokens_details"`
-	CompletionTokenDetails OutputTokenDetails `json:"completion_tokens_details"`
-	InputTokens            int                `json:"input_tokens"`
-	OutputTokens           int                `json:"output_tokens"`
-	InputTokensDetails     *InputTokenDetails `json:"input_tokens_details"`
+	PromptTokensDetails    InputTokenDetails   `json:"prompt_tokens_details"`
+	CompletionTokenDetails OutputTokenDetails  `json:"completion_tokens_details"`
+	OutputTokensDetails    *OutputTokenDetails `json:"output_tokens_details,omitempty"`
+	InputTokens            int                 `json:"input_tokens"`
+	OutputTokens           int                 `json:"output_tokens"`
+	InputTokensDetails     *InputTokenDetails  `json:"input_tokens_details"`
 
 	// claude cache 1h
 	ClaudeCacheCreation5mTokens int `json:"claude_cache_creation_5_m_tokens"`
@@ -255,9 +257,45 @@ type OpenAIVideoResponse struct {
 type InputTokenDetails struct {
 	CachedTokens         int `json:"cached_tokens"`
 	CachedCreationTokens int `json:"cached_creation_tokens,omitempty"`
+	CacheWriteTokens     int `json:"cache_write_tokens,omitempty"`
 	TextTokens           int `json:"text_tokens"`
 	AudioTokens          int `json:"audio_tokens"`
 	ImageTokens          int `json:"image_tokens"`
+}
+
+func CopyInputTokenDetails(dst *InputTokenDetails, src *InputTokenDetails, overwriteExisting bool) {
+	if dst == nil || src == nil {
+		return
+	}
+	if overwriteExisting || dst.CachedTokens == 0 {
+		dst.CachedTokens = src.CachedTokens
+	}
+	if overwriteExisting || dst.CachedCreationTokens == 0 {
+		dst.CachedCreationTokens = src.CachedCreationTokens
+	}
+	if overwriteExisting || dst.CacheWriteTokens == 0 {
+		dst.CacheWriteTokens = src.CacheWriteTokens
+	}
+	if overwriteExisting || dst.TextTokens == 0 {
+		dst.TextTokens = src.TextTokens
+	}
+	if overwriteExisting || dst.ImageTokens == 0 {
+		dst.ImageTokens = src.ImageTokens
+	}
+	if overwriteExisting || dst.AudioTokens == 0 {
+		dst.AudioTokens = src.AudioTokens
+	}
+}
+
+func (d InputTokenDetails) CacheCreationTokensTotal() int {
+	total := d.CachedCreationTokens
+	if d.CacheWriteTokens > total {
+		total = d.CacheWriteTokens
+	}
+	if total < 0 {
+		return 0
+	}
+	return total
 }
 
 type OutputTokenDetails struct {
@@ -265,6 +303,24 @@ type OutputTokenDetails struct {
 	AudioTokens     int `json:"audio_tokens"`
 	ImageTokens     int `json:"image_tokens"`
 	ReasoningTokens int `json:"reasoning_tokens"`
+}
+
+func CopyOutputTokenDetails(dst *OutputTokenDetails, src *OutputTokenDetails, overwriteExisting bool) {
+	if dst == nil || src == nil {
+		return
+	}
+	if overwriteExisting || dst.TextTokens == 0 {
+		dst.TextTokens = src.TextTokens
+	}
+	if overwriteExisting || dst.AudioTokens == 0 {
+		dst.AudioTokens = src.AudioTokens
+	}
+	if overwriteExisting || dst.ImageTokens == 0 {
+		dst.ImageTokens = src.ImageTokens
+	}
+	if overwriteExisting || dst.ReasoningTokens == 0 {
+		dst.ReasoningTokens = src.ReasoningTokens
+	}
 }
 
 type OpenAIResponsesResponse struct {

@@ -17,6 +17,8 @@ import (
 	"github.com/MAX-API-Next/MAX-API/types"
 )
 
+const maxUpstreamErrorBodyBytes = 1 << 20
+
 func MidjourneyErrorWrapper(code int, desc string) *dto.MidjourneyResponse {
 	return &dto.MidjourneyResponse{
 		Code:        code,
@@ -86,13 +88,16 @@ func ClaudeErrorWrapperLocal(err error, code string, statusCode int) *dto.Claude
 func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) (maxApiErr *types.MaxAPIError) {
 	maxApiErr = types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
 
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, truncated, err := readUpstreamErrorBody(resp.Body)
 	if err != nil {
 		return
 	}
 	CloseResponseBodyGracefully(resp)
 	var errResponse dto.GeneralErrorResponse
 	responseBodyText := string(responseBody)
+	if truncated {
+		responseBodyText += fmt.Sprintf("...[truncated after %d bytes]", maxUpstreamErrorBodyBytes)
+	}
 	responseBodyPreview := common.LocalLogPreview(responseBodyText)
 	buildErrWithBody := func(message string) error {
 		if message == "" {
@@ -128,6 +133,17 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 		maxApiErr.Err = buildErrWithBody(maxApiErr.Error())
 	}
 	return
+}
+
+func readUpstreamErrorBody(body io.Reader) ([]byte, bool, error) {
+	responseBody, err := io.ReadAll(io.LimitReader(body, maxUpstreamErrorBodyBytes+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if len(responseBody) <= maxUpstreamErrorBodyBytes {
+		return responseBody, false, nil
+	}
+	return responseBody[:maxUpstreamErrorBodyBytes], true, nil
 }
 
 func ResetStatusCode(maxApiErr *types.MaxAPIError, statusCodeMappingStr string) {
@@ -214,10 +230,19 @@ func TaskErrorFromAPIError(apiErr *types.MaxAPIError) *dto.TaskError {
 	if apiErr == nil {
 		return nil
 	}
+	message := apiErr.Error()
 	return &dto.TaskError{
 		Code:       string(apiErr.GetErrorCode()),
-		Message:    apiErr.Err.Error(),
+		Message:    message,
 		StatusCode: apiErr.StatusCode,
 		Error:      apiErr.Err,
 	}
+}
+
+func TaskErrorLocalFromAPIError(apiErr *types.MaxAPIError) *dto.TaskError {
+	taskErr := TaskErrorFromAPIError(apiErr)
+	if taskErr != nil {
+		taskErr.LocalError = true
+	}
+	return taskErr
 }

@@ -18,6 +18,7 @@ For commercial licensing, please contact https://github.com/MAX-API-Next/MAX-API
 */
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
+import { useMediaQuery } from '@/hooks'
 import { useTranslation } from 'react-i18next'
 import { IconGithub } from '@/assets/brand-icons'
 import { useAuthStore } from '@/stores/auth-store'
@@ -42,9 +43,11 @@ import { ThemeSwitch } from '@/components/theme-switch'
 import { defaultTopNavLinks } from '../config/top-nav.config'
 import type { TopNavLink } from '../types'
 import { HeaderLogo } from './header-logo'
+import { PublicHeaderToolsMenu } from './header-tools-menu'
 
 const AUTH_PROMPT_SECONDS = 5
 const MAX_API_GITHUB_URL = 'https://github.com/MAX-API-Next/MAX-API'
+const DESKTOP_NAVIGATION_MEDIA_QUERY = '(min-width: 1024px)'
 
 type AuthPromptTarget = {
   title: string
@@ -99,6 +102,7 @@ export function PublicHeader(props: PublicHeaderProps) {
   const notifications = useNotifications()
   const routerState = useRouterState()
   const pathname = routerState.location.pathname
+  const isDesktopNavigation = useMediaQuery(DESKTOP_NAVIGATION_MEDIA_QUERY)
 
   const user = auth.user
   const isAuthenticated = !!user
@@ -118,6 +122,17 @@ export function PublicHeader(props: PublicHeaderProps) {
       document.body.style.overflow = ''
     }
   }, [mobileOpen])
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia(DESKTOP_NAVIGATION_MEDIA_QUERY)
+    const closeMobileMenuOnDesktop = (event: MediaQueryListEvent) => {
+      if (event.matches) setMobileOpen(false)
+    }
+
+    mediaQuery.addEventListener('change', closeMobileMenuOnDesktop)
+    return () =>
+      mediaQuery.removeEventListener('change', closeMobileMenuOnDesktop)
+  }, [])
 
   useEffect(() => {
     if (!authPromptTarget) return
@@ -191,7 +206,7 @@ export function PublicHeader(props: PublicHeaderProps) {
         <div
           className={cn(
             'pointer-events-auto mx-auto transition-all duration-700 ease-[cubic-bezier(0.16,1,0.3,1)]',
-            scrolled ? 'max-w-[52rem] px-3 pt-1' : 'max-w-7xl px-4 pt-0 md:px-6'
+            scrolled ? 'max-w-[52rem] px-3 pt-1' : 'max-w-7xl px-4 pt-0 lg:px-6'
           )}
         >
           <nav
@@ -199,7 +214,7 @@ export function PublicHeader(props: PublicHeaderProps) {
               'flex items-center justify-between transition-all duration-700 ease-[cubic-bezier(0.16,1,0.3,1)]',
               scrolled
                 ? 'bg-background/72 ring-border/50 dark:bg-background/72 h-12 rounded-xl pr-1.5 pl-4 shadow-[0_2px_16px_-6px_rgba(0,0,0,0.08),0_0_0_0.5px_rgba(0,0,0,0.02)] ring-[0.5px] backdrop-blur-2xl dark:shadow-[0_2px_16px_-6px_rgba(0,0,0,0.4)]'
-                : 'h-16 rounded-none px-2 md:h-12 md:rounded-xl md:border md:border-slate-300/45 md:bg-white/54 md:px-4 md:shadow-sm md:backdrop-blur-xl md:dark:border-white/10 md:dark:bg-white/[0.055]'
+                : 'bg-background/72 h-16 rounded-none px-2 shadow-sm backdrop-blur-xl lg:h-12 lg:rounded-xl lg:border lg:border-slate-300/45 lg:bg-white/54 lg:px-4 lg:dark:border-white/10 lg:dark:bg-white/[0.055]'
             )}
           >
             {/* Logo */}
@@ -221,13 +236,13 @@ export function PublicHeader(props: PublicHeaderProps) {
                   />
                 )}
               </div>
-              <span className='font-serif text-[15px] font-bold tracking-[-0.01em]'>
+              <span className='font-serif text-[15px] font-bold'>
                 {loading ? <Skeleton className='h-4 w-16' /> : displaySiteName}
               </span>
             </Link>
 
             {/* Desktop nav */}
-            <div className='hidden items-center gap-0.5 sm:flex'>
+            <div className='hidden items-center gap-0.5 lg:flex'>
               {links.map((link, i) => {
                 const isActive = pathname === link.href
                 if (link.external) {
@@ -273,7 +288,7 @@ export function PublicHeader(props: PublicHeaderProps) {
               <GitHubLinkButton />
               {showLanguageSwitcher && <LanguageSwitcher />}
               {showThemeSwitch && <ThemeSwitch />}
-              {showNotifications && (
+              {showNotifications && isDesktopNavigation && (
                 <NotificationPopover
                   open={notifications.popoverOpen}
                   onOpenChange={notifications.setPopoverOpen}
@@ -308,9 +323,25 @@ export function PublicHeader(props: PublicHeaderProps) {
             </div>
 
             {/* Mobile: compact actions + hamburger */}
-            <div className='flex items-center gap-2 sm:hidden'>
-              <GitHubLinkButton className='size-9' />
-              {showThemeSwitch && <ThemeSwitch />}
+            <div className='flex items-center gap-1 lg:hidden'>
+              {showNotifications && !isDesktopNavigation && (
+                <NotificationPopover
+                  open={notifications.popoverOpen}
+                  onOpenChange={notifications.setPopoverOpen}
+                  onCloseForToday={notifications.closeForToday}
+                  unreadCount={notifications.unreadCount}
+                  activeTab={notifications.activeTab}
+                  onTabChange={notifications.setActiveTab}
+                  notice={notifications.notice}
+                  announcements={notifications.announcements}
+                  loading={notifications.loading}
+                />
+              )}
+              <PublicHeaderToolsMenu
+                githubUrl={MAX_API_GITHUB_URL}
+                showLanguageSwitcher={showLanguageSwitcher}
+                showThemeSwitch={showThemeSwitch}
+              />
               {showAuthButtons && !loading && isAuthenticated && (
                 <ProfileDropdown />
               )}
@@ -351,7 +382,7 @@ export function PublicHeader(props: PublicHeaderProps) {
       {/* Mobile full-screen overlay */}
       <div
         className={cn(
-          'bg-background/98 fixed inset-0 z-40 backdrop-blur-2xl transition-all duration-500 ease-[cubic-bezier(0.16,1,0.3,1)] sm:pointer-events-none sm:hidden',
+          'bg-background/98 fixed inset-0 z-40 backdrop-blur-2xl transition-all duration-500 ease-[cubic-bezier(0.16,1,0.3,1)] lg:pointer-events-none lg:hidden',
           mobileOpen
             ? 'pointer-events-auto opacity-100'
             : 'pointer-events-none opacity-0'
@@ -362,7 +393,7 @@ export function PublicHeader(props: PublicHeaderProps) {
             {links.map((link, i) => {
               const isActive = pathname === link.href
               const linkClassName = cn(
-                'flex items-center gap-3 py-3 text-base font-medium tracking-tight transition-all duration-500 ease-[cubic-bezier(0.16,1,0.3,1)]',
+                'flex items-center gap-3 py-3 text-base font-medium transition-all duration-500 ease-[cubic-bezier(0.16,1,0.3,1)]',
                 mobileOpen
                   ? 'translate-y-0 opacity-100'
                   : 'translate-y-4 opacity-0',
