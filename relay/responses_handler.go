@@ -40,12 +40,7 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (maxAPIError *
 	case *dto.OpenAIResponsesRequest:
 		responsesReq = req
 	case *dto.OpenAIResponsesCompactionRequest:
-		responsesReq = &dto.OpenAIResponsesRequest{
-			Model:              req.Model,
-			Input:              req.Input,
-			Instructions:       req.Instructions,
-			PreviousResponseID: req.PreviousResponseID,
-		}
+		responsesReq = req.ToResponsesRequest()
 	default:
 		return types.NewErrorWithStatusCode(
 			fmt.Errorf("invalid request type, expected dto.OpenAIResponsesRequest or dto.OpenAIResponsesCompactionRequest, got %T", info.Request),
@@ -76,9 +71,21 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (maxAPIError *
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())
 		}
-		requestBody = common.ReaderOnly(storage)
+		body, size, closer, err := relaycommon.PreparePassThroughJSONBody(storage, info.ChannelOtherSettings)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		}
+		if closer != nil {
+			defer closer.Close()
+		}
+		info.UpstreamRequestBodySize = size
+		requestBody = body
 	} else {
 		convertedRequest, err := adaptor.ConvertOpenAIResponsesRequest(c, info, *request)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		}
+		convertedRequest, err = filterResponsesRequestFields(convertedRequest, info, adaptor)
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 		}
@@ -134,9 +141,21 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (maxAPIError *
 
 	usage, maxAPIError := adaptor.DoResponse(c, httpResp, info)
 	if maxAPIError != nil {
+		// Responses streams can deliver billable output before an upstream
+		// cancellation, disconnect, or incomplete terminal event. Reuse the
+		// existing partial settlement path instead of refunding the whole
+		// reservation or claiming a successful request.
+		if partial, ok := usage.(*dto.Usage); ok && partial != nil &&
+			types.IsSkipRetryError(maxAPIError) && info.IsStream &&
+			info.RelayMode == relayconstant.RelayModeResponses {
+			service.PostPartialConsumeQuota(c, info, partial)
+		}
 		// reset status code 重置状态码
 		service.ResetStatusCode(maxAPIError, statusCodeMappingStr)
 		return maxAPIError
+	}
+	if !info.IsStream {
+		info.SetFirstResponseTime()
 	}
 
 	usageDto := usage.(*dto.Usage)

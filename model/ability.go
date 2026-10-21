@@ -66,9 +66,22 @@ func GetAllEnableAbilities() []Ability {
 }
 
 func GetChannel(group string, model string, retry int, requestPath string) (*Channel, error) {
-	channelQuery, err := getChannelQuery(group, model, retry)
-	if err != nil {
-		return nil, err
+	return GetChannelExcluding(group, model, retry, requestPath, nil)
+}
+
+// GetChannelExcluding selects a channel while excluding channels already tried
+// during the current request's retry sequence.
+func GetChannelExcluding(group string, model string, retry int, requestPath string, excludedChannelIDs map[int]struct{}) (*Channel, error) {
+	var channelQuery *gorm.DB
+	var err error
+	if channelHealthRoutingEnabled() {
+		channelQuery = DB.Model(&Ability{}).
+			Where(abilityCol("group")+" = ? and "+abilityCol("model")+" = ? and "+abilityCol("enabled")+" = ?", group, model, true)
+	} else {
+		channelQuery, err = getChannelQuery(group, model, retry)
+		if err != nil {
+			return nil, err
+		}
 	}
 	abilityRows, err := findAbilityRows(channelQuery)
 	if err != nil {
@@ -88,7 +101,10 @@ func GetChannel(group string, model string, retry int, requestPath string) (*Cha
 		return nil, nil
 	}
 
-	channelId, ok := selectChannelIdFromAbilities(abilities, retry)
+	channelId, ok, err := selectChannelIdFromAbilities(abilities, retry, excludedChannelIDs)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, nil
 	}
@@ -160,14 +176,18 @@ func abilityCol(name string) string {
 	return "`abilities`.`" + name + "`"
 }
 
-func selectChannelIdFromAbilities(abilities []Ability, retry int) (int, bool) {
+func selectChannelIdFromAbilities(abilities []Ability, retry int, excludedChannelIDs map[int]struct{}) (int, bool, error) {
 	if len(abilities) == 0 {
-		return 0, false
+		return 0, false, nil
 	}
-	priorities := make([]int64, 0, len(abilities))
+	routingCandidates := buildAbilityRoutingCandidates(abilities)
+	priorities := make([]int64, 0, len(routingCandidates))
 	seenPriorities := make(map[int64]struct{}, len(abilities))
-	for _, ability := range abilities {
-		priority := abilityPriority(ability)
+	for _, candidate := range routingCandidates {
+		if _, excluded := excludedChannelIDs[candidate.ability.ChannelId]; excluded {
+			continue
+		}
+		priority := candidate.priority
 		if _, ok := seenPriorities[priority]; ok {
 			continue
 		}
@@ -177,33 +197,40 @@ func selectChannelIdFromAbilities(abilities []Ability, retry int) (int, bool) {
 	sort.Slice(priorities, func(i, j int) bool {
 		return priorities[i] > priorities[j]
 	})
+	if len(priorities) == 0 {
+		return 0, false, nil
+	}
 	if retry >= len(priorities) {
 		retry = len(priorities) - 1
 	}
 	targetPriority := priorities[retry]
 
-	targetAbilities := make([]Ability, 0, len(abilities))
-	for _, ability := range abilities {
-		if abilityPriority(ability) == targetPriority {
-			targetAbilities = append(targetAbilities, ability)
+	targetAbilities := make([]Ability, 0, len(routingCandidates))
+	for _, candidate := range routingCandidates {
+		if _, excluded := excludedChannelIDs[candidate.ability.ChannelId]; !excluded && candidate.priority == targetPriority {
+			targetAbilities = append(targetAbilities, candidate.ability)
 		}
 	}
 	if len(targetAbilities) == 0 {
-		return 0, false
+		return 0, false, nil
 	}
 
 	weightSum := uint(0)
 	for _, ability_ := range targetAbilities {
 		weightSum += ability_.Weight + 10
 	}
-	weight := common.GetRandomInt(int(weightSum))
-	for _, ability_ := range targetAbilities {
-		weight -= int(ability_.Weight) + 10
-		if weight <= 0 {
-			return ability_.ChannelId, true
-		}
+	weight, err := common.SecureRandomInt(int(weightSum))
+	if err != nil {
+		return 0, false, fmt.Errorf("select channel by weight: %w", err)
 	}
-	return 0, false
+	for _, ability_ := range targetAbilities {
+		candidateWeight := int(ability_.Weight) + 10
+		if weight < candidateWeight {
+			return ability_.ChannelId, true, nil
+		}
+		weight -= candidateWeight
+	}
+	return 0, false, nil
 }
 
 func abilityPriority(ability Ability) int64 {
@@ -234,21 +261,17 @@ func filterAbilityRowsByRequestPath(abilityRows []AbilityWithChannel, requestPat
 		seen[row.ChannelId] = struct{}{}
 		channelIds = append(channelIds, row.ChannelId)
 	}
-	if len(channelIds) == 0 {
-		return abilities, nil
-	}
-
 	var channels []*Channel
-	if err := DB.Select("id", "type", "settings").
-		Where("id IN ? AND type = ?", channelIds, constant.ChannelTypeAdvancedCustom).
-		Find(&channels).Error; err != nil {
-		return nil, err
+	if len(channelIds) > 0 {
+		if err := DB.Select("id", "type", "settings").
+			Where("id IN ? AND type = ?", channelIds, constant.ChannelTypeAdvancedCustom).
+			Find(&channels).Error; err != nil {
+			return nil, err
+		}
 	}
 
-	advancedChannelIds := make(map[int]struct{}, len(channels))
 	advancedConfigs := make(map[int]*dto.AdvancedCustomConfig)
 	for _, channel := range channels {
-		advancedChannelIds[channel.Id] = struct{}{}
 		config, err := validatedAdvancedCustomConfigFromChannel(channel)
 		if err == nil && config != nil {
 			advancedConfigs[channel.Id] = config
@@ -260,14 +283,16 @@ func filterAbilityRowsByRequestPath(abilityRows []AbilityWithChannel, requestPat
 	}
 
 	filtered := make([]Ability, 0, len(abilities))
-	for _, ability := range abilities {
-		_, isAdvancedCustom := advancedChannelIds[ability.ChannelId]
-		if !isAdvancedCustom {
-			filtered = append(filtered, ability)
+	for _, row := range abilityRows {
+		if !channelTypeSupportsRequestPath(row.ChannelType, requestPath) {
 			continue
 		}
-		if config := advancedConfigs[ability.ChannelId]; config != nil && config.SupportsPath(requestPath) {
-			filtered = append(filtered, ability)
+		if row.ChannelType != constant.ChannelTypeAdvancedCustom {
+			filtered = append(filtered, row.Ability)
+			continue
+		}
+		if config := advancedConfigs[row.ChannelId]; config != nil && config.SupportsPath(requestPath) {
+			filtered = append(filtered, row.Ability)
 		}
 	}
 	return filtered, nil

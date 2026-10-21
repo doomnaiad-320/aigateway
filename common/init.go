@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +14,11 @@ import (
 
 	"github.com/MAX-API-Next/MAX-API/constant"
 )
+
+func SessionCookieSecureForServerAddress(serverAddress string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(serverAddress))
+	return err == nil && strings.EqualFold(parsed.Scheme, "https") && parsed.Host != ""
+}
 
 var (
 	Port         = flag.Int("port", 3000, "the listening port")
@@ -87,15 +93,10 @@ func InitEnv() {
 	SessionCookieSecure = GetEnvOrDefaultBool("SESSION_COOKIE_SECURE", false)
 	SMTPStartTLSEnabled = GetEnvOrDefaultBool("SMTP_STARTTLS_ENABLE", GetEnvOrDefaultBool("SMTP_STARTTLS_ENABLED", false))
 	SMTPInsecureSkipVerify = GetEnvOrDefaultBool("SMTP_INSECURE_SKIP_VERIFY", GetEnvOrDefaultBool("SMTP_TLS_INSECURE_SKIP_VERIFY", false))
-	TrustedProxies = append([]string(nil), DefaultTrustedProxies...)
-	if trustedProxies := strings.TrimSpace(os.Getenv("TRUSTED_PROXIES")); trustedProxies != "" {
-		TrustedProxies = nil
-		for _, proxy := range strings.Split(trustedProxies, ",") {
-			proxy = strings.TrimSpace(proxy)
-			if proxy != "" {
-				TrustedProxies = append(TrustedProxies, proxy)
-			}
-		}
+	var trustedProxyErr error
+	TrustedProxies, trustedProxyErr = parseTrustedProxies(os.Getenv("TRUSTED_PROXIES"))
+	if trustedProxyErr != nil {
+		log.Fatal(trustedProxyErr)
 	}
 	IsMasterNode = os.Getenv("NODE_TYPE") != "slave"
 	initNodeNameIdentity()
@@ -126,23 +127,32 @@ func InitEnv() {
 	GeminiSafetySetting = GetEnvOrDefaultString("GEMINI_SAFETY_SETTING", "BLOCK_NONE")
 	CohereSafetySetting = GetEnvOrDefaultString("COHERE_SAFETY_SETTING", "NONE")
 
-	// Initialize rate limit variables
+	initRateLimitEnv()
+	initConstantEnv()
+}
+
+func initRateLimitEnv() {
 	GlobalApiRateLimitEnable = GetEnvOrDefaultBool("GLOBAL_API_RATE_LIMIT_ENABLE", true)
 	GlobalApiRateLimitNum = GetEnvOrDefault("GLOBAL_API_RATE_LIMIT", 720)
 	GlobalApiRateLimitDuration = int64(GetEnvOrDefault("GLOBAL_API_RATE_LIMIT_DURATION", 180))
 
 	GlobalWebRateLimitEnable = GetEnvOrDefaultBool("GLOBAL_WEB_RATE_LIMIT_ENABLE", true)
-	GlobalWebRateLimitNum = GetEnvOrDefault("GLOBAL_WEB_RATE_LIMIT", 60)
+	GlobalWebRateLimitNum = GetEnvOrDefault("GLOBAL_WEB_RATE_LIMIT", 600)
 	GlobalWebRateLimitDuration = int64(GetEnvOrDefault("GLOBAL_WEB_RATE_LIMIT_DURATION", 180))
 
 	CriticalRateLimitEnable = GetEnvOrDefaultBool("CRITICAL_RATE_LIMIT_ENABLE", true)
-	CriticalRateLimitNum = GetEnvOrDefault("CRITICAL_RATE_LIMIT", 20)
+	CriticalRateLimitNum = GetEnvOrDefault("CRITICAL_RATE_LIMIT", 200)
 	CriticalRateLimitDuration = int64(GetEnvOrDefault("CRITICAL_RATE_LIMIT_DURATION", 20*60))
+	CriticalRouteRateLimitNum = GetEnvOrDefault("CRITICAL_ROUTE_RATE_LIMIT", 200)
+	CriticalRouteRateLimitDuration = int64(GetEnvOrDefault("CRITICAL_ROUTE_RATE_LIMIT_DURATION", 20*60))
+
+	LoginRateLimitEnable = GetEnvOrDefaultBool("LOGIN_RATE_LIMIT_ENABLE", true)
+	LoginRateLimitNum = GetEnvOrDefault("LOGIN_RATE_LIMIT", 100)
+	LoginRateLimitDuration = int64(GetEnvOrDefault("LOGIN_RATE_LIMIT_DURATION", 15*60))
 
 	SearchRateLimitEnable = GetEnvOrDefaultBool("SEARCH_RATE_LIMIT_ENABLE", true)
-	SearchRateLimitNum = GetEnvOrDefault("SEARCH_RATE_LIMIT", 10)
+	SearchRateLimitNum = GetEnvOrDefault("SEARCH_RATE_LIMIT", 100)
 	SearchRateLimitDuration = int64(GetEnvOrDefault("SEARCH_RATE_LIMIT_DURATION", 60))
-	initConstantEnv()
 }
 
 func initConstantEnv() {
@@ -168,7 +178,8 @@ func initConstantEnv() {
 	constant.ErrorLogEnabled = GetEnvOrDefaultBool("ERROR_LOG_ENABLED", constant.DefaultErrorLogEnabled)
 	// 任务轮询时查询的最大数量
 	constant.TaskQueryLimit = GetEnvOrDefault("TASK_QUERY_LIMIT", constant.DefaultTaskQueryLimit)
-	// 异步任务超时时间（分钟），超过此时间未完成的任务将被标记为失败并退款。0 表示禁用。
+	// 异步任务超时时间（分钟）。已确认上游 ID 的任务失败后退款；无法确认
+	// 上游是否接受的提交占位只标记人工核对，避免错误退款。0 表示禁用。
 	constant.TaskTimeoutMinutes = GetEnvOrDefault("TASK_TIMEOUT_MINUTES", constant.DefaultTaskTimeoutMinutes)
 
 	soraPatchStr := GetEnvOrDefaultString("TASK_PRICE_PATCH", "")

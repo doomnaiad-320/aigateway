@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"github.com/MAX-API-Next/MAX-API/middleware"
 	"github.com/MAX-API-Next/MAX-API/model"
 	"github.com/MAX-API-Next/MAX-API/pkg/billingexpr"
+	"github.com/MAX-API-Next/MAX-API/pkg/channelhealth"
 	"github.com/MAX-API-Next/MAX-API/relay"
 	relaycommon "github.com/MAX-API-Next/MAX-API/relay/common"
 	relayconstant "github.com/MAX-API-Next/MAX-API/relay/constant"
@@ -197,6 +199,8 @@ func testChannel(channel *model.Channel, testUserID int, testModel string, endpo
 			relayFormat = types.RelayFormatOpenAIResponses
 		case constant.EndpointTypeOpenAIResponseCompact:
 			relayFormat = types.RelayFormatOpenAIResponsesCompaction
+		case constant.EndpointTypeOpenAIAlphaSearch:
+			relayFormat = types.RelayFormatOpenAIAlphaSearch
 		case constant.EndpointTypeAnthropic:
 			relayFormat = types.RelayFormatClaude
 		case constant.EndpointTypeGemini:
@@ -233,6 +237,9 @@ func testChannel(channel *model.Channel, testUserID int, testModel string, endpo
 		}
 		if strings.HasPrefix(c.Request.URL.Path, "/v1/responses/compact") {
 			relayFormat = types.RelayFormatOpenAIResponsesCompaction
+		}
+		if c.Request.URL.Path == "/v1/alpha/search" {
+			relayFormat = types.RelayFormatOpenAIAlphaSearch
 		}
 	}
 
@@ -374,6 +381,21 @@ func testChannel(channel *model.Channel, testUserID int, testModel string, endpo
 				maxAPIError: types.NewError(errors.New("invalid response compaction request type"), types.ErrorCodeConvertRequestFailed),
 			}
 		}
+	case relayconstant.RelayModeAlphaSearch:
+		if alphaReq, ok := request.(*dto.AlphaSearchRequest); ok {
+			var body map[string]any
+			err = common.Unmarshal(alphaReq.RawBody, &body)
+			if err == nil {
+				body["model"] = alphaReq.Model
+				convertedRequest = body
+			}
+		} else {
+			return testResult{
+				context:     c,
+				localErr:    errors.New("invalid alpha search request type"),
+				maxAPIError: types.NewError(errors.New("invalid alpha search request type"), types.ErrorCodeConvertRequestFailed),
+			}
+		}
 	default:
 		// Chat/Completion 等其他请求类型
 		if generalReq, ok := request.(*dto.GeneralOpenAIRequest); ok {
@@ -461,6 +483,32 @@ func testChannel(channel *model.Channel, testUserID int, testModel string, endpo
 				maxAPIError: types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError),
 			}
 		}
+	}
+	if info.RelayMode == relayconstant.RelayModeAlphaSearch {
+		if httpResp == nil {
+			return testResult{
+				context:     c,
+				localErr:    errors.New("alpha search response is nil"),
+				maxAPIError: types.NewOpenAIError(errors.New("alpha search response is nil"), types.ErrorCodeBadResponse, http.StatusInternalServerError),
+			}
+		}
+		respBody, err := readTestResponseBody(httpResp.Body, false)
+		if err != nil {
+			return testResult{
+				context:     c,
+				localErr:    err,
+				maxAPIError: types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError),
+			}
+		}
+		if bodyErr := validateTestResponseBody(respBody, false); bodyErr != nil {
+			return testResult{
+				context:     c,
+				localErr:    bodyErr,
+				maxAPIError: types.NewOpenAIError(bodyErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
+			}
+		}
+		common.SysLog(fmt.Sprintf("testing channel #%d alpha search response: \n%s", channel.Id, string(respBody)))
+		return testResult{context: c}
 	}
 	usageA, respErr := adaptor.DoResponse(c, httpResp, info)
 	if respErr != nil {
@@ -737,6 +785,24 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 				Model: model,
 				Input: testResponsesInput,
 			}
+		case constant.EndpointTypeOpenAIAlphaSearch:
+			rawBody, err := common.Marshal(map[string]any{
+				"model": model,
+				"input": []map[string]any{{
+					"role":    "user",
+					"content": "Search for the latest artificial intelligence news.",
+				}},
+				"commands": map[string]any{
+					"search_query": []map[string]any{{"q": "latest artificial intelligence news"}},
+				},
+			})
+			if err != nil {
+				rawBody = []byte(`{"model":""}`)
+			}
+			return &dto.AlphaSearchRequest{
+				Model:   model,
+				RawBody: rawBody,
+			}
 		case constant.EndpointTypeAnthropic, constant.EndpointTypeGemini, constant.EndpointTypeOpenAI:
 			// 返回 GeneralOpenAIRequest
 			maxTokens := uint(16)
@@ -893,7 +959,7 @@ func TestChannel(c *gin.Context) {
 var testAllChannelsLock sync.Mutex
 var testAllChannelsRunning bool = false
 
-func testChannels(channels []*model.Channel, testUserID int, notify bool, allowDisable bool) error {
+func testChannels(channels []*model.Channel, testUserID int, notify bool, allowDisable bool, runtimeStates map[int]channelhealth.RuntimeState) error {
 	testAllChannelsLock.Lock()
 	if testAllChannelsRunning {
 		testAllChannelsLock.Unlock()
@@ -918,6 +984,23 @@ func testChannels(channels []*model.Channel, testUserID int, notify bool, allowD
 				continue
 			}
 			isChannelEnabled := channel.Status == common.ChannelStatusEnabled
+			setting := operation_setting.GetMonitorSetting()
+			var runtimeState channelhealth.RuntimeState
+			var hasRuntimeState bool
+			if setting.TimeoutAutoDisableEnabled {
+				if runtimeStates != nil {
+					runtimeState, hasRuntimeState = runtimeStates[channel.Id]
+				} else {
+					runtimeState, hasRuntimeState = loadChannelHealthRuntimeState(channel.Id)
+				}
+			}
+			runtimeRecoveryProbe := hasRuntimeState && runtimeState.RuntimeDisabled &&
+				(runtimeState.DisabledUntil.IsZero() || !time.Now().Before(runtimeState.DisabledUntil)) &&
+				setting.TimeoutAutoDisableRecoveryMode == operation_setting.TimeoutAutoDisableRecoveryProbe &&
+				setting.TimeoutAutoDisableDurationSeconds > 0
+			if hasRuntimeState && !runtimeRecoveryProbe {
+				continue
+			}
 			tik := time.Now()
 			result := testChannel(channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel))
 			tok := time.Now()
@@ -940,12 +1023,31 @@ func testChannels(channels []*model.Channel, testUserID int, notify bool, allowD
 			}
 
 			// disable channel
-			if allowDisable && isChannelEnabled && shouldBanChannel && channel.GetAutoBan() {
+			if allowDisable && !runtimeRecoveryProbe && isChannelEnabled && shouldBanChannel && channel.GetAutoBan() {
 				processChannelError(result.context, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()), maxAPIError)
 			}
 
+			if runtimeRecoveryProbe {
+				probeID := fmt.Sprintf("scheduled-channel-recovery:%d:%d", channel.Id, tik.UnixNano())
+				probeSetting := operation_setting.GetMonitorSetting()
+				probeResult, probeErr := channelhealth.RecoverRuntimeState(context.Background(), channel.Id, probeID, result.localErr == nil && maxAPIError == nil, probeSetting)
+				if probeErr != nil {
+					common.SysLog(fmt.Sprintf("channel %d runtime recovery probe failed: %v", channel.Id, probeErr))
+				} else if probeResult.Transition != "" {
+					common.PublishChannelHealthRuntimeTransition(common.ChannelHealthRuntimeTransition{
+						ChannelID:       channel.Id,
+						Transition:      probeResult.Transition,
+						Penalty:         probeResult.State.Penalty,
+						PenaltyUntil:    probeResult.State.PenaltyUntil,
+						RuntimeDisabled: probeResult.State.RuntimeDisabled,
+						DisabledUntil:   probeResult.State.DisabledUntil,
+						ObservedAt:      probeResult.State.LastObservedAt,
+					})
+				}
+			}
+
 			// enable channel
-			if result.localErr == nil && !isChannelEnabled && service.ShouldEnableChannel(maxAPIError, channel.Status) {
+			if shouldEnableLegacyChannelAfterTest(runtimeRecoveryProbe, result.localErr, isChannelEnabled, maxAPIError, channel.Status) {
 				service.EnableChannel(channel.Id, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.Name)
 			}
 
@@ -958,6 +1060,12 @@ func testChannels(channels []*model.Channel, testUserID int, notify bool, allowD
 		}
 	})
 	return nil
+}
+
+// Runtime timeout recovery must not pass through the legacy SQL auto-enable
+// path. The two state sources have independent ownership and recovery rules.
+func shouldEnableLegacyChannelAfterTest(runtimeRecoveryProbe bool, localErr error, isChannelEnabled bool, maxAPIError *types.MaxAPIError, status int) bool {
+	return !runtimeRecoveryProbe && localErr == nil && !isChannelEnabled && service.ShouldEnableChannel(maxAPIError, status)
 }
 
 func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*model.Channel {
@@ -983,7 +1091,7 @@ func testAllChannels(notify bool) error {
 	if getChannelErr != nil {
 		return getChannelErr
 	}
-	return testChannels(selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModeScheduledAll), testUserID, notify, true)
+	return testChannels(selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModeScheduledAll), testUserID, notify, true, nil)
 }
 
 func testAutoDisabledChannels(notify bool) error {
@@ -995,7 +1103,126 @@ func testAutoDisabledChannels(notify bool) error {
 	if getChannelErr != nil {
 		return getChannelErr
 	}
-	return testChannels(selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModePassiveRecovery), testUserID, notify, false)
+	selected, runtimeStates := selectChannelsForRuntimeRecoveryWithStates(channels)
+	return testChannels(selected, testUserID, notify, false, runtimeStates)
+}
+
+// Runtime recovery remains scheduled when the legacy all-channel test is
+// disabled. Only due, SQL-enabled runtime-disabled channels are probed.
+func testRuntimeDisabledChannels() error {
+	channels, err := model.GetAllChannels(0, 0, true, false)
+	if err != nil {
+		return err
+	}
+	selected, runtimeStates := selectChannelsForRuntimeRecoveryWithStates(channels)
+	runtimeOnly := make([]*model.Channel, 0, len(selected))
+	for _, channel := range selected {
+		if channel.Status == common.ChannelStatusEnabled {
+			runtimeOnly = append(runtimeOnly, channel)
+		}
+	}
+	if len(runtimeOnly) == 0 {
+		return nil
+	}
+	testUserID, err := resolveChannelTestUserID(nil)
+	if err != nil {
+		return err
+	}
+	return testChannels(runtimeOnly, testUserID, false, false, runtimeStates)
+}
+
+func loadChannelHealthRuntimeState(channelID int) (channelhealth.RuntimeState, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	state, err := channelhealth.LoadRuntimeState(ctx, channelID)
+	if err != nil || !state.RuntimeDisabled {
+		return channelhealth.RuntimeState{}, false
+	}
+	return state, true
+}
+
+func selectChannelsForRuntimeRecovery(channels []*model.Channel) []*model.Channel {
+	selected, _ := selectChannelsForRuntimeRecoveryWithStates(channels)
+	return selected
+}
+
+func selectChannelsForRuntimeRecoveryWithStates(channels []*model.Channel) ([]*model.Channel, map[int]channelhealth.RuntimeState) {
+	selected := make([]*model.Channel, 0, len(channels))
+	now := time.Now()
+	setting := operation_setting.GetMonitorSetting()
+	if setting == nil {
+		return selected, nil
+	}
+	shouldLoadRuntimeStates := setting.TimeoutAutoDisableEnabled &&
+		setting.TimeoutAutoDisableRecoveryMode == operation_setting.TimeoutAutoDisableRecoveryProbe &&
+		setting.TimeoutAutoDisableDurationSeconds > 0
+	runtimeStates := make(map[int]channelhealth.RuntimeState)
+	if shouldLoadRuntimeStates {
+		candidateIDs := make([]int, 0, len(channels))
+		for _, channel := range channels {
+			if channel != nil && channel.Status != common.ChannelStatusManuallyDisabled &&
+				channel.Status != common.ChannelStatusAutoDisabled {
+				candidateIDs = append(candidateIDs, channel.Id)
+			}
+		}
+		if len(candidateIDs) > 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			loaded, err := channelhealth.LoadRuntimeStates(ctx, candidateIDs)
+			cancel()
+			if err == nil {
+				runtimeStates = loaded
+			}
+		}
+	}
+	for _, channel := range channels {
+		if channel == nil || channel.Status == common.ChannelStatusManuallyDisabled {
+			continue
+		}
+		if channel.Status == common.ChannelStatusAutoDisabled {
+			selected = append(selected, channel)
+			continue
+		}
+		if !shouldLoadRuntimeStates {
+			continue
+		}
+		state, ok := runtimeStates[channel.Id]
+		if ok && state.RuntimeDisabled &&
+			(state.DisabledUntil.IsZero() || !now.Before(state.DisabledUntil)) {
+			selected = append(selected, channel)
+		}
+	}
+	return selected, runtimeStates
+}
+
+// RecoverChannelHealthRuntime clears only the timeout strategy's Redis state.
+// The existing channel status and ability rows are intentionally untouched.
+func RecoverChannelHealthRuntime(c *gin.Context) {
+	channelID, err := strconv.Atoi(strings.TrimSpace(c.Param("id")))
+	if err != nil || channelID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "无效的渠道 ID"})
+		return
+	}
+	result, err := channelhealth.RestoreRuntimeState(c.Request.Context(), channelID)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if result.Applied {
+		common.PublishChannelHealthRuntimeTransition(common.ChannelHealthRuntimeTransition{
+			ChannelID:       channelID,
+			Transition:      result.Transition,
+			Penalty:         result.State.Penalty,
+			PenaltyUntil:    result.State.PenaltyUntil,
+			RuntimeDisabled: result.State.RuntimeDisabled,
+			DisabledUntil:   result.State.DisabledUntil,
+			ObservedAt:      result.State.LastObservedAt,
+		})
+		recordManageAudit(c, "smart_ops.channel_health_runtime_recovery", map[string]interface{}{
+			"channel_id": channelID,
+			"transition": result.Transition,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": result.State})
 }
 
 func TestAllChannels(c *gin.Context) {
@@ -1019,7 +1246,15 @@ func AutomaticallyTestChannels() {
 	}
 	autoTestChannelsOnce.Do(func() {
 		for {
-			if !operation_setting.GetMonitorSetting().AutoTestChannelEnabled {
+			setting := operation_setting.GetMonitorSetting()
+			if !setting.AutoTestChannelEnabled {
+				if setting.TimeoutAutoDisableEnabled &&
+					setting.TimeoutAutoDisableRecoveryMode == operation_setting.TimeoutAutoDisableRecoveryProbe &&
+					setting.TimeoutAutoDisableDurationSeconds > 0 {
+					if err := testRuntimeDisabledChannels(); err != nil {
+						common.SysLog(fmt.Sprintf("automatic channel runtime recovery failed: %v", err))
+					}
+				}
 				time.Sleep(1 * time.Minute)
 				continue
 			}

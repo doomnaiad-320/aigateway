@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/MAX-API-Next/MAX-API/common"
+	"github.com/MAX-API-Next/MAX-API/dto"
 	"github.com/MAX-API-Next/MAX-API/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -48,6 +49,18 @@ func TestResetStatusCode(t *testing.T) {
 			statusCodeConfig: `{"200":503}`,
 			expectedCode:     200,
 		},
+		{
+			name:             "skip out of range target",
+			statusCode:       429,
+			statusCodeConfig: `{"429":999}`,
+			expectedCode:     429,
+		},
+		{
+			name:             "ignore unrelated invalid entry",
+			statusCode:       429,
+			statusCodeConfig: `{"429":503,"500":999}`,
+			expectedCode:     503,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -62,6 +75,25 @@ func TestResetStatusCode(t *testing.T) {
 			require.Equal(t, tc.expectedCode, maxAPIError.StatusCode)
 		})
 	}
+}
+
+func TestResetTaskStatusCodePreservesOriginalUpstreamStatus(t *testing.T) {
+	t.Parallel()
+
+	upstreamErr := &dto.TaskError{StatusCode: http.StatusTooManyRequests}
+	ResetTaskStatusCode(upstreamErr, `{"429":"503"}`)
+	require.Equal(t, http.StatusServiceUnavailable, upstreamErr.StatusCode)
+	require.Equal(t, http.StatusTooManyRequests, upstreamErr.UpstreamStatusCode)
+}
+
+func TestValidateStatusCodeMapping(t *testing.T) {
+	t.Parallel()
+
+	require.NoError(t, ValidateStatusCodeMapping(`{"429":"503","500":502}`))
+	require.Error(t, ValidateStatusCodeMapping(`null`))
+	require.Error(t, ValidateStatusCodeMapping(`{"bad":503}`))
+	require.Error(t, ValidateStatusCodeMapping(`{"429":999}`))
+	require.Error(t, ValidateStatusCodeMapping(`{"429":503,"0429":502}`))
 }
 
 func TestRelayErrorHandlerTruncatesInvalidJSONBodyInLog(t *testing.T) {
@@ -163,6 +195,47 @@ func TestRelayErrorHandlerLimitsUpstreamErrorBodyRead(t *testing.T) {
 	require.NotNil(t, maxAPIError)
 	require.LessOrEqual(t, reader.read, maxUpstreamErrorBodyBytes+1)
 	require.Contains(t, maxAPIError.Error(), "truncated after")
+}
+
+func TestTaskErrorFromUpstreamResponseKeepsStructuredSafeMessage(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"upstream failed\r\ntry later","type":"server_error","code":"server_error"}}`)),
+	}
+
+	taskErr := TaskErrorFromUpstreamResponse(context.Background(), resp, "fail_to_fetch_task")
+
+	require.NotNil(t, taskErr)
+	require.Equal(t, "fail_to_fetch_task", taskErr.Code)
+	require.Equal(t, http.StatusBadGateway, taskErr.StatusCode)
+	require.Equal(t, "upstream failed  try later", taskErr.Message)
+	require.NotContains(t, taskErr.Message, "\r")
+	require.NotContains(t, taskErr.Message, "\n")
+}
+
+func TestTaskErrorFromUpstreamResponseDoesNotExposeRawInvalidBody(t *testing.T) {
+	rawBody := `{"internal_prompt":"` + strings.Repeat("secret", 100) + `"}`
+	resp := &http.Response{
+		StatusCode: http.StatusInternalServerError,
+		Body:       io.NopCloser(strings.NewReader(rawBody)),
+	}
+
+	taskErr := TaskErrorFromUpstreamResponse(context.Background(), resp, "fail_to_fetch_task")
+
+	require.NotNil(t, taskErr)
+	require.Equal(t, "bad upstream response status code 500", taskErr.Message)
+	require.NotContains(t, taskErr.Message, "secret")
+}
+
+func TestTaskErrorFromUpstreamResponseHandlesNilBody(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusBadGateway,
+	}
+
+	taskErr := TaskErrorFromUpstreamResponse(context.Background(), resp, "fail_to_fetch_task")
+
+	require.NotNil(t, taskErr)
+	require.Equal(t, "bad upstream response status code 502", taskErr.Message)
 }
 
 type countingReadCloser struct {

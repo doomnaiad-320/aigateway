@@ -6,16 +6,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MAX-API-Next/MAX-API/common"
 	"github.com/MAX-API-Next/MAX-API/constant"
 	"github.com/MAX-API-Next/MAX-API/dto"
 	"github.com/MAX-API-Next/MAX-API/model"
 	"github.com/MAX-API-Next/MAX-API/pkg/billingexpr"
 	relaycommon "github.com/MAX-API-Next/MAX-API/relay/common"
+	relayconstant "github.com/MAX-API-Next/MAX-API/relay/constant"
 	"github.com/MAX-API-Next/MAX-API/service/openaicompat"
+	"github.com/MAX-API-Next/MAX-API/setting/config"
+	"github.com/MAX-API-Next/MAX-API/setting/operation_setting"
 	"github.com/MAX-API-Next/MAX-API/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -237,6 +242,197 @@ func TestPostTextConsumeQuotaUsesFallbackForNilUsageWithEstimate(t *testing.T) {
 	require.NotNil(t, log)
 	require.Equal(t, fallbackQuota, log.Quota)
 	require.Equal(t, 20, log.PromptTokens)
+}
+
+func TestSettleAndRecordConsumeLeavesUsageProjectionPendingWhenFinalChargeExceedsWallet(t *testing.T) {
+	truncate(t)
+	const userID, tokenID, channelID = 121, 122, 123
+	const preConsumedQuota, actualQuota = 100, 200
+
+	seedUser(t, userID, preConsumedQuota)
+	seedToken(t, tokenID, userID, "final-charge-insufficient-token", preConsumedQuota)
+	seedChannel(t, channelID)
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Set("token_quota", int64(preConsumedQuota))
+	info := &relaycommon.RelayInfo{
+		RequestId:       "final-charge-insufficient-request",
+		UserId:          userID,
+		TokenId:         tokenID,
+		TokenKey:        "final-charge-insufficient-token",
+		OriginModelName: "final-charge-insufficient-model",
+		UsingGroup:      "default",
+		ForcePreConsume: true,
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: channelID},
+	}
+
+	session, apiErr := NewBillingSession(ctx, info, preConsumedQuota)
+	require.Nil(t, apiErr)
+	require.NotNil(t, session)
+	info.Billing = session
+
+	settleAndRecordConsume(ctx, info, true, model.RecordConsumeLogParams{
+		ChannelId: channelID,
+		ModelName: "final-charge-insufficient-model",
+		TokenId:   tokenID,
+		Group:     "default",
+		Quota:     actualQuota,
+		Content:   "final charge exceeds remaining wallet",
+	})
+
+	var user model.User
+	require.NoError(t, model.DB.Select("used_quota", "request_count").First(&user, userID).Error)
+	assert.Zero(t, user.UsedQuota)
+	assert.Zero(t, user.RequestCount)
+	var channel model.Channel
+	require.NoError(t, model.DB.Select("used_quota").First(&channel, channelID).Error)
+	assert.Zero(t, channel.UsedQuota)
+	assert.Zero(t, countLogs(t))
+
+	var settlement model.BillingSettlement
+	require.NoError(t, model.DB.Where("operation_key = ?", model.BillingRequestFinalizeOperationKey("final-charge-insufficient-request")).First(&settlement).Error)
+	assert.Equal(t, model.BillingSettlementStatusManual, settlement.Status)
+	assert.Contains(t, settlement.LastError, "user quota is not enough")
+}
+
+func TestSettleAndRecordConsumeProjectsExplicitZeroFinalQuota(t *testing.T) {
+	truncate(t)
+	const userID, tokenID, channelID = 124, 125, 126
+	const initialQuota, preConsumedQuota = 1_000, 100
+
+	seedUser(t, userID, initialQuota)
+	seedToken(t, tokenID, userID, "zero-final-quota-token", initialQuota)
+	seedChannel(t, channelID)
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Set(common.RequestIdKey, "zero-final-quota-request")
+	ctx.Set("token_quota", int64(initialQuota))
+	info := &relaycommon.RelayInfo{
+		RequestId:       "zero-final-quota-request",
+		UserId:          userID,
+		TokenId:         tokenID,
+		TokenKey:        "zero-final-quota-token",
+		OriginModelName: "zero-final-quota-model",
+		UsingGroup:      "default",
+		ForcePreConsume: true,
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: channelID},
+	}
+
+	session, apiErr := NewBillingSession(ctx, info, preConsumedQuota)
+	require.Nil(t, apiErr)
+	require.NotNil(t, session)
+	info.Billing = session
+
+	settleAndRecordConsume(ctx, info, true, model.RecordConsumeLogParams{
+		ChannelId:    channelID,
+		PromptTokens: 1,
+		ModelName:    "zero-final-quota-model",
+		TokenId:      tokenID,
+		Group:        "default",
+		Quota:        0,
+		Content:      "billable usage rounded to zero quota",
+	})
+
+	assert.EqualValues(t, initialQuota, getUserQuota(t, userID))
+	assert.EqualValues(t, initialQuota, getTokenRemainQuota(t, tokenID))
+	var user model.User
+	require.NoError(t, model.DB.Select("used_quota", "request_count").First(&user, userID).Error)
+	assert.Zero(t, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+	var channel model.Channel
+	require.NoError(t, model.DB.Select("used_quota").First(&channel, channelID).Error)
+	assert.Zero(t, channel.UsedQuota)
+	assert.Equal(t, int64(1), countLogs(t))
+	log := getLastLog(t)
+	assert.Zero(t, log.Quota)
+	assert.Equal(t, 1, log.PromptTokens)
+	assert.Equal(t, "zero-final-quota-request", log.RequestId)
+}
+
+func TestPostTextConsumeQuotaDoesNotProjectUsageWhenFinalizeSettlementFails(t *testing.T) {
+	truncate(t)
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(w)
+	ctx.Set(common.RequestIdKey, "failed-finalize-text-request")
+
+	const userID, tokenID, channelID = 103, 203, 303
+	seedUser(t, userID, 15)
+	seedToken(t, tokenID, userID, "failed-finalize-text-token", 100)
+	seedChannel(t, channelID)
+
+	relayInfo := &relaycommon.RelayInfo{
+		RequestId:               "failed-finalize-text-request",
+		UserId:                  userID,
+		TokenId:                 tokenID,
+		TokenKey:                "failed-finalize-text-token",
+		OriginModelName:         "test-model",
+		StartTime:               time.Now(),
+		UserSetting:             dto.UserSetting{BillingPreference: "wallet_only"},
+		FinalRequestRelayFormat: types.RelayFormatOpenAI,
+		UsingGroup:              "default",
+		ChannelMeta:             &relaycommon.ChannelMeta{ChannelId: channelID},
+		PriceData: types.PriceData{
+			ModelRatio:      1,
+			CompletionRatio: 1,
+			GroupRatioInfo:  types.GroupRatioInfo{GroupRatio: 1},
+		},
+	}
+	session, apiErr := NewBillingSession(ctx, relayInfo, 10)
+	require.Nil(t, apiErr)
+	relayInfo.Billing = session
+
+	PostTextConsumeQuota(ctx, relayInfo, &dto.Usage{
+		PromptTokens:     10,
+		CompletionTokens: 10,
+		TotalTokens:      20,
+	}, nil)
+
+	assert.EqualValues(t, 5, getUserQuota(t, userID))
+	assert.EqualValues(t, 90, getTokenRemainQuota(t, tokenID))
+	var user model.User
+	require.NoError(t, model.DB.Select("used_quota", "request_count").First(&user, userID).Error)
+	assert.Zero(t, user.UsedQuota)
+	assert.Zero(t, user.RequestCount)
+	var channel model.Channel
+	require.NoError(t, model.DB.Select("used_quota").First(&channel, channelID).Error)
+	assert.Zero(t, channel.UsedQuota)
+	assert.Zero(t, countLogs(t))
+
+	var settlement model.BillingSettlement
+	require.NoError(t, model.DB.Where("operation_key = ?", model.BillingRequestFinalizeOperationKey("failed-finalize-text-request")).First(&settlement).Error)
+	assert.Equal(t, model.BillingSettlementStatusManual, settlement.Status)
+	assert.NotEmpty(t, settlement.EffectPayload)
+	assert.Empty(t, settlement.EffectStatus)
+
+	// Manual review/reconciliation makes the missing funding available and
+	// requeues the durable settlement. Its effect must then project exactly once.
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", userID).Update("quota", 15).Error)
+	require.NoError(t, model.DB.Model(&model.BillingSettlement{}).
+		Where("id = ?", settlement.ID).
+		Updates(map[string]interface{}{"status": model.BillingSettlementStatusPending, "next_attempt": time.Now().Unix()}).Error)
+	model.ProcessPendingBillingSettlementsOnce()
+
+	assert.EqualValues(t, 5, getUserQuota(t, userID))
+	var projectedUser model.User
+	require.NoError(t, model.DB.Select("used_quota", "request_count").First(&projectedUser, userID).Error)
+	assert.EqualValues(t, 20, projectedUser.UsedQuota)
+	assert.Equal(t, 1, projectedUser.RequestCount)
+	var projectedChannel model.Channel
+	require.NoError(t, model.DB.Select("used_quota").First(&projectedChannel, channelID).Error)
+	assert.EqualValues(t, 20, projectedChannel.UsedQuota)
+	assert.Equal(t, int64(1), countLogs(t))
+	log := getLastLog(t)
+	assert.Equal(t, 20, log.Quota)
+	assert.Equal(t, 10, log.PromptTokens)
+	assert.Equal(t, 10, log.CompletionTokens)
+	assert.Equal(t, "failed-finalize-text-request", log.RequestId)
+
+	model.ProcessPendingBillingSettlementsOnce()
+	var replayedUser model.User
+	require.NoError(t, model.DB.Select("used_quota").First(&replayedUser, userID).Error)
+	assert.EqualValues(t, 20, replayedUser.UsedQuota)
+	assert.Equal(t, int64(1), countLogs(t))
 }
 
 func TestCalculateTextQuotaSummaryUsesSplitClaudeCacheCreationRatios(t *testing.T) {
@@ -763,6 +959,232 @@ func TestComposeTieredTextQuotaKeepsToolCallSurcharges(t *testing.T) {
 	require.Equal(t, 14000, quota)
 }
 
+func TestCalculateTextQuotaSummaryZeroTokensStillBillsToolSurcharge(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "o1",
+		PriceData: types.PriceData{
+			ModelRatio:      1,
+			CompletionRatio: 1,
+			GroupRatioInfo:  types.GroupRatioInfo{GroupRatio: 1},
+		},
+		ResponsesUsageInfo: &relaycommon.ResponsesUsageInfo{
+			BuiltInTools: map[string]*relaycommon.BuildInToolInfo{
+				dto.BuildInToolWebSearchPreview: {
+					CallCount: 1,
+				},
+			},
+		},
+		StartTime: time.Now(),
+	}
+
+	summary := calculateTextQuotaSummary(ctx, relayInfo, &dto.Usage{})
+
+	require.Equal(t, 0, summary.TotalTokens)
+	require.False(t, summary.ToolCallSurchargeQuota.IsZero())
+	require.Greater(t, summary.Quota, 0)
+	require.Equal(t, common.QuotaFromDecimal(summary.ToolCallSurchargeQuota), summary.Quota)
+}
+
+func TestCustomToolItemQuotaPreservesBillingExpression(t *testing.T) {
+	item := relaycommon.ToolUsageItem{Name: "lookup", CallCount: 3, PricePer1K: 2.5}
+	groupRatio := 1.25
+	expected := decimal.NewFromFloat(item.PricePer1K).
+		Mul(decimal.NewFromInt(int64(item.CallCount))).
+		Div(decimal.NewFromInt(1000)).
+		Mul(decimal.NewFromFloat(groupRatio)).
+		Mul(decimal.NewFromFloat(common.QuotaPerUnit))
+
+	require.True(t, expected.Equal(customToolItemQuota(item, groupRatio)))
+}
+
+func TestCalculateTextQuotaSummaryBillsFrozenCustomToolUsage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	setServiceToolPricesForTest(t, map[string]float64{"lookup": 5})
+	toolPrices := config.GlobalConfig.Get("tool_price_setting").(*operation_setting.ToolPriceSetting)
+
+	ledger := relaycommon.NewToolUsageLedger("gpt-test")
+	ledger.BeginAttempt(0)
+	require.True(t, ledger.ObserveCustom("lookup", relaycommon.ToolCallIdentity{
+		Scope:    "openai-chat",
+		CallID:   "call-1",
+		Position: "choice:0:tool:0",
+	}))
+	require.True(t, ledger.CommitAttempt(0))
+
+	// A config reload after the request starts must not reprice the call.
+	toolPrices.Prices["lookup"] = 9
+	operation_setting.RebuildToolPriceIndex()
+
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "gpt-test",
+		PriceData: types.PriceData{
+			ModelRatio:      1,
+			CompletionRatio: 1,
+			GroupRatioInfo:  types.GroupRatioInfo{GroupRatio: 1},
+		},
+		ToolUsage: ledger,
+		StartTime: time.Now(),
+	}
+
+	summary := calculateTextQuotaSummary(ctx, relayInfo, &dto.Usage{})
+	expected := decimal.NewFromFloat(5.0 / 1000).Mul(decimal.NewFromFloat(common.QuotaPerUnit))
+
+	require.Equal(t, 0, summary.TotalTokens)
+	require.True(t, expected.Equal(summary.ToolCallSurchargeQuota))
+	require.Equal(t, common.QuotaFromDecimal(expected), summary.Quota)
+}
+
+func TestCalculateTextQuotaSummaryBillsFrozenBuiltInToolPrices(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Set("claude_web_search_requests", 2)
+
+	setServiceToolPricesForTest(t, map[string]float64{
+		"web_search_preview:gpt-4o*": 7,
+		"web_search":                 11,
+		"file_search":                13,
+	})
+	toolPrices := config.GlobalConfig.Get("tool_price_setting").(*operation_setting.ToolPriceSetting)
+	ledger := relaycommon.NewToolUsageLedger("gpt-4o")
+
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "gpt-4o",
+		PriceData: types.PriceData{
+			ModelRatio:      1,
+			CompletionRatio: 1,
+			GroupRatioInfo:  types.GroupRatioInfo{GroupRatio: 1},
+		},
+		ResponsesUsageInfo: &relaycommon.ResponsesUsageInfo{
+			BuiltInTools: map[string]*relaycommon.BuildInToolInfo{
+				dto.BuildInToolWebSearchPreview: {CallCount: 1},
+				dto.BuildInToolFileSearch:       {CallCount: 2},
+			},
+		},
+		ToolUsage: ledger,
+		StartTime: time.Now(),
+	}
+
+	// The request captures its price index before the admin reload below.
+	toolPrices.Prices["web_search_preview:gpt-4o*"] = 70
+	toolPrices.Prices["web_search"] = 110
+	toolPrices.Prices["file_search"] = 130
+	operation_setting.RebuildToolPriceIndex()
+
+	summary := calculateTextQuotaSummary(ctx, relayInfo, &dto.Usage{})
+	require.Equal(t, float64(7), summary.WebSearchPrice)
+	require.Equal(t, float64(11), summary.ClaudeWebSearchPrice)
+	require.Equal(t, float64(13), summary.FileSearchPrice)
+	require.Equal(t, 1, summary.WebSearchCallCount)
+	require.Equal(t, 2, summary.ClaudeWebSearchCallCount)
+	require.Equal(t, 2, summary.FileSearchCallCount)
+
+	expected := decimal.NewFromFloat(7 + 11*2 + 13*2).
+		Div(decimal.NewFromInt(1000)).
+		Mul(decimal.NewFromFloat(common.QuotaPerUnit))
+	require.True(t, expected.Equal(summary.ToolCallSurchargeQuota))
+}
+
+func TestAlphaSearchPreConsumeQuotaUsesFrozenBuiltInToolPrice(t *testing.T) {
+	setServiceToolPricesForTest(t, map[string]float64{"web_search_preview": 7})
+	toolPrices := config.GlobalConfig.Get("tool_price_setting").(*operation_setting.ToolPriceSetting)
+	info := &relaycommon.RelayInfo{
+		RelayMode:       relayconstant.RelayModeAlphaSearch,
+		OriginModelName: "o1",
+		ToolUsage:       relaycommon.NewToolUsageLedger("o1"),
+		PriceData: types.PriceData{
+			GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1},
+		},
+		ResponsesUsageInfo: &relaycommon.ResponsesUsageInfo{
+			BuiltInTools: map[string]*relaycommon.BuildInToolInfo{
+				dto.BuildInToolWebSearchPreview: {CallCount: 1},
+			},
+		},
+	}
+
+	preConsumed, err := AlphaSearchPreConsumeQuota(0, info, 1)
+	require.NoError(t, err)
+
+	toolPrices.Prices["web_search_preview"] = 70
+	operation_setting.RebuildToolPriceIndex()
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	summary := calculateTextQuotaSummary(ctx, info, &dto.Usage{})
+	require.Equal(t, preConsumed, summary.Quota)
+	require.Equal(t, float64(7), summary.WebSearchPrice)
+}
+
+func TestCalculateTextQuotaSummaryAlphaSearchKeepsFixedPriceWhenToolPriceIsZero(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	toolPrices := config.GlobalConfig.Get("tool_price_setting").(*operation_setting.ToolPriceSetting)
+	originalPrices := make(map[string]float64, len(toolPrices.Prices))
+	for key, value := range toolPrices.Prices {
+		originalPrices[key] = value
+	}
+	toolPrices.Prices = map[string]float64{"web_search_preview": 0}
+	operation_setting.RebuildToolPriceIndex()
+	t.Cleanup(func() {
+		toolPrices.Prices = originalPrices
+		operation_setting.RebuildToolPriceIndex()
+	})
+
+	relayInfo := &relaycommon.RelayInfo{
+		RelayMode:       relayconstant.RelayModeAlphaSearch,
+		OriginModelName: "fixed-price-alpha-search",
+		PriceData: types.PriceData{
+			UsePrice:       true,
+			ModelPrice:     0.02,
+			GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1},
+		},
+		ResponsesUsageInfo: &relaycommon.ResponsesUsageInfo{
+			BuiltInTools: map[string]*relaycommon.BuildInToolInfo{
+				dto.BuildInToolWebSearchPreview: {CallCount: 1},
+			},
+		},
+		StartTime: time.Now(),
+	}
+
+	summary := calculateTextQuotaSummary(ctx, relayInfo, &dto.Usage{})
+
+	require.True(t, summary.ToolCallSurchargeQuota.IsZero())
+	require.Equal(t, common.QuotaFromFloat(0.02*common.QuotaPerUnit), summary.Quota)
+}
+
+func TestCalculateTextQuotaSummaryDoesNotApplyRequestMultipliersToToolSurcharge(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "o1",
+		PriceData: types.PriceData{
+			ModelRatio:      1,
+			CompletionRatio: 1,
+			GroupRatioInfo:  types.GroupRatioInfo{GroupRatio: 1},
+		},
+		ResponsesUsageInfo: &relaycommon.ResponsesUsageInfo{
+			BuiltInTools: map[string]*relaycommon.BuildInToolInfo{
+				dto.BuildInToolWebSearchPreview: {
+					CallCount: 1,
+				},
+			},
+		},
+		StartTime: time.Now(),
+	}
+	relayInfo.PriceData.AddOtherRatio("n", 3)
+
+	summary := calculateTextQuotaSummary(ctx, relayInfo, &dto.Usage{})
+	expected := decimal.NewFromFloat(10.0 / 1000).Mul(decimal.NewFromFloat(common.QuotaPerUnit))
+
+	require.True(t, expected.Equal(summary.ToolCallSurchargeQuota))
+	require.Equal(t, common.QuotaFromDecimal(expected), summary.Quota)
+}
+
 func TestComposeTieredTextQuotaFallbackKeepsToolCallSurcharges(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
@@ -834,6 +1256,34 @@ func TestComposeTieredTextQuotaErrorFallbackUsesPreConsumedQuota(t *testing.T) {
 
 	require.Equal(t, int64(12500), summary.ToolCallSurchargeQuota.Round(0).IntPart())
 	require.Equal(t, 14500, quota)
+}
+
+func TestComposeTieredTextQuotaAlphaSearchErrorFallbackDoesNotDuplicateReservedSurcharge(t *testing.T) {
+	summary := textQuotaSummary{
+		ToolCallSurchargeQuota: decimal.NewFromInt(12_500),
+	}
+	relayInfo := &relaycommon.RelayInfo{
+		RelayMode:             relayconstant.RelayModeAlphaSearch,
+		FinalPreConsumedQuota: 14_500,
+	}
+
+	quota := composeTieredTextQuota(relayInfo, summary, 14_500, nil)
+
+	require.Equal(t, 14_500, quota)
+}
+
+func TestComposeTieredTextQuotaTrustedAlphaSearchFallbackAddsUnreservedSurcharge(t *testing.T) {
+	summary := textQuotaSummary{
+		ToolCallSurchargeQuota: decimal.NewFromInt(12_500),
+	}
+	relayInfo := &relaycommon.RelayInfo{
+		RelayMode:             relayconstant.RelayModeAlphaSearch,
+		FinalPreConsumedQuota: 0,
+	}
+
+	quota := composeTieredTextQuota(relayInfo, summary, 2_000, nil)
+
+	require.Equal(t, 14_500, quota)
 }
 
 func TestComposeTieredTextQuotaFallbackSaturatesFinalQuota(t *testing.T) {

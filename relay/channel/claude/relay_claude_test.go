@@ -2,6 +2,8 @@ package claude
 
 import (
 	"encoding/base64"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -9,13 +11,105 @@ import (
 	"github.com/MAX-API-Next/MAX-API/common"
 	"github.com/MAX-API-Next/MAX-API/dto"
 	relaycommon "github.com/MAX-API-Next/MAX-API/relay/common"
+	"github.com/MAX-API-Next/MAX-API/service/openaicompat"
+	"github.com/MAX-API-Next/MAX-API/setting/config"
+	"github.com/MAX-API-Next/MAX-API/setting/operation_setting"
 	"github.com/MAX-API-Next/MAX-API/types"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func commonPointer[T any](value T) *T {
 	return &value
+}
+
+func TestClaudeStreamHandlerReturnsRetryableErrorBeforeFirstResponseTimeout(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	info := &relaycommon.RelayInfo{
+		IsStream:    true,
+		RelayFormat: types.RelayFormatClaude,
+		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"},
+		DisablePing: true,
+	}
+	info.InitChannelMeta(c)
+	info.StreamStatus = relaycommon.NewStreamStatus()
+	info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
+
+	usage, err := ClaudeStreamHandler(c, &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, info)
+	require.Nil(t, usage)
+	require.NotNil(t, err)
+	require.Equal(t, types.ErrorCodeChannelResponseTimeExceeded, err.GetErrorCode())
+	require.False(t, types.IsSkipRetryError(err))
+}
+
+func TestConvertOpenAIResponsesRequestPreservesCustomToolHistory(t *testing.T) {
+	input, err := common.Marshal([]map[string]any{
+		{"role": "user", "content": "apply the patch"},
+		{"type": "custom_tool_call", "call_id": "call_custom", "name": "apply_patch", "input": "*** Begin Patch"},
+		{"type": "custom_tool_call_output", "call_id": "call_custom", "output": "ok"},
+	})
+	require.NoError(t, err)
+	tools, err := common.Marshal([]map[string]any{{
+		"type":        "custom",
+		"name":        "apply_patch",
+		"description": "Apply a patch",
+	}})
+	require.NoError(t, err)
+
+	converted, err := (&Adaptor{}).ConvertOpenAIResponsesRequest(nil, nil, dto.OpenAIResponsesRequest{
+		Model: "claude-test",
+		Input: input,
+		Tools: tools,
+	})
+	require.NoError(t, err)
+	claudeRequest, ok := converted.(*dto.ClaudeRequest)
+	require.True(t, ok)
+	require.Len(t, claudeRequest.Messages, 3)
+
+	toolUse, err := claudeRequest.Messages[1].ParseContent()
+	require.NoError(t, err)
+	require.Len(t, toolUse, 2)
+	var toolUseBlock *dto.ClaudeMediaMessage
+	for i := range toolUse {
+		if toolUse[i].Type == "tool_use" {
+			toolUseBlock = &toolUse[i]
+			break
+		}
+	}
+	require.NotNil(t, toolUseBlock)
+	assert.Equal(t, "call_custom", toolUseBlock.Id)
+	assert.Equal(t, "apply_patch", toolUseBlock.Name)
+	assert.Equal(t, "*** Begin Patch", toolUseBlock.Input.(map[string]any)["input"])
+
+	toolResult, err := claudeRequest.Messages[2].ParseContent()
+	require.NoError(t, err)
+	require.Len(t, toolResult, 1)
+	assert.Equal(t, "tool_result", toolResult[0].Type)
+	assert.Equal(t, "call_custom", toolResult[0].ToolUseId)
+}
+
+func setClaudeToolPricesForTest(t *testing.T, additions map[string]float64) {
+	t.Helper()
+	setting := config.GlobalConfig.Get("tool_price_setting").(*operation_setting.ToolPriceSetting)
+	original := make(map[string]float64, len(setting.Prices))
+	for name, price := range setting.Prices {
+		original[name] = price
+	}
+	setting.Prices = make(map[string]float64, len(original)+len(additions))
+	for name, price := range original {
+		setting.Prices[name] = price
+	}
+	for name, price := range additions {
+		setting.Prices[name] = price
+	}
+	operation_setting.RebuildToolPriceIndex()
+	t.Cleanup(func() {
+		setting.Prices = original
+		operation_setting.RebuildToolPriceIndex()
+	})
 }
 
 func TestFormatClaudeResponseInfo_MessageStart(t *testing.T) {
@@ -55,6 +149,231 @@ func TestFormatClaudeResponseInfo_MessageStart(t *testing.T) {
 	if claudeInfo.Model != "claude-3-5-sonnet" {
 		t.Errorf("Model = %s, want claude-3-5-sonnet", claudeInfo.Model)
 	}
+}
+
+func TestHandleClaudeResponseDataRecordsActualCustomToolUse(t *testing.T) {
+	setClaudeToolPricesForTest(t, map[string]float64{"lookup": 5})
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	ledger := relaycommon.NewToolUsageLedger("claude-test")
+	ledger.BeginAttempt(0)
+	info := &relaycommon.RelayInfo{
+		RelayFormat:     types.RelayFormatClaude,
+		OriginModelName: "claude-test",
+		ToolUsage:       ledger,
+		ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"},
+	}
+	response := dto.ClaudeResponse{
+		Type:       "message",
+		StopReason: "tool_use",
+		Content: []dto.ClaudeMediaMessage{{
+			Type:  "tool_use",
+			Id:    "toolu-1",
+			Name:  "lookup",
+			Input: map[string]any{},
+		}},
+		Usage: &dto.ClaudeUsage{InputTokens: 10, OutputTokens: 2},
+	}
+	data, err := common.Marshal(response)
+	require.NoError(t, err)
+
+	maxErr := HandleClaudeResponseData(c, info, &ClaudeResponseInfo{Usage: &dto.Usage{}}, nil, data)
+	require.Nil(t, maxErr)
+	require.True(t, info.CommitToolUsageAttempt())
+	require.Equal(t, []relaycommon.ToolUsageItem{{Name: "lookup", CallCount: 1, PricePer1K: 5}}, info.ToolUsageSnapshot().Items)
+}
+
+func TestHandleClaudeResponseDataConvertsResponsesFormat(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	info := &relaycommon.RelayInfo{
+		RelayFormat:     types.RelayFormatOpenAIResponses,
+		OriginModelName: "claude-test",
+		ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"},
+	}
+	response := dto.ClaudeResponse{
+		Type:       "message",
+		Id:         "msg_responses",
+		Model:      "claude-test",
+		StopReason: "end_turn",
+		Content: []dto.ClaudeMediaMessage{{
+			Type: "text",
+			Text: common.GetPointer("hello"),
+		}},
+		Usage: &dto.ClaudeUsage{InputTokens: 4, OutputTokens: 2},
+	}
+	data, err := common.Marshal(response)
+	require.NoError(t, err)
+
+	maxErr := HandleClaudeResponseData(c, info, &ClaudeResponseInfo{ResponseId: "msg_responses", Usage: &dto.Usage{}}, nil, data)
+	require.Nil(t, maxErr)
+	var converted dto.OpenAIResponsesResponse
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &converted))
+	require.Len(t, converted.Output, 1)
+	assert.Equal(t, "message", converted.Output[0].Type)
+	require.Len(t, converted.Output[0].Content, 1)
+	assert.Equal(t, "hello", converted.Output[0].Content[0].Text)
+	assert.Equal(t, 6, converted.Usage.TotalTokens)
+}
+
+func TestHandleStreamResponseDataConvertsResponsesFormat(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	info := &relaycommon.RelayInfo{
+		RelayFormat:     types.RelayFormatOpenAIResponses,
+		OriginModelName: "claude-test",
+		ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"},
+	}
+	claudeInfo := &ClaudeResponseInfo{
+		ResponseId:     "msg_stream",
+		Usage:          &dto.Usage{},
+		ResponsesState: openaicompat.NewChatToResponsesStreamState("msg_stream", "claude-test"),
+	}
+	streamData := []string{
+		`{"type":"message_start","message":{"id":"msg_stream","model":"claude-test","usage":{"input_tokens":4,"output_tokens":0}}}`,
+		`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"hello"}}`,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}`,
+		`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`,
+	}
+	for _, data := range streamData {
+		require.Nil(t, HandleStreamResponseData(c, info, claudeInfo, data))
+	}
+	require.Nil(t, HandleStreamFinalResponse(c, info, claudeInfo))
+
+	body := recorder.Body.String()
+	assert.Contains(t, body, "response.created")
+	assert.Contains(t, body, "response.output_text.delta")
+	assert.Contains(t, body, "response.completed")
+}
+
+func TestClaudeResponsesStreamEOFReturnsIncompleteWithoutFalseCompletion(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	info := &relaycommon.RelayInfo{
+		IsStream:        true,
+		RelayFormat:     types.RelayFormatOpenAIResponses,
+		OriginModelName: "claude-test",
+		ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"},
+		DisablePing:     true,
+	}
+	body := "data: " + strings.Join([]string{
+		`{"type":"message_start","message":{"id":"msg_eof","model":"claude-test","usage":{"input_tokens":4,"output_tokens":0}}}`,
+		`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"partial"}}`,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" output"}}`,
+	}, "\n\ndata: ") + "\n\n"
+
+	usage, maxAPIError := ClaudeStreamHandler(c, &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}, info)
+	require.NotNil(t, usage)
+	require.NotNil(t, maxAPIError)
+	require.True(t, types.IsSkipRetryError(maxAPIError))
+	require.Equal(t, 3, info.ReceivedResponseCount)
+	require.Equal(t, 4, usage.PromptTokens)
+	require.Positive(t, usage.CompletionTokens)
+	require.NotNil(t, usage.BillingUsage)
+	require.Contains(t, recorder.Body.String(), " output")
+	require.Contains(t, recorder.Body.String(), "response.incomplete")
+	require.NotContains(t, recorder.Body.String(), "response.completed")
+}
+
+func TestHandleStreamResponseDataBillsCustomToolUseOnlyAfterToolUseTerminal(t *testing.T) {
+	setClaudeToolPricesForTest(t, map[string]float64{"lookup": 5})
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ledger := relaycommon.NewToolUsageLedger("claude-test")
+	ledger.BeginAttempt(0)
+	info := &relaycommon.RelayInfo{
+		RelayFormat:     types.RelayFormatClaude,
+		OriginModelName: "claude-test",
+		ToolUsage:       ledger,
+		ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"},
+	}
+	claudeInfo := &ClaudeResponseInfo{Usage: &dto.Usage{}}
+	startData := `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu-1","name":"lookup","input":{}}}`
+	terminalData := `{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":2}}`
+
+	require.Nil(t, HandleStreamResponseData(c, info, claudeInfo, startData))
+	require.Nil(t, HandleStreamResponseData(c, info, claudeInfo, startData))
+	require.Nil(t, HandleStreamResponseData(c, info, claudeInfo, terminalData))
+	require.True(t, info.CommitToolUsageAttempt())
+	require.Equal(t, []relaycommon.ToolUsageItem{{Name: "lookup", CallCount: 1, PricePer1K: 5}}, info.ToolUsageSnapshot().Items)
+}
+
+func TestHandleStreamResponseDataDoesNotBillIncompleteCustomToolUse(t *testing.T) {
+	setClaudeToolPricesForTest(t, map[string]float64{"lookup": 5})
+
+	tests := []struct {
+		name         string
+		terminalData string
+	}{
+		{name: "max tokens", terminalData: `{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":2}}`},
+		{name: "refusal", terminalData: `{"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":2}}`},
+		{name: "missing terminal"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ledger := relaycommon.NewToolUsageLedger("claude-test")
+			ledger.BeginAttempt(0)
+			info := &relaycommon.RelayInfo{
+				RelayFormat:     types.RelayFormatClaude,
+				OriginModelName: "claude-test",
+				ToolUsage:       ledger,
+				ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"},
+			}
+			claudeInfo := &ClaudeResponseInfo{Usage: &dto.Usage{}}
+
+			require.Nil(t, HandleStreamResponseData(c, info, claudeInfo, `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu-1","name":"lookup","input":{}}}`))
+			if tt.terminalData != "" {
+				require.Nil(t, HandleStreamResponseData(c, info, claudeInfo, tt.terminalData))
+			}
+			HandleStreamFinalResponse(c, info, claudeInfo)
+			require.True(t, info.CommitToolUsageAttempt())
+			require.Empty(t, info.ToolUsageSnapshot().Items)
+		})
+	}
+}
+
+func TestHandleClaudeResponseDataDoesNotBillIncompleteCustomToolUse(t *testing.T) {
+	setClaudeToolPricesForTest(t, map[string]float64{"lookup": 5})
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	ledger := relaycommon.NewToolUsageLedger("claude-test")
+	ledger.BeginAttempt(0)
+	info := &relaycommon.RelayInfo{
+		RelayFormat:     types.RelayFormatClaude,
+		OriginModelName: "claude-test",
+		ToolUsage:       ledger,
+		ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"},
+	}
+	response := dto.ClaudeResponse{
+		Type:       "message",
+		StopReason: "max_tokens",
+		Content: []dto.ClaudeMediaMessage{{
+			Type:  "tool_use",
+			Id:    "toolu-1",
+			Name:  "lookup",
+			Input: map[string]any{},
+		}},
+		Usage: &dto.ClaudeUsage{InputTokens: 10, OutputTokens: 2},
+	}
+	data, err := common.Marshal(response)
+	require.NoError(t, err)
+
+	maxErr := HandleClaudeResponseData(c, info, &ClaudeResponseInfo{Usage: &dto.Usage{}}, nil, data)
+	require.Nil(t, maxErr)
+	require.True(t, info.CommitToolUsageAttempt())
+	require.Empty(t, info.ToolUsageSnapshot().Items)
 }
 
 func TestFormatClaudeResponseInfo_MessageDelta_FullUsage(t *testing.T) {
@@ -426,6 +745,73 @@ func TestRequestOpenAI2ClaudeMessage_ReturnsErrorForMalformedToolArguments(t *te
 	require.Error(t, err)
 	require.Nil(t, claudeRequest)
 	require.Contains(t, err.Error(), "tool call function arguments is not valid JSON object")
+}
+
+func TestRequestOpenAI2ClaudeMessageNormalizesParameterlessToolsAndOmitsEmptyTools(t *testing.T) {
+	parameterless, err := RequestOpenAI2ClaudeMessage(nil, dto.GeneralOpenAIRequest{
+		Model: "claude-3-5-sonnet",
+		Tools: []dto.ToolCallRequest{{Type: "function", Function: dto.FunctionRequest{Name: "ping"}}},
+	})
+	require.NoError(t, err)
+	parameterlessTools := parameterless.GetTools()
+	require.Len(t, parameterlessTools, 1)
+	tool, ok := parameterlessTools[0].(*dto.Tool)
+	require.True(t, ok)
+	require.Equal(t, "object", tool.InputSchema["type"])
+	require.Equal(t, map[string]any{}, tool.InputSchema["properties"])
+
+	customSchema := map[string]any{"type": 123, "properties": map[string]any{"value": map[string]any{"type": "string"}}, "additionalProperties": false}
+	converted, err := RequestOpenAI2ClaudeMessage(nil, dto.GeneralOpenAIRequest{
+		Model: "claude-3-5-sonnet",
+		Tools: []dto.ToolCallRequest{{Type: "function", Function: dto.FunctionRequest{Name: "custom", Parameters: customSchema}}},
+	})
+	require.NoError(t, err)
+	convertedTools := converted.GetTools()
+	require.Len(t, convertedTools, 1)
+	customTool := convertedTools[0].(*dto.Tool)
+	require.Equal(t, 123, customTool.InputSchema["type"])
+	require.Equal(t, false, customTool.InputSchema["additionalProperties"])
+
+	unsupported, err := RequestOpenAI2ClaudeMessage(nil, dto.GeneralOpenAIRequest{
+		Model: "claude-3-5-sonnet",
+		Tools: []dto.ToolCallRequest{{
+			Type: "custom",
+			Function: dto.FunctionRequest{
+				Name:       "must-not-be-converted",
+				Parameters: map[string]any{"type": "object"},
+			},
+		}},
+	})
+	require.NoError(t, err)
+	require.Empty(t, unsupported.GetTools())
+
+	empty, err := RequestOpenAI2ClaudeMessage(nil, dto.GeneralOpenAIRequest{Model: "claude-3-5-sonnet"})
+	require.NoError(t, err)
+	payload, err := common.Marshal(empty)
+	require.NoError(t, err)
+	require.NotContains(t, string(payload), `"tools"`)
+}
+
+func TestRequestOpenAI2ClaudeMessageOmitsForcedToolChoiceWhenAllToolsAreUnsupported(t *testing.T) {
+	converted, err := RequestOpenAI2ClaudeMessage(nil, dto.GeneralOpenAIRequest{
+		Model: "claude-3-5-sonnet",
+		Tools: []dto.ToolCallRequest{{
+			Type: "custom",
+			Function: dto.FunctionRequest{
+				Name:       "unsupported-tool",
+				Parameters: map[string]any{"type": "object"},
+			},
+		}},
+		ToolChoice: "required",
+	})
+	require.NoError(t, err)
+	require.Empty(t, converted.GetTools())
+	require.Nil(t, converted.ToolChoice)
+
+	payload, err := common.Marshal(converted)
+	require.NoError(t, err)
+	require.NotContains(t, string(payload), `"tools"`)
+	require.NotContains(t, string(payload), `"tool_choice"`)
 }
 
 func TestRequestOpenAI2ClaudeMessage_ClaudeOpus48HighUsesAdaptiveThinking(t *testing.T) {

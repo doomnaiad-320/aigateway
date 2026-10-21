@@ -1,0 +1,439 @@
+package controller
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/MAX-API-Next/MAX-API/common"
+	"github.com/MAX-API-Next/MAX-API/model"
+	"github.com/MAX-API-Next/MAX-API/service"
+	"github.com/gin-gonic/gin"
+)
+
+// GetSmartOpsAlerts exposes the current in-process operational alerts to
+// administrators. The endpoint is read-only and does not trigger remediation.
+func GetSmartOpsAlerts(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    service.GetSmartOpsAlerts(),
+	})
+}
+
+var channelHealthPolicyKeys = []string{
+	"monitor_setting.auto_priority_demotion_enabled",
+	"monitor_setting.streaming_first_result_timeout_seconds",
+	"monitor_setting.non_streaming_response_timeout_seconds",
+	"monitor_setting.priority_deduction",
+	"monitor_setting.timeout_auto_disable_enabled",
+	"monitor_setting.timeout_auto_disable_count",
+	"monitor_setting.timeout_auto_disable_window_seconds",
+	"monitor_setting.timeout_auto_disable_minimum_samples",
+	"monitor_setting.timeout_auto_disable_ratio_percent",
+	"monitor_setting.timeout_auto_disable_duration_seconds",
+	"monitor_setting.timeout_auto_disable_successful_probe_count",
+	"monitor_setting.timeout_auto_disable_recovery_mode",
+	"monitor_setting.timeout_auto_disable_count_scope",
+	"monitor_setting.penalty_cooldown_seconds",
+	"monitor_setting.recovery_mode",
+	"monitor_setting.extend_on_repeat_timeout",
+	"monitor_setting.channel_timeout_notification_enabled",
+	"monitor_setting.alert_repeat_interval_seconds",
+}
+
+func isChannelHealthPolicyKey(key string) bool {
+	for _, allowed := range channelHealthPolicyKeys {
+		if key == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func channelHealthPolicySnapshot() []model.Option {
+	common.OptionMapRWMutex.RLock()
+	defer common.OptionMapRWMutex.RUnlock()
+	options := make([]model.Option, 0, len(channelHealthPolicyKeys))
+	for _, key := range channelHealthPolicyKeys {
+		options = append(options, model.Option{Key: key, Value: common.OptionMap[key]})
+	}
+	return options
+}
+
+// GetChannelHealthPolicy exposes only the non-sensitive monitor_setting keys
+// needed by Smart Operations. It is intentionally available to administrators
+// who can view the page; writes remain root-only.
+func GetChannelHealthPolicy(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    channelHealthPolicySnapshot(),
+	})
+}
+
+type channelHealthPolicyUpdate struct {
+	Key   string      `json:"key"`
+	Value interface{} `json:"value"`
+}
+
+type channelHealthPolicyUpdateRequest struct {
+	Updates []channelHealthPolicyUpdate `json:"updates"`
+}
+
+// UpdateChannelHealthPolicy validates and saves all changed monitor_setting
+// values in one existing-options transaction. No new persistence structure is
+// introduced and a rejected value cannot leave a partial policy update.
+func UpdateChannelHealthPolicy(c *gin.Context) {
+	var request channelHealthPolicyUpdateRequest
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil || len(request.Updates) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "updates is required"})
+		return
+	}
+	values := make(map[string]string, len(request.Updates))
+	for _, update := range request.Updates {
+		key := strings.TrimSpace(update.Key)
+		if !isChannelHealthPolicyKey(key) || !model.IsRegisteredOptionKey(key) {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "unsupported channel health option"})
+			return
+		}
+		values[key] = common.Interface2String(update.Value)
+	}
+	if err := model.UpdateOptionsBulk(values); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	recordManageAudit(c, "smart_ops.channel_health_policy_update", map[string]interface{}{
+		"updates": values,
+	})
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    channelHealthPolicySnapshot(),
+	})
+}
+
+type billingSettlementBlockingPolicyRequest struct {
+	BlockUserByDefault *bool `json:"block_user_by_default"`
+}
+
+func UpdateBillingSettlementBlockingPolicy(c *gin.Context) {
+	var request billingSettlementBlockingPolicyRequest
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil || request.BlockUserByDefault == nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "block_user_by_default is required",
+		})
+		return
+	}
+	if err := service.UpdateBillingSettlementBlockingPolicy(*request.BlockUserByDefault); err != nil {
+		common.SysError(fmt.Sprintf("failed to update billing reconciliation blocking policy: %v", err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "failed to update billing reconciliation blocking policy",
+		})
+		return
+	}
+	recordManageAudit(c, "billing.reconciliation_blocking_policy_update", map[string]interface{}{
+		"block_user_by_default": *request.BlockUserByDefault,
+	})
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"block_user_by_default": *request.BlockUserByDefault,
+		},
+	})
+}
+
+type billingSettlementReviewRequest struct {
+	BlockUser *bool  `json:"block_user"`
+	Note      string `json:"note"`
+}
+
+type billingSettlementBatchReviewRequest struct {
+	Items []model.BillingSettlementReviewTarget `json:"items"`
+}
+
+type manualTaskBillingCompletionRequest struct {
+	Revision    int64  `json:"revision"`
+	ActualQuota *int64 `json:"actual_quota"`
+	Note        string `json:"note"`
+}
+
+type manualTaskBillingBatchCompletionRequest struct {
+	Items []manualTaskBillingBatchCompletionItem `json:"items"`
+}
+
+type manualTaskBillingBatchCompletionItem struct {
+	ID          int64  `json:"id"`
+	Revision    int64  `json:"revision"`
+	ActualQuota *int64 `json:"actual_quota"`
+}
+
+// ReviewBillingSettlements closes a bounded set of current reconciliation
+// alerts after the administrator acknowledges them.
+func ReviewBillingSettlements(c *gin.Context) {
+	var request billingSettlementBatchReviewRequest
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "invalid billing settlement batch review request",
+		})
+		return
+	}
+	records, err := service.ReviewBillingSettlements(request.Items, c.GetInt("id"))
+	if err != nil {
+		status := http.StatusInternalServerError
+		message := "failed to review billing settlements"
+		switch {
+		case errors.Is(err, service.ErrInvalidBillingSettlementReconciliationReview):
+			status = http.StatusBadRequest
+			message = err.Error()
+		case errors.Is(err, model.ErrBillingSettlementReviewConflict):
+			status = http.StatusConflict
+			message = "one or more billing settlement alerts changed; refresh and review again"
+		case errors.Is(err, model.ErrBillingSettlementCompletionRequired):
+			status = http.StatusConflict
+			message = "one or more task settlements require an exact final quota and cannot be batch closed"
+		}
+		if status == http.StatusInternalServerError {
+			common.SysError(fmt.Sprintf("failed to review billing settlements: %v", err))
+		}
+		c.JSON(status, gin.H{"success": false, "message": message})
+		return
+	}
+	settlementIDs := make([]int64, 0, len(records))
+	targetUserIDs := make([]int, 0, len(records))
+	for _, record := range records {
+		settlementIDs = append(settlementIDs, record.ID)
+		targetUserIDs = append(targetUserIDs, record.UserID)
+	}
+	recordManageAudit(c, "billing.reconciliation_review_batch", map[string]interface{}{
+		"count":           len(records),
+		"settlement_ids":  settlementIDs,
+		"target_user_ids": targetUserIDs,
+	})
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"reviewed_count": len(records),
+			"settlement_ids": settlementIDs,
+		},
+	})
+}
+
+func ReviewBillingSettlement(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "invalid billing settlement id",
+		})
+		return
+	}
+	var request billingSettlementReviewRequest
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "invalid billing settlement review request",
+		})
+		return
+	}
+	record, err := service.ReviewBillingSettlement(id, c.GetInt("id"), request.BlockUser, request.Note)
+	if err != nil {
+		status := http.StatusInternalServerError
+		message := "failed to review billing settlement"
+		switch {
+		case errors.Is(err, service.ErrInvalidBillingSettlementReconciliationReview):
+			status = http.StatusBadRequest
+			message = err.Error()
+		case errors.Is(err, model.ErrBillingSettlementReviewConflict):
+			status = http.StatusConflict
+			message = "billing settlement is no longer pending manual reconciliation"
+		case errors.Is(err, model.ErrBillingSettlementCompletionRequired):
+			status = http.StatusConflict
+			message = "task settlement requires an exact final quota before it can be closed"
+		}
+		if status == http.StatusInternalServerError {
+			common.SysError(fmt.Sprintf("failed to review billing settlement %d: %v", id, err))
+		}
+		c.JSON(status, gin.H{"success": false, "message": message})
+		return
+	}
+	recordManageAudit(c, "billing.reconciliation_review", map[string]interface{}{
+		"settlement_id":  record.ID,
+		"target_user_id": record.UserID,
+		"block_user":     *request.BlockUser,
+	})
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"id":                         record.ID,
+			"reconciliation_reviewed_at": record.ReconciliationReviewedAt,
+			"block_user":                 *request.BlockUser,
+		},
+	})
+}
+
+// CompleteManualTaskBillingSettlement applies a root administrator's exact
+// final quota to a reconciliation-only task settlement. Zero is a valid and
+// explicit financial result; omission is rejected.
+func CompleteManualTaskBillingSettlement(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid billing settlement id"})
+		return
+	}
+	var request manualTaskBillingCompletionRequest
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid manual task billing completion request"})
+		return
+	}
+	result, err := service.CompleteManualTaskBillingSettlement(
+		id,
+		request.Revision,
+		c.GetInt("id"),
+		request.ActualQuota,
+		request.Note,
+	)
+	if err != nil {
+		status := http.StatusInternalServerError
+		message := "failed to complete manual task billing settlement"
+		switch {
+		case errors.Is(err, service.ErrInvalidBillingSettlementReconciliationReview):
+			status = http.StatusBadRequest
+			message = err.Error()
+		case errors.Is(err, model.ErrBillingSettlementReviewConflict),
+			errors.Is(err, model.ErrBillingSettlementOperationConflict),
+			errors.Is(err, model.ErrBillingSettlementTaskConflict),
+			errors.Is(err, model.ErrBillingSettlementManualReview):
+			status = http.StatusConflict
+			message = "manual task billing settlement could not be applied safely; refresh and reconcile the current record"
+		case errors.Is(err, model.ErrTokenQuotaInsufficient):
+			status = http.StatusConflict
+			message = "the token quota mirror is inconsistent; repair the token record before completing this settlement"
+		case errors.Is(err, model.ErrSubscriptionRefundClamped):
+			status = http.StatusConflict
+			message = "the subscription usage mirror is lower than the refund; repair the subscription record before completing this settlement"
+		case errors.Is(err, model.ErrSubscriptionSettlementUnbound),
+			errors.Is(err, model.ErrSubscriptionSettlementPeriodChanged):
+			status = http.StatusConflict
+			message = "the subscription reservation is unbound or its period changed; escalate this record for manual reconciliation"
+		}
+		if status == http.StatusInternalServerError {
+			common.SysError(fmt.Sprintf("failed to complete manual task billing settlement %d: %v", id, err))
+		}
+		c.JSON(status, gin.H{"success": false, "message": message})
+		return
+	}
+	recordManageAudit(c, "billing.manual_task_settlement_complete", map[string]interface{}{
+		"settlement_id":         result.SettlementID,
+		"task_id":               result.TaskID,
+		"target_user_id":        result.UserID,
+		"operation_key":         result.OperationKey,
+		"actual_quota":          result.ActualQuota,
+		"applied_funding_delta": result.AppliedFundingDelta,
+		"already_applied":       result.AlreadyApplied,
+	})
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
+}
+
+// CompleteManualTaskBillingSettlementsZero performs an explicit root-admin
+// zero-quota settlement for selected MiniMax-H3 task alerts. Ordinary
+// reconciliation alerts are never accepted by this endpoint.
+func CompleteManualTaskBillingSettlementsZero(c *gin.Context) {
+	var request billingSettlementBatchReviewRequest
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid manual task billing batch completion request"})
+		return
+	}
+	result, err := service.CompleteManualTaskBillingSettlementsZero(request.Items, c.GetInt("id"))
+	if err != nil {
+		status := http.StatusInternalServerError
+		message := "failed to complete manual task billing settlements"
+		if errors.Is(err, service.ErrInvalidBillingSettlementReconciliationReview) {
+			status = http.StatusBadRequest
+			message = err.Error()
+		} else {
+			common.SysError(fmt.Sprintf("failed to complete manual task billing settlements: %v", err))
+		}
+		c.JSON(status, gin.H{"success": false, "message": message})
+		return
+	}
+	recordManageAudit(c, "billing.manual_task_settlement_batch_zero", map[string]interface{}{
+		"completed_count": result.CompletedCount,
+		"failed_count":    result.FailedCount,
+		"settlement_ids":  result.SettlementIDs,
+		"failed":          result.Failed,
+	})
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
+}
+
+// CompleteManualTaskBillingSettlements applies administrator-supplied exact
+// final quotas to a bounded set of task-finalization alerts. Each item carries
+// its own amount so reservations from different tasks cannot be conflated.
+func CompleteManualTaskBillingSettlements(c *gin.Context) {
+	var request manualTaskBillingBatchCompletionRequest
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid manual task billing batch completion request"})
+		return
+	}
+	targets := make([]service.ManualTaskBillingCompletionTarget, len(request.Items))
+	for index, item := range request.Items {
+		targets[index] = service.ManualTaskBillingCompletionTarget{
+			ID:          item.ID,
+			Revision:    item.Revision,
+			ActualQuota: item.ActualQuota,
+		}
+	}
+	result, err := service.CompleteManualTaskBillingSettlements(targets, c.GetInt("id"))
+	if err != nil {
+		status := http.StatusInternalServerError
+		message := "failed to complete manual task billing settlements"
+		if errors.Is(err, service.ErrInvalidBillingSettlementReconciliationReview) {
+			status = http.StatusBadRequest
+			message = err.Error()
+		}
+		if status == http.StatusInternalServerError {
+			common.SysError(fmt.Sprintf("failed to complete manual task billing settlements: %v", err))
+		}
+		c.JSON(status, gin.H{"success": false, "message": message})
+		return
+	}
+	recordManageAudit(c, "billing.manual_task_settlement_batch_complete", map[string]interface{}{
+		"completed_count": result.CompletedCount,
+		"failed_count":    result.FailedCount,
+		"settlement_ids":  result.SettlementIDs,
+		"failed":          result.Failed,
+	})
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
+}
+
+// GetBillingSettlementReconciliation exposes bounded, read-only evidence for
+// open billing reconciliation records. It does not retry or mutate records.
+func GetBillingSettlementReconciliation(c *gin.Context) {
+	limit, err := parseIntQuery(c, "limit")
+	if err != nil {
+		respondInvalidPerformanceQuery(
+			c,
+			err,
+			service.ErrInvalidBillingSettlementReconciliationQuery,
+			"failed to query billing settlement reconciliation",
+		)
+		return
+	}
+	result, err := service.GetBillingSettlementReconciliation(limit)
+	if err != nil {
+		respondPerformanceError(
+			c,
+			err,
+			service.ErrInvalidBillingSettlementReconciliationQuery,
+			"failed to query billing settlement reconciliation",
+		)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    result,
+	})
+}

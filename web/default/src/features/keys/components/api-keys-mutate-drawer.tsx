@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact https://github.com/MAX-API-Next/MAX-API/issues
 */
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react'
 import { useForm, type SubmitErrorHandler } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useQuery } from '@tanstack/react-query'
@@ -24,8 +24,10 @@ import { ChevronDown, KeyRound, Settings2, WalletCards } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { getUserModels, getUserGroups } from '@/lib/api'
-import { DEFAULT_AUTO_ROUTE_KEY, isAutoRouteKey } from '@/lib/auto-routes'
+import { DEFAULT_AUTO_ROUTE_KEY } from '@/lib/auto-routes'
 import { getCurrencyDisplay, getCurrencyLabel } from '@/lib/currency'
+import { handleServerError } from '@/lib/handle-server-error'
+import { wasSecureVerificationErrorReported } from '@/lib/secure-verification'
 import { cn } from '@/lib/utils'
 import { useStatus } from '@/hooks/use-status'
 import { Button } from '@/components/ui/button'
@@ -70,16 +72,19 @@ import { createApiKey, updateApiKey, getApiKey } from '../api'
 import { ERROR_MESSAGES, SUCCESS_MESSAGES } from '../constants'
 import {
   getApiKeyFormSchema,
+  MAX_MANUAL_ROUTING_GROUPS,
+  shouldIncludeRoutingProjection,
   type ApiKeyFormValues,
   getApiKeyFormDefaultValues,
   transformFormDataToPayload,
   transformApiKeyToFormDefaults,
 } from '../lib'
 import { type ApiKey } from '../types'
+import { type ApiKeyGroupOption } from './api-key-group-combobox'
 import {
-  ApiKeyGroupCombobox,
-  type ApiKeyGroupOption,
-} from './api-key-group-combobox'
+  ApiKeyRoutingEditor,
+  type ApiKeyAutoRouteOption,
+} from './api-key-routing-editor'
 import { useApiKeys } from './api-keys-provider'
 
 type ApiKeyMutateDrawerProps = {
@@ -88,18 +93,21 @@ type ApiKeyMutateDrawerProps = {
   currentRow?: ApiKey
 }
 
-export function ApiKeysMutateDrawer({
-  open,
-  onOpenChange,
-  currentRow,
-}: ApiKeyMutateDrawerProps) {
+export function ApiKeysMutateDrawer(
+  props: ApiKeyMutateDrawerProps
+): ReactElement {
   const { t } = useTranslation()
-  const isUpdate = !!currentRow
-  const { triggerRefresh } = useApiKeys()
+  const isUpdate = !!props.currentRow
+  const { triggerRefresh, withApiTokenVerification } = useApiKeys()
   const { status } = useStatus()
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
-  const defaultUseAutoGroup = status?.default_use_auto_group === true
+  const [editingLegacyRouting, setEditingLegacyRouting] = useState(false)
+  const [preservedSmartRoute, setPreservedSmartRoute] = useState<string>()
+  const [preservedManualGroups, setPreservedManualGroups] = useState<string[]>(
+    []
+  )
+  const currentRowId = props.currentRow?.id
   const defaultAutoRoute =
     typeof status?.default_auto_route === 'string'
       ? status.default_auto_route
@@ -113,90 +121,203 @@ export function ApiKeysMutateDrawer({
   })
 
   // Fetch groups
-  const { data: groupsData } = useQuery({
+  const { data: groupsData, isLoading: groupsLoading } = useQuery({
     queryKey: ['user-groups'],
     queryFn: getUserGroups,
     staleTime: 5 * 60 * 1000,
   })
 
   const models = modelsData?.data || []
-  const groupsRaw = groupsData?.data || {}
-  const groups: ApiKeyGroupOption[] = Object.entries(groupsRaw).map(
-    ([key, info]) => ({
-      value: key,
-      label: key,
-      desc: info.desc || key,
-      ratio: info.ratio,
-    })
+  const groupsRaw = useMemo(() => groupsData?.data || {}, [groupsData?.data])
+  const {
+    realGroups,
+    autoRouteOptions,
+    effectiveAutoRoute,
+    legacyManualGroups,
+  } = useMemo(() => {
+    const entries = Object.entries(groupsRaw)
+    const real: ApiKeyGroupOption[] = entries
+      .filter(([, info]) => info.auto !== true)
+      .map(([key, info]) => ({
+        value: key,
+        label: key,
+        desc: info.desc || key,
+        ratio: info.ratio,
+      }))
+    const realGroupNames = new Set(real.map((option) => option.value))
+    const serverRoutes = groupsData?.auto_routes || []
+    const routes: ApiKeyAutoRouteOption[] = (
+      serverRoutes.length > 0
+        ? serverRoutes.map((route) => ({
+            value: route.key,
+            label: route.name || route.key,
+            groups: route.groups,
+          }))
+        : entries
+            .filter(([, info]) => info.auto === true)
+            .map(([key, info]) => ({
+              value: key,
+              label: info.desc || key,
+              groups: info.groups || [],
+            }))
+    )
+      .map((route) => ({
+        ...route,
+        groups: route.groups.filter((group) => realGroupNames.has(group)),
+      }))
+      .filter((route) => route.groups.length > 0)
+    const route = routes.some((option) => option.value === defaultAutoRoute)
+      ? defaultAutoRoute
+      : routes[0]?.value || ''
+    const routeGroups =
+      routes
+        .find((option) => option.value === route)
+        ?.groups.slice(0, MAX_MANUAL_ROUTING_GROUPS) || []
+    return {
+      realGroups: real,
+      autoRouteOptions: routes,
+      effectiveAutoRoute: route,
+      legacyManualGroups:
+        routeGroups.length > 0
+          ? routeGroups
+          : real.slice(0, 1).map((option) => option.value),
+    }
+  }, [defaultAutoRoute, groupsData?.auto_routes, groupsRaw])
+
+  const routingContextRef = useRef({
+    autoRouteOptions,
+    realGroups,
+    legacyManualGroups,
+    effectiveAutoRoute,
+  })
+  routingContextRef.current = {
+    autoRouteOptions,
+    realGroups,
+    legacyManualGroups,
+    effectiveAutoRoute,
+  }
+  const schema = useMemo(
+    () =>
+      getApiKeyFormSchema(t, {
+        smartRoutes: autoRouteOptions.map((route) => route.value),
+        manualGroups: realGroups.map((group) => group.value),
+        preservedSmartRoute,
+        preservedManualGroups,
+      }),
+    [
+      autoRouteOptions,
+      preservedManualGroups,
+      preservedSmartRoute,
+      realGroups,
+      t,
+    ]
   )
-  const backendHasDefaultAutoRoute = groups.some(
-    (g) => g.value === defaultAutoRoute
-  )
-  const schema = getApiKeyFormSchema(t)
 
   const form = useForm<ApiKeyFormValues>({
     resolver: zodResolver(schema),
-    defaultValues: getApiKeyFormDefaultValues(
-      defaultUseAutoGroup,
-      defaultAutoRoute
-    ),
+    defaultValues: getApiKeyFormDefaultValues(defaultAutoRoute),
   })
 
   // Load existing data when updating
   useEffect(() => {
-    if (open && isUpdate && currentRow) {
-      getApiKey(currentRow.id).then((result) => {
-        if (result.success && result.data) {
-          form.reset(transformApiKeyToFormDefaults(result.data))
-        }
-      })
-    } else if (open && !isUpdate) {
-      form.reset(
-        getApiKeyFormDefaultValues(
-          defaultUseAutoGroup && backendHasDefaultAutoRoute,
-          defaultAutoRoute
-        )
-      )
-    }
-  }, [
-    open,
-    isUpdate,
-    currentRow,
-    form,
-    defaultUseAutoGroup,
-    backendHasDefaultAutoRoute,
-    defaultAutoRoute,
-  ])
+    if (!props.open || groupsLoading) return
 
-  // Correct group after groups load: if the form value is not in available groups, fall back
-  useEffect(() => {
-    if (groups.length === 0) return
-    const currentGroup = form.getValues('group')
-    if (currentGroup && !groups.some((g) => g.value === currentGroup)) {
-      const fallback =
-        groups.find((g) => g.value === 'default')?.value ??
-        groups[0]?.value ??
-        ''
-      form.setValue('group', fallback)
-      if (isAutoRouteKey(currentGroup)) {
-        form.setValue('cross_group_retry', false)
-      }
-    }
-  }, [groups, form])
+    let cancelled = false
+    const {
+      autoRouteOptions: availableAutoRoutes,
+      realGroups: availableRealGroups,
+      legacyManualGroups: availableLegacyManualGroups,
+      effectiveAutoRoute: availableAutoRoute,
+    } = routingContextRef.current
 
-  const onSubmit = async (data: ApiKeyFormValues) => {
+    if (isUpdate && currentRowId != null) {
+      setEditingLegacyRouting(false)
+      setPreservedSmartRoute(undefined)
+      setPreservedManualGroups([])
+      getApiKey(currentRowId)
+        .then((result) => {
+          if (cancelled) return
+          if (!result.success || !result.data) {
+            toast.error(result.message || t(ERROR_MESSAGES.UNEXPECTED))
+            return
+          }
+
+          setEditingLegacyRouting(Boolean(result.data.routing_legacy))
+          const routing = result.data.routing
+          const routeKey = routing?.route || result.data.group
+          const selectableAutoRoutes = new Set(
+            availableAutoRoutes.map((route) => route.value)
+          )
+          const selectableManualGroups = new Set(
+            availableRealGroups.map((group) => group.value)
+          )
+          const unavailableSmartRoute =
+            routing?.mode === 'smart' &&
+            routeKey &&
+            !selectableAutoRoutes.has(routeKey)
+          const unavailableManualGroups =
+            routing?.mode === 'manual'
+              ? (routing.groups || []).filter(
+                  (group) => !selectableManualGroups.has(group)
+                )
+              : []
+          setPreservedSmartRoute(unavailableSmartRoute ? routeKey : undefined)
+          setPreservedManualGroups(unavailableManualGroups)
+          const routeManualGroups =
+            availableAutoRoutes.find((route) => route.value === routeKey)
+              ?.groups || availableLegacyManualGroups
+          form.reset(
+            transformApiKeyToFormDefaults(result.data, routeManualGroups)
+          )
+        })
+        .catch((error) => {
+          if (!cancelled) {
+            handleServerError(error, {
+              fallback: t(ERROR_MESSAGES.UNEXPECTED),
+            })
+          }
+        })
+    } else if (!isUpdate) {
+      setEditingLegacyRouting(false)
+      setPreservedSmartRoute(undefined)
+      setPreservedManualGroups([])
+      form.reset(getApiKeyFormDefaultValues(availableAutoRoute))
+    }
+
+    return () => {
+      cancelled = true
+    }
+  }, [props.open, isUpdate, currentRowId, form, groupsLoading, t])
+
+  const onSubmit = async (data: ApiKeyFormValues): Promise<void> => {
     setIsSubmitting(true)
+    let created = 0
     try {
-      const basePayload = transformFormDataToPayload(data)
+      const dirtyFields = form.formState.dirtyFields
+      const routingChanged = Boolean(
+        dirtyFields.routing_mode ||
+        dirtyFields.routing_route ||
+        dirtyFields.manual_groups ||
+        dirtyFields.cross_group_retry
+      )
+      const basePayload = transformFormDataToPayload(data, {
+        includeRouting: shouldIncludeRoutingProjection(
+          isUpdate,
+          editingLegacyRouting ||
+            Boolean(preservedSmartRoute) ||
+            preservedManualGroups.length > 0,
+          routingChanged
+        ),
+      })
 
-      if (isUpdate && currentRow) {
+      if (isUpdate && props.currentRow) {
         const result = await updateApiKey({
           ...basePayload,
-          id: currentRow.id,
+          id: props.currentRow.id,
         })
         if (result.success) {
           toast.success(t(SUCCESS_MESSAGES.API_KEY_UPDATED))
-          onOpenChange(false)
+          props.onOpenChange(false)
           triggerRefresh()
         } else {
           toast.error(result.message || t(ERROR_MESSAGES.UPDATE_FAILED))
@@ -204,38 +325,43 @@ export function ApiKeysMutateDrawer({
       } else {
         // Create mode - handle batch creation
         const count = data.tokenCount || 1
-        let successCount = 0
-
-        for (let i = 0; i < count; i++) {
-          const result = await createApiKey({
-            ...basePayload,
-            name:
-              i === 0 && data.name
-                ? data.name
-                : `${data.name || 'default'}-${Math.random().toString(36).slice(2, 8)}`,
-          })
-          if (result.success) {
-            successCount++
-          } else {
-            toast.error(result.message || t(ERROR_MESSAGES.CREATE_FAILED))
-            break
-          }
-        }
-
-        if (successCount > 0) {
-          toast.success(
-            t('Successfully created {{count}} API Key(s)', {
-              count: successCount,
+        await withApiTokenVerification(async (): Promise<number> => {
+          for (let i = created; i < count; i++) {
+            const result = await createApiKey({
+              ...basePayload,
+              name:
+                i === 0 && data.name
+                  ? data.name
+                  : `${data.name || 'default'}-${Math.random().toString(36).slice(2, 8)}`,
             })
-          )
-          onOpenChange(false)
-          triggerRefresh()
-        }
+            if (result.success) {
+              created++
+            } else {
+              toast.error(result.message || t(ERROR_MESSAGES.CREATE_FAILED))
+              break
+            }
+          }
+
+          return created
+        })
       }
-    } catch (_error) {
-      toast.error(t(ERROR_MESSAGES.UNEXPECTED))
+    } catch (error) {
+      if (!wasSecureVerificationErrorReported(error)) {
+        handleServerError(error, {
+          fallback: t(ERROR_MESSAGES.UNEXPECTED),
+        })
+      }
     } finally {
       setIsSubmitting(false)
+      if (!isUpdate && created > 0) {
+        toast.success(
+          t('Successfully created {{count}} API Key(s)', {
+            count: created,
+          })
+        )
+        props.onOpenChange(false)
+        triggerRefresh()
+      }
     }
   }
 
@@ -264,15 +390,22 @@ export function ApiKeysMutateDrawer({
   const quotaPlaceholder = tokensOnly
     ? t('Enter quota in tokens')
     : t('Enter quota in {{currency}}', { currency: currencyLabel })
-  const selectedGroup = form.watch('group')
+  const routingMode = form.watch('routing_mode')
+  const routingRoute = form.watch('routing_route')
+  const manualGroups = form.watch('manual_groups')
+  const crossGroupRetry = form.watch('cross_group_retry')
   const unlimitedQuota = form.watch('unlimited_quota')
+  const routingRouteError = form.formState.errors.routing_route?.message
 
   return (
     <Sheet
-      open={open}
-      onOpenChange={(v) => {
-        onOpenChange(v)
+      open={props.open}
+      onOpenChange={(v: boolean): void => {
+        props.onOpenChange(v)
         if (!v) {
+          setEditingLegacyRouting(false)
+          setPreservedSmartRoute(undefined)
+          setPreservedManualGroups([])
           form.reset()
         }
       }}
@@ -318,49 +451,57 @@ export function ApiKeysMutateDrawer({
 
               <FormField
                 control={form.control}
-                name='group'
-                render={({ field }) => (
+                name='manual_groups'
+                render={() => (
                   <FormItem>
-                    <FormLabel>{t('Group')}</FormLabel>
                     <FormControl>
-                      <ApiKeyGroupCombobox
-                        options={groups}
-                        value={field.value}
-                        onValueChange={field.onChange}
-                        placeholder={t('Select a group')}
+                      <ApiKeyRoutingEditor
+                        mode={routingMode}
+                        route={routingRoute}
+                        manualGroups={manualGroups}
+                        retryOnFailure={!!crossGroupRetry}
+                        autoRouteOptions={autoRouteOptions}
+                        realGroupOptions={realGroups}
+                        preserveUnavailableRouting={
+                          Boolean(preservedSmartRoute) ||
+                          preservedManualGroups.length > 0
+                        }
+                        routesLoading={groupsLoading}
+                        disabled={isSubmitting || groupsLoading}
+                        onModeChange={(mode) =>
+                          form.setValue('routing_mode', mode, {
+                            shouldDirty: true,
+                            shouldValidate: true,
+                          })
+                        }
+                        onRouteChange={(route) => {
+                          form.setValue('routing_route', route, {
+                            shouldDirty: true,
+                            shouldValidate: true,
+                          })
+                        }}
+                        onManualGroupsChange={(groups) =>
+                          form.setValue('manual_groups', groups, {
+                            shouldDirty: true,
+                            shouldValidate: true,
+                          })
+                        }
+                        onRetryOnFailureChange={(enabled) =>
+                          form.setValue('cross_group_retry', enabled, {
+                            shouldDirty: true,
+                          })
+                        }
                       />
                     </FormControl>
                     <FormMessage />
+                    {routingRouteError && (
+                      <p className='text-destructive text-sm' role='alert'>
+                        {String(routingRouteError)}
+                      </p>
+                    )}
                   </FormItem>
                 )}
               />
-
-              {isAutoRouteKey(selectedGroup) && (
-                <FormField
-                  control={form.control}
-                  name='cross_group_retry'
-                  render={({ field }) => (
-                    <FormItem className={sideDrawerSwitchItemClassName()}>
-                      <div className='flex flex-col gap-0.5'>
-                        <FormLabel className='text-sm'>
-                          {t('Cross-group retry')}
-                        </FormLabel>
-                        <FormDescription className='line-clamp-2 text-xs sm:line-clamp-none'>
-                          {t(
-                            'When enabled, if channels in the current group fail, it will try channels in the next group in order.'
-                          )}
-                        </FormDescription>
-                      </div>
-                      <FormControl>
-                        <Switch
-                          checked={!!field.value}
-                          onCheckedChange={field.onChange}
-                        />
-                      </FormControl>
-                    </FormItem>
-                  )}
-                />
-              )}
 
               <FormField
                 control={form.control}
@@ -606,7 +747,7 @@ export function ApiKeysMutateDrawer({
           <Button
             type='button'
             onClick={form.handleSubmit(onSubmit, onInvalid)}
-            disabled={isSubmitting}
+            disabled={isSubmitting || groupsLoading}
             className='w-full sm:w-auto'
           >
             {isSubmitting ? t('Saving...') : t('Save changes')}

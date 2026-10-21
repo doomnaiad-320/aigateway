@@ -16,9 +16,103 @@ import (
 	"github.com/MAX-API-Next/MAX-API/relay/channel/task/taskcommon"
 	relaycommon "github.com/MAX-API-Next/MAX-API/relay/common"
 	"github.com/MAX-API-Next/MAX-API/service"
+	"github.com/MAX-API-Next/MAX-API/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+func TestClientWithStreamingHeaderTimeoutCachesTransportByConfiguredBudget(t *testing.T) {
+	originalSetting := *operation_setting.GetMonitorSetting()
+	*operation_setting.GetMonitorSetting() = operation_setting.MonitorSetting{
+		StreamingFirstResultTimeoutSeconds: 1,
+	}
+	t.Cleanup(func() { *operation_setting.GetMonitorSetting() = originalSetting })
+
+	transport := &http.Transport{ResponseHeaderTimeout: 5 * time.Second}
+	client := &http.Client{Transport: transport}
+	info := &relaycommon.RelayInfo{
+		IsStream: true,
+	}
+
+	cloned := clientWithStreamingHeaderTimeout(client, info)
+	clonedAgain := clientWithStreamingHeaderTimeout(client, info)
+	require.NotSame(t, client, cloned)
+	require.NotSame(t, client, clonedAgain)
+	clonedTransport, ok := cloned.Transport.(*http.Transport)
+	require.True(t, ok)
+	clonedAgainTransport, ok := clonedAgain.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.Same(t, clonedTransport, clonedAgainTransport)
+	require.Equal(t, time.Second, clonedTransport.ResponseHeaderTimeout)
+	require.Equal(t, 5*time.Second, transport.ResponseHeaderTimeout)
+}
+
+func TestResetProxyClientCacheClearsDerivedResponseHeaderTransports(t *testing.T) {
+	originalSetting := *operation_setting.GetMonitorSetting()
+	*operation_setting.GetMonitorSetting() = operation_setting.MonitorSetting{
+		StreamingFirstResultTimeoutSeconds: 1,
+	}
+	t.Cleanup(func() { *operation_setting.GetMonitorSetting() = originalSetting })
+	t.Cleanup(service.ResetProxyClientCache)
+
+	transport := &http.Transport{}
+	client := &http.Client{Transport: transport}
+	info := &relaycommon.RelayInfo{IsStream: true}
+	first := clientWithStreamingHeaderTimeout(client, info)
+	firstTransport, ok := first.Transport.(*http.Transport)
+	require.True(t, ok)
+
+	service.ResetProxyClientCache()
+	second := clientWithStreamingHeaderTimeout(client, info)
+	secondTransport, ok := second.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.NotSame(t, firstTransport, secondTransport)
+	require.Equal(t, time.Second, secondTransport.ResponseHeaderTimeout)
+}
+
+func TestClientWithNonStreamingTimeoutUsesHeaderBudgetWithoutShorteningBodyClient(t *testing.T) {
+	originalSetting := *operation_setting.GetMonitorSetting()
+	*operation_setting.GetMonitorSetting() = operation_setting.MonitorSetting{
+		NonStreamingResponseTimeoutSeconds: 1,
+	}
+	t.Cleanup(func() { *operation_setting.GetMonitorSetting() = originalSetting })
+
+	transport := &http.Transport{ResponseHeaderTimeout: 5 * time.Second}
+	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
+	cloned := clientWithNonStreamingTimeout(client, &relaycommon.RelayInfo{})
+	require.NotSame(t, client, cloned)
+	require.Equal(t, 30*time.Second, cloned.Timeout)
+	clonedTransport, ok := cloned.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.Equal(t, time.Second, clonedTransport.ResponseHeaderTimeout)
+	require.Equal(t, 5*time.Second, transport.ResponseHeaderTimeout)
+}
+
+func TestTimeoutTrackingBodyEnforcesDeadline(t *testing.T) {
+	reader, writer := io.Pipe()
+	tracked := newTimeoutTrackingBody(reader, nil, 20*time.Millisecond)
+	t.Cleanup(func() { _ = tracked.Close(); _ = writer.Close() })
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := tracked.Read(make([]byte, 1))
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		require.Error(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timeout tracking body did not stop a stalled read")
+	}
+}
+
+func TestServerSentEventsResponseSkipsNonStreamingBodyTimeout(t *testing.T) {
+	sse := &http.Response{Header: http.Header{"Content-Type": []string{"text/event-stream; charset=utf-8"}}}
+	json := &http.Response{Header: http.Header{"Content-Type": []string{"application/json"}}}
+	require.True(t, isServerSentEventsResponse(sse))
+	require.False(t, isServerSentEventsResponse(json))
+}
 
 type taskHeaderAdaptor struct {
 	taskcommon.BaseBilling
@@ -129,7 +223,7 @@ func TestNewTaskHTTPRequestDoesNotPreReadRequestBody(t *testing.T) {
 	require.Equal(t, 1, body.reads)
 }
 
-func TestNewTaskHTTPRequestUsesSeekableGetBodyWithoutBuffering(t *testing.T) {
+func TestNewTaskHTTPRequestDoesNotInventReplayForUnknownSeeker(t *testing.T) {
 	t.Parallel()
 
 	body := &customReadSeeker{reader: strings.NewReader("abcdef")}
@@ -139,14 +233,39 @@ func TestNewTaskHTTPRequestUsesSeekableGetBodyWithoutBuffering(t *testing.T) {
 	req, err := newTaskHTTPRequest(http.MethodPost, "https://example.com/tasks", body, &relaycommon.RelayInfo{})
 
 	require.NoError(t, err)
-	require.Equal(t, int64(4), req.ContentLength)
+	require.Zero(t, req.ContentLength)
+	require.Nil(t, req.GetBody)
+}
+
+func TestApplyUpstreamBodyMetadataUsesIndependentReplayReaders(t *testing.T) {
+	payload := []byte(`{"model":"test","input":"abcdef"}`)
+	storage, err := common2.CreateBodyStorage(payload)
+	require.NoError(t, err)
+	defer storage.Close()
+	body := common2.NewReplayableBodyReader(storage)
+
+	req, err := http.NewRequest(http.MethodPost, "https://example.com", body)
+	require.NoError(t, err)
+	applyUpstreamBodyMetadata(req, body, nil)
+	require.Equal(t, int64(len(payload)), req.ContentLength)
 	require.NotNil(t, req.GetBody)
 
-	replay, err := req.GetBody()
+	first, err := req.GetBody()
 	require.NoError(t, err)
-	replayed, err := io.ReadAll(replay)
+	defer first.Close()
+	second, err := req.GetBody()
 	require.NoError(t, err)
-	require.Equal(t, "cdef", string(replayed))
+	defer second.Close()
+
+	prefix := make([]byte, 5)
+	_, err = io.ReadFull(first, prefix)
+	require.NoError(t, err)
+	secondBody, err := io.ReadAll(second)
+	require.NoError(t, err)
+	require.Equal(t, payload, secondBody)
+	firstRest, err := io.ReadAll(first)
+	require.NoError(t, err)
+	require.Equal(t, payload[5:], firstRest)
 }
 
 func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {
@@ -398,6 +517,41 @@ func TestDoTaskApiRequestAppliesRuntimeHeaderOverride(t *testing.T) {
 	require.NoError(t, resp.Body.Close())
 	require.Equal(t, "overridden", gotDefault)
 	require.Equal(t, "enabled", gotRuntime)
+}
+
+func TestDoTaskApiRequestMarksWrittenTransportFailureAsOutcomeUnknown(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service.InitHttpClient()
+	requestReceived := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		close(requestReceived)
+		hijacker, ok := w.(http.Hijacker)
+		require.True(t, ok)
+		conn, _, err := hijacker.Hijack()
+		require.NoError(t, err)
+		_ = conn.Close()
+	}))
+	t.Cleanup(server.Close)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"prompt":"test"}`))
+	info := &relaycommon.RelayInfo{
+		ChannelMeta:   &relaycommon.ChannelMeta{},
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{},
+	}
+
+	resp, err := DoTaskApiRequest(taskHeaderAdaptor{url: server.URL}, ctx, info, strings.NewReader(`{"prompt":"test"}`))
+
+	require.Error(t, err)
+	require.Nil(t, resp)
+	require.True(t, info.UpstreamTaskOutcomeUnknown)
+	select {
+	case <-requestReceived:
+	default:
+		t.Fatal("upstream did not receive the task request")
+	}
 }
 
 func TestSendPingDataReturnsWhenWriterBlocks(t *testing.T) {

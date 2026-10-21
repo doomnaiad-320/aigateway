@@ -18,25 +18,64 @@ For commercial licensing, please contact https://github.com/MAX-API-Next/MAX-API
 */
 import { api } from './api'
 
+export interface CustomOAuthBinding {
+  provider_id: number
+  provider_name: string
+  provider_slug: string
+  provider_icon: string
+  provider_user_id: string
+}
+
+export function indexCustomOAuthBindings(
+  bindings: CustomOAuthBinding[]
+): Map<number, CustomOAuthBinding> {
+  return new Map(bindings.map((binding) => [binding.provider_id, binding]))
+}
+
+export function selfCustomOAuthUnbindPath(providerId: number): string {
+  return `/api/user/oauth/bindings/${providerId}`
+}
+
+export function adminCustomOAuthUnbindPath(
+  userId: number,
+  providerId: number
+): string {
+  return `/api/user/${userId}/oauth/bindings/${providerId}`
+}
+
 const oauthBindingStatePrefix = 'oauth:binding:state:'
 const oauthBindingStateTtlMs = 10 * 60 * 1000
 
-function getOAuthBindingStateKey(state: string): string {
+function normalizeOAuthProvider(provider: string): string {
+  return provider.trim().toLowerCase()
+}
+
+function getOAuthBindingStateKey(provider: string, state: string): string {
+  return `${oauthBindingStatePrefix}${normalizeOAuthProvider(provider)}:${state}`
+}
+
+function getLegacyOAuthBindingStateKey(state: string): string {
   return `${oauthBindingStatePrefix}${state}`
 }
 
-function markOAuthBindingState(state: string): void {
+function markOAuthBindingState(provider: string, state: string): void {
   try {
-    localStorage.setItem(getOAuthBindingStateKey(state), String(Date.now()))
+    localStorage.setItem(
+      getOAuthBindingStateKey(provider, state),
+      String(Date.now())
+    )
   } catch {
-    // The callback retains the legacy opener check when storage is unavailable.
+    // Without this marker the callback safely falls back to login mode.
   }
 }
 
-export function isOAuthBindingState(state?: string): boolean {
-  if (!state) return false
+export function isOAuthBindingState(
+  provider?: string,
+  state?: string
+): boolean {
+  if (!provider || !state) return false
   try {
-    const key = getOAuthBindingStateKey(state)
+    const key = getOAuthBindingStateKey(provider, state)
     const createdAt = Number(localStorage.getItem(key))
     if (
       !Number.isFinite(createdAt) ||
@@ -51,17 +90,27 @@ export function isOAuthBindingState(state?: string): boolean {
   }
 }
 
-export function clearOAuthBindingState(state?: string): void {
+export function clearOAuthBindingState(
+  provider?: string,
+  state?: string
+): void {
   if (!state) return
   try {
-    localStorage.removeItem(getOAuthBindingStateKey(state))
+    if (provider) {
+      localStorage.removeItem(getOAuthBindingStateKey(provider, state))
+    }
+    localStorage.removeItem(getLegacyOAuthBindingStateKey(state))
   } catch {
     // Ignore storage cleanup failures; entries are bounded by their TTL.
   }
 }
 
-function openOAuthBindingWindow(url: string, state: string): void {
-  markOAuthBindingState(state)
+function openOAuthBindingWindow(
+  url: string,
+  provider: string,
+  state: string
+): void {
+  markOAuthBindingState(provider, state)
   window.open(url, '_blank', 'noopener,noreferrer')
 }
 
@@ -124,14 +173,12 @@ export function buildLinuxDOOAuthUrl(clientId: string, state: string): string {
  * Get OAuth state token
  * Includes affiliate code from localStorage if available
  */
-export async function getOAuthState(): Promise<string | null> {
+export async function getOAuthState(provider: string): Promise<string | null> {
   try {
-    let path = '/api/oauth/state'
-    const affCode = localStorage.getItem('aff')
-    if (affCode && affCode.length > 0) {
-      path += `?aff=${affCode}`
-    }
-    const res = await api.get(path)
+    const res = await api.post('/api/oauth/state', {
+      provider: normalizeOAuthProvider(provider),
+      intent: 'bind',
+    })
     if (res.data.success) {
       return res.data.data
     }
@@ -147,22 +194,22 @@ export async function getOAuthState(): Promise<string | null> {
  * Handle GitHub OAuth binding/login
  */
 export async function handleGitHubOAuth(clientId: string): Promise<void> {
-  const state = await getOAuthState()
+  const state = await getOAuthState('github')
   if (!state) return
 
   const url = buildGitHubOAuthUrl(clientId, state)
-  openOAuthBindingWindow(url, state)
+  openOAuthBindingWindow(url, 'github', state)
 }
 
 /**
  * Handle Discord OAuth binding/login
  */
 export async function handleDiscordOAuth(clientId: string): Promise<void> {
-  const state = await getOAuthState()
+  const state = await getOAuthState('discord')
   if (!state) return
 
   const url = buildDiscordOAuthUrl(clientId, state)
-  openOAuthBindingWindow(url, state)
+  openOAuthBindingWindow(url, 'discord', state)
 }
 
 /**
@@ -172,20 +219,20 @@ export async function handleOIDCOAuth(
   authUrl: string,
   clientId: string
 ): Promise<void> {
-  const state = await getOAuthState()
+  const state = await getOAuthState('oidc')
   if (!state) return
 
   const url = buildOIDCOAuthUrl(authUrl, clientId, state)
-  openOAuthBindingWindow(url, state)
+  openOAuthBindingWindow(url, 'oidc', state)
 }
 
 /**
  * Handle LinuxDO OAuth binding/login
  */
 export async function handleLinuxDOOAuth(clientId: string): Promise<void> {
-  const state = await getOAuthState()
+  const state = await getOAuthState('linuxdo')
   if (!state) return
 
   const url = buildLinuxDOOAuthUrl(clientId, state)
-  openOAuthBindingWindow(url, state)
+  openOAuthBindingWindow(url, 'linuxdo', state)
 }

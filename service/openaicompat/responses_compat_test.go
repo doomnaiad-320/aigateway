@@ -44,6 +44,71 @@ func TestResponsesRequestToChatCompletionsRequestInstructionsScalarInputAndZeroT
 	assert.Equal(t, "medium", got.ReasoningEffort)
 }
 
+func TestChatCompletionsRequestToResponsesRequestPreservesQwenThinkingBudget(t *testing.T) {
+	got, err := ChatCompletionsRequestToResponsesRequest(&dto.GeneralOpenAIRequest{
+		Model:          "qwen-plus",
+		Messages:       []dto.Message{{Role: "user", Content: "hello"}},
+		EnableThinking: mustCompatRawMessage(t, false),
+		ThinkingBudget: mustCompatRawMessage(t, 0),
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, "false", string(got.EnableThinking))
+	assert.Equal(t, "0", string(got.ThinkingBudget))
+}
+
+func TestChatCompletionsRequestToResponsesPreservesCacheKeyAndExplicitZeroPenalties(t *testing.T) {
+	zero := 0.0
+	got, err := ChatCompletionsRequestToResponsesRequest(&dto.GeneralOpenAIRequest{
+		Model:            "gpt-test",
+		Messages:         []dto.Message{{Role: "user", Content: "hello"}},
+		PromptCacheKey:   "cache-key",
+		FrequencyPenalty: &zero,
+		PresencePenalty:  &zero,
+	})
+	require.NoError(t, err)
+	payload, err := common.Marshal(got)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"model":"gpt-test","input":[{"content":"hello","role":"user"}],"prompt_cache_key":"cache-key","frequency_penalty":0,"presence_penalty":0}`, string(payload))
+
+	without, err := ChatCompletionsRequestToResponsesRequest(&dto.GeneralOpenAIRequest{Model: "gpt-test"})
+	require.NoError(t, err)
+	payload, err = common.Marshal(without)
+	require.NoError(t, err)
+	require.NotContains(t, string(payload), "frequency_penalty")
+	require.NotContains(t, string(payload), "presence_penalty")
+	require.NotContains(t, string(payload), "prompt_cache_key")
+}
+
+func TestResponsesRequestToChatCompletionsRequestPreservesQwenThinkingBudget(t *testing.T) {
+	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+		Model:          "qwen-plus",
+		Input:          mustCompatRawMessage(t, "hello"),
+		EnableThinking: mustCompatRawMessage(t, true),
+		ThinkingBudget: mustCompatRawMessage(t, 0),
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, "true", string(got.EnableThinking))
+	assert.Equal(t, "0", string(got.ThinkingBudget))
+}
+
+func TestResponsesRequestToChatCompletionsRequestPreservesPenalties(t *testing.T) {
+	frequencyPenalty := 0.0
+	presencePenalty := 1.5
+	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+		Model:            "gpt-test",
+		Input:            mustCompatRawMessage(t, "hello"),
+		FrequencyPenalty: &frequencyPenalty,
+		PresencePenalty:  &presencePenalty,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, got.FrequencyPenalty)
+	require.NotNil(t, got.PresencePenalty)
+	assert.Equal(t, 0.0, *got.FrequencyPenalty)
+	assert.Equal(t, 1.5, *got.PresencePenalty)
+}
+
 func TestResponsesRequestToChatCompletionsRequestFunctionCallConversation(t *testing.T) {
 	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
 		Model: "gpt-test",
@@ -170,7 +235,7 @@ func TestResponsesRequestToChatCompletionsRequestSkipsNonMessageOutputItems(t *t
 	assert.Equal(t, "continue", got.Messages[1].StringContent())
 }
 
-func TestResponsesRequestToChatCompletionsRequestRejectsCustomToolCallItems(t *testing.T) {
+func TestResponsesRequestToChatCompletionsRequestEncodesCustomToolHistory(t *testing.T) {
 	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
 		Model: "gpt-test",
 		Input: mustCompatRawMessage(t, []map[string]any{
@@ -180,12 +245,46 @@ func TestResponsesRequestToChatCompletionsRequestRejectsCustomToolCallItems(t *t
 				"name":    "apply_patch",
 				"input":   "patch body",
 			},
+			{
+				"type":    "custom_tool_call_output",
+				"call_id": "call_custom",
+				"output":  "ok",
+			},
 		}),
 	})
 
-	require.Error(t, err)
-	require.Nil(t, got)
-	assert.Contains(t, err.Error(), "custom_tool_call")
+	require.NoError(t, err)
+	require.Len(t, got.Messages, 2)
+	toolCalls := got.Messages[0].ParseToolCalls()
+	require.Len(t, toolCalls, 1)
+	assert.Equal(t, "function", toolCalls[0].Type)
+	assert.Equal(t, "call_custom", toolCalls[0].ID)
+	assert.Equal(t, "apply_patch", toolCalls[0].Function.Name)
+	assert.Equal(t, "patch body", gjson.Get(toolCalls[0].Function.Arguments, "input").String())
+	assert.Equal(t, dto.Message{Role: "tool", ToolCallId: "call_custom", Content: "ok"}, got.Messages[1])
+}
+
+func TestResponsesRequestToChatCompletionsRequestEncodesCustomToolDefinition(t *testing.T) {
+	got, err := ResponsesRequestToChatCompletionsRequest(&dto.OpenAIResponsesRequest{
+		Model: "gpt-test",
+		Tools: mustCompatRawMessage(t, []map[string]any{{
+			"type":        "custom",
+			"name":        "apply_patch",
+			"description": "Apply a patch",
+		}}),
+		ToolChoice: mustCompatRawMessage(t, map[string]any{"type": "custom", "name": "apply_patch"}),
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Tools, 1)
+	assert.Equal(t, "function", got.Tools[0].Type)
+	assert.Equal(t, "apply_patch", got.Tools[0].Function.Name)
+	assert.Contains(t, got.Tools[0].Function.Description, "Apply a patch")
+	params := got.Tools[0].Function.Parameters.(map[string]any)
+	assert.Equal(t, []string{"input"}, params["required"])
+	assert.Equal(t, map[string]any{
+		"type":     "function",
+		"function": map[string]any{"name": "apply_patch"},
+	}, got.ToolChoice)
 }
 
 func TestResponsesRequestToChatCompletionsRequestRejectsMissingToolCallIDs(t *testing.T) {
@@ -234,13 +333,13 @@ func TestResponsesRequestToChatCompletionsRequestRejectsUnsupportedToolTypes(t *
 		Model: "gpt-test",
 		Input: mustCompatRawMessage(t, "hello"),
 		Tools: mustCompatRawMessage(t, []map[string]any{
-			{"type": "custom", "name": "apply_patch"},
+			{"type": "web_search_preview"},
 		}),
 	})
 
 	require.Error(t, err)
 	require.Nil(t, got)
-	assert.Contains(t, err.Error(), `tool type "custom"`)
+	assert.Contains(t, err.Error(), `tool type "web_search_preview"`)
 }
 
 func TestChatCompletionsResponseToResponsesResponsePreservesToolCallsAndIncompleteReason(t *testing.T) {
@@ -330,6 +429,49 @@ func TestResponsesResponseToChatCompletionsResponsePreservesUsageDetails(t *test
 	assert.Equal(t, usage.CompletionTokenDetails, resp.Usage.CompletionTokenDetails)
 }
 
+func TestResponsesResponseToChatCompletionsResponsePreservesCustomToolInput(t *testing.T) {
+	var upstream dto.OpenAIResponsesResponse
+	require.NoError(t, common.Unmarshal([]byte(`{
+		"id":"resp_custom",
+		"status":"completed",
+		"model":"gpt-test",
+		"output":[{
+			"type":"custom_tool_call",
+			"id":"ctc_1",
+			"call_id":"call_custom",
+			"name":"apply_patch",
+			"input":"*** Begin Patch\n*** End Patch"
+		}]
+	}`), &upstream))
+
+	got, _, err := ResponsesResponseToChatCompletionsResponse(&upstream, "chatcmpl_custom")
+	require.NoError(t, err)
+	require.Len(t, got.Choices, 1)
+	toolCalls := got.Choices[0].Message.ParseToolCalls()
+	require.Len(t, toolCalls, 1)
+	assert.Equal(t, "call_custom", toolCalls[0].ID)
+	assert.Equal(t, "apply_patch", toolCalls[0].Function.Name)
+	assert.Equal(t, "*** Begin Patch\n*** End Patch", toolCalls[0].Function.Arguments)
+}
+
+func TestResponsesStreamOutputItemPreservesCustomToolInput(t *testing.T) {
+	var event dto.ResponsesStreamResponse
+	require.NoError(t, common.Unmarshal([]byte(`{
+		"type":"response.output_item.done",
+		"output_index":0,
+		"item":{
+			"type":"custom_tool_call",
+			"id":"ctc_1",
+			"call_id":"call_custom",
+			"name":"apply_patch",
+			"input":"patch body"
+		}
+	}`), &event))
+
+	require.NotNil(t, event.Item)
+	assert.Equal(t, "patch body", event.Item.ArgumentsString())
+}
+
 func TestChatCompletionsStreamToResponsesEventsAggregatesUsage(t *testing.T) {
 	state := NewChatToResponsesStreamState("resp_1", "gpt-test")
 	state.Created = 123
@@ -386,6 +528,68 @@ func TestChatCompletionsStreamToResponsesEventsAggregatesUsage(t *testing.T) {
 	require.Len(t, events[9].Payload.Response.Output, 2)
 	assert.Equal(t, "hello", events[9].Payload.Response.Output[0].Content[0].Text)
 	assert.Equal(t, `"{\"q\":\"x\"}"`, string(events[9].Payload.Response.Output[1].Arguments))
+}
+
+func TestChatCompletionsStreamToResponsesEventsWaitsForToolName(t *testing.T) {
+	state := NewChatToResponsesStreamState("resp_unnamed", "gpt-test")
+	toolIndex := 0
+	finishReason := "tool_calls"
+
+	events := mustCompatResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+		Id: "chatcmpl_unnamed",
+		Choices: []dto.ChatCompletionsStreamResponseChoice{{Delta: dto.ChatCompletionsStreamResponseChoiceDelta{
+			ToolCalls: []dto.ToolCallResponse{{
+				Index: &toolIndex,
+				ID:    "call_unnamed",
+				Function: dto.FunctionResponse{
+					Arguments: `{"input":"ls"}`,
+				},
+			}},
+		}}},
+	})
+	require.Len(t, events, 1)
+	assert.Equal(t, responsesEventCreated, events[0].Type)
+
+	nameEvents := mustCompatResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+		Choices: []dto.ChatCompletionsStreamResponseChoice{{Delta: dto.ChatCompletionsStreamResponseChoiceDelta{
+			ToolCalls: []dto.ToolCallResponse{{
+				Index:    &toolIndex,
+				Function: dto.FunctionResponse{Name: "exec"},
+			}},
+		}}},
+	})
+	require.Len(t, nameEvents, 2)
+	assert.Equal(t, responsesEventOutputItemAdded, nameEvents[0].Type)
+	require.NotNil(t, nameEvents[0].Payload.Item)
+	assert.Equal(t, "exec", nameEvents[0].Payload.Item.Name)
+	assert.Equal(t, responsesEventFunctionArgsDelta, nameEvents[1].Type)
+	assert.Equal(t, `{"input":"ls"}`, nameEvents[1].Payload.Delta)
+
+	finishEvents := mustCompatResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+		Choices: []dto.ChatCompletionsStreamResponseChoice{{FinishReason: &finishReason}},
+	})
+	require.Len(t, finishEvents, 2)
+	assert.Equal(t, responsesEventFunctionArgsDone, finishEvents[0].Type)
+	assert.Equal(t, responsesEventOutputItemDone, finishEvents[1].Type)
+}
+
+func TestChatCompletionsStreamToResponsesMarksTransportEOFIncomplete(t *testing.T) {
+	state := NewChatToResponsesStreamState("resp_eof", "gpt-test")
+	mustCompatResponsesEventsFromChatChunk(t, state, &dto.ChatCompletionsStreamResponse{
+		Choices: []dto.ChatCompletionsStreamResponseChoice{{
+			Delta: dto.ChatCompletionsStreamResponseChoiceDelta{Content: lo.ToPtr("partial")},
+		}},
+	})
+
+	state.MarkIncomplete("upstream_eof")
+	events := FinalizeChatCompletionsStreamToResponses(state)
+	require.NotEmpty(t, events)
+	last := events[len(events)-1]
+	assert.Equal(t, responsesEventIncomplete, last.Type)
+	require.NotNil(t, last.Payload.Response)
+	assert.Equal(t, `"incomplete"`, string(last.Payload.Response.Status))
+	require.NotNil(t, last.Payload.Response.IncompleteDetails)
+	assert.Equal(t, "upstream_eof", last.Payload.Response.IncompleteDetails.Reason)
 }
 
 func compatAssistantMessageWithTool(content string, id string, name string, args string) dto.Message {

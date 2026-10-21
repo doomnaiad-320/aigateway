@@ -404,12 +404,30 @@ type ResponsesOutput struct {
 	CallId    string                   `json:"call_id,omitempty"`
 	Name      string                   `json:"name,omitempty"`
 	Arguments json.RawMessage          `json:"arguments,omitempty"`
+	Input     string                   `json:"input,omitempty"`
 }
 
-// ArgumentsString returns function call arguments in the string form expected by Chat Completions.
+// A custom tool's empty input is still a supplied protocol value. Preserve it
+// without adding an input field to ordinary Responses output items.
+func (r ResponsesOutput) MarshalJSON() ([]byte, error) {
+	type outputAlias ResponsesOutput
+	var input *string
+	if r.Type == BuildInCallCustomToolCall || r.Input != "" {
+		input = &r.Input
+	}
+	return common.Marshal(struct {
+		outputAlias
+		Input *string `json:"input,omitempty"`
+	}{outputAlias: outputAlias(r), Input: input})
+}
+
+// ArgumentsString returns function arguments or custom-tool input in the string form expected by Chat Completions.
 func (r *ResponsesOutput) ArgumentsString() string {
 	if r == nil {
 		return ""
+	}
+	if r.Type == BuildInCallCustomToolCall {
+		return r.Input
 	}
 	return ResponsesArgumentsString(r.Arguments)
 }
@@ -433,11 +451,18 @@ type ResponsesReasoningSummaryPart struct {
 
 const (
 	BuildInToolWebSearchPreview = "web_search_preview"
+	BuildInToolWebSearch        = "web_search"
 	BuildInToolFileSearch       = "file_search"
+	BuildInToolGoogleSearch     = "google_search"
+	BuildInToolImageGeneration  = "image_generation"
 )
 
 const (
-	BuildInCallWebSearchCall = "web_search_call"
+	BuildInCallWebSearchCall  = "web_search_call"
+	BuildInCallFileSearchCall = "file_search_call"
+	BuildInCallFunctionCall   = "function_call"
+	BuildInCallCustomToolCall = "custom_tool_call"
+	BuildInCallToolUse        = "tool_use"
 )
 
 const (
@@ -447,10 +472,15 @@ const (
 
 // ResponsesStreamResponse 用于处理 /v1/responses 流式响应
 type ResponsesStreamResponse struct {
-	Type     string                   `json:"type"`
-	Response *OpenAIResponsesResponse `json:"response,omitempty"`
-	Delta    string                   `json:"delta,omitempty"`
-	Item     *ResponsesOutput         `json:"item,omitempty"`
+	Type      string                   `json:"type"`
+	Response  *OpenAIResponsesResponse `json:"response,omitempty"`
+	Code      any                      `json:"code,omitempty"`
+	Message   string                   `json:"message,omitempty"`
+	Param     string                   `json:"param,omitempty"`
+	Delta     string                   `json:"delta,omitempty"`
+	Input     *string                  `json:"input,omitempty"`
+	Arguments *string                  `json:"arguments,omitempty"`
+	Item      *ResponsesOutput         `json:"item,omitempty"`
 	// - response.function_call_arguments.delta
 	// - response.function_call_arguments.done
 	OutputIndex  *int                           `json:"output_index,omitempty"`

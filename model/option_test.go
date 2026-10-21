@@ -1,6 +1,8 @@
 package model
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/MAX-API-Next/MAX-API/common"
@@ -26,11 +28,37 @@ func setupOptionMapTestState(t *testing.T) {
 	})
 }
 
-func optionMapContainsForTest(key string) bool {
-	common.OptionMapRWMutex.RLock()
-	defer common.OptionMapRWMutex.RUnlock()
-	_, ok := common.OptionMap[key]
-	return ok
+func registerOptionKeysForTest(keys ...string) {
+	common.OptionMapRWMutex.Lock()
+	defer common.OptionMapRWMutex.Unlock()
+	for _, key := range keys {
+		common.OptionMap[key] = ""
+	}
+}
+
+func TestUpdateOptionRejectsUnregisteredKeyBeforePersistence(t *testing.T) {
+	setupOptionMapTestState(t)
+	deleteOptionsForTest(t, "unregistered.option")
+	t.Cleanup(func() { deleteOptionsForTest(t, "unregistered.option") })
+
+	err := UpdateOption("unregistered.option", "value")
+	require.Error(t, err)
+	require.False(t, optionExistsForTest(t, "unregistered.option"))
+}
+
+func TestUpdateOptionsBulkRejectsUnregisteredKeyBeforePersistence(t *testing.T) {
+	setupOptionMapTestState(t)
+	registerOptionKeysForTest("SystemName")
+	deleteOptionsForTest(t, "SystemName", "unregistered.option")
+	t.Cleanup(func() { deleteOptionsForTest(t, "SystemName", "unregistered.option") })
+
+	err := UpdateOptionsBulk(map[string]string{
+		"SystemName":          "should-not-persist",
+		"unregistered.option": "value",
+	})
+	require.Error(t, err)
+	require.False(t, optionExistsForTest(t, "SystemName"))
+	require.False(t, optionExistsForTest(t, "unregistered.option"))
 }
 
 func deleteOptionsForTest(t *testing.T, keys ...string) {
@@ -60,6 +88,7 @@ func optionMapValueForTest(key string) string {
 
 func TestUpdateOptionFiltersAutoRouteGroupRatioNamesBeforePersistence(t *testing.T) {
 	setupOptionMapTestState(t)
+	registerOptionKeysForTest("GroupRatio", "group_ratio_setting.group_ratio")
 	deleteOptionsForTest(t, "GroupRatio", "group_ratio_setting.group_ratio")
 	t.Cleanup(func() {
 		deleteOptionsForTest(t, "GroupRatio", "group_ratio_setting.group_ratio")
@@ -154,8 +183,170 @@ func TestValidateOptionUpdateRejectsRuntimeConfigParseErrors(t *testing.T) {
 	}
 }
 
+func TestValidateOptionUpdateRejectsUnsafePricingValues(t *testing.T) {
+	pricingKeys := []string{
+		"ModelRatio",
+		"ModelPrice",
+		"CacheRatio",
+		"CreateCacheRatio",
+		"CompletionRatio",
+		"ImageRatio",
+		"AudioRatio",
+		"AudioCompletionRatio",
+	}
+
+	for _, key := range pricingKeys {
+		t.Run(key+" rejects null", func(t *testing.T) {
+			require.Error(t, validateOptionUpdate(key, `{"unsafe-model":null}`))
+		})
+		t.Run(key+" rejects negative values", func(t *testing.T) {
+			require.Error(t, validateOptionUpdate(key, `{"unsafe-model":-0.01}`))
+		})
+		t.Run(key+" allows zero", func(t *testing.T) {
+			require.NoError(t, validateOptionUpdate(key, `{"free-model":0}`))
+		})
+	}
+}
+
+func TestValidateOptionUpdateRejectsInvalidPreConsumedQuota(t *testing.T) {
+	for _, value := range []string{"-1", "1.5", "not-a-number"} {
+		t.Run(value, func(t *testing.T) {
+			require.Error(t, validateOptionUpdate("PreConsumedQuota", value))
+		})
+	}
+
+	for _, value := range []string{"0", "500", " 1000 "} {
+		t.Run("accepts-"+strings.TrimSpace(value), func(t *testing.T) {
+			require.NoError(t, validateOptionUpdate("PreConsumedQuota", value))
+		})
+	}
+}
+
+func TestNormalizePreConsumedQuota(t *testing.T) {
+	normalized, err := normalizeOptionUpdateValue("PreConsumedQuota", " 1000 ")
+	require.NoError(t, err)
+	require.Equal(t, "1000", normalized)
+
+	for _, value := range []string{"-1", "1.5", "not-a-number"} {
+		_, err := normalizeOptionUpdateValue("PreConsumedQuota", value)
+		require.Error(t, err)
+	}
+}
+
+func TestUpdateOptionMapRejectsInvalidPreConsumedQuotaWithoutMutation(t *testing.T) {
+	setupOptionMapTestState(t)
+	registerOptionKeysForTest("PreConsumedQuota")
+	originalPreConsumedQuota := common.PreConsumedQuota
+	common.PreConsumedQuota = 123
+	common.OptionMapRWMutex.Lock()
+	common.OptionMap["PreConsumedQuota"] = "123"
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() { common.PreConsumedQuota = originalPreConsumedQuota })
+
+	err := updateOptionMap("PreConsumedQuota", "not-a-number")
+
+	require.Error(t, err)
+	require.Equal(t, 123, common.PreConsumedQuota)
+	require.Equal(t, "123", optionMapValueForTest("PreConsumedQuota"))
+}
+
+func TestUpdateOptionPersistsPreConsumedQuota(t *testing.T) {
+	setupOptionMapTestState(t)
+	registerOptionKeysForTest("PreConsumedQuota")
+	deleteOptionsForTest(t, "PreConsumedQuota")
+	originalPreConsumedQuota := common.PreConsumedQuota
+	t.Cleanup(func() {
+		common.PreConsumedQuota = originalPreConsumedQuota
+		deleteOptionsForTest(t, "PreConsumedQuota")
+	})
+
+	require.NoError(t, UpdateOption("PreConsumedQuota", " 1000 "))
+	require.Equal(t, "1000", optionValueForTest(t, "PreConsumedQuota"))
+	require.Equal(t, "1000", optionMapValueForTest("PreConsumedQuota"))
+	require.Equal(t, 1000, common.PreConsumedQuota)
+}
+
+func TestValidateOptionUpdateRejectsOversizedPricingMaps(t *testing.T) {
+	const entryCount = 20001
+	values := make(map[string]float64, entryCount)
+	for i := 0; i < entryCount; i++ {
+		values[fmt.Sprintf("model-%d", i)] = 1
+	}
+	data, err := common.Marshal(values)
+	require.NoError(t, err)
+
+	require.Error(t, validateOptionUpdate("ModelRatio", string(data)))
+}
+
+func TestValidateOptionUpdateRejectsUnsafePricingKeys(t *testing.T) {
+	longModelName := strings.Repeat("a", 257)
+
+	require.Error(t, validateOptionUpdate("CompletionRatio", fmt.Sprintf(`{"%s":1}`, longModelName)))
+	require.Error(t, validateOptionUpdate("CompletionRatio", `{" ":1}`))
+	require.Error(t, validateOptionUpdate("ModelRatio", `{"gemini-2.5-flash-thinking-a":1,"gemini-2.5-flash-thinking-b":2}`))
+	require.Error(t, validateOptionUpdate("CompletionRatio", `{"gemini-2.5-pro-thinking-a":1,"gemini-2.5-pro-thinking-b":2}`))
+}
+
+func TestValidateOptionUpdateRejectsNullRWMapConfigs(t *testing.T) {
+	for _, key := range []string{
+		"billing_setting.billing_mode",
+		"billing_setting.billing_expr",
+		"task_billing_setting.rate_cards",
+		"task_billing_setting.h3_profiles",
+	} {
+		t.Run(key, func(t *testing.T) {
+			require.Error(t, validateOptionUpdate(key, "null"))
+		})
+	}
+}
+
+func TestValidateOptionUpdateRejectsSemanticallyInvalidTaskBillingConfigs(t *testing.T) {
+	for key, value := range map[string]string{
+		"task_billing_setting.rate_cards":  `{ "invalid": { "billing_type": "unsupported" } }`,
+		"task_billing_setting.h3_profiles": `{}`,
+	} {
+		t.Run(key, func(t *testing.T) {
+			require.Error(t, validateOptionUpdate(key, value))
+		})
+	}
+}
+
+func TestNormalizeDataExportIntervalRejectsUnsafeValues(t *testing.T) {
+	for _, value := range []string{"0", "-1", "1441", "not-a-number"} {
+		t.Run(value, func(t *testing.T) {
+			_, err := normalizeOptionUpdateValue("DataExportInterval", value)
+			require.Error(t, err)
+		})
+	}
+
+	normalized, err := normalizeOptionUpdateValue("DataExportInterval", " 60 ")
+	require.NoError(t, err)
+	require.Equal(t, "60", normalized)
+}
+
+func TestUpdateOptionsBulkRejectsNullRWMapConfigBeforePersistence(t *testing.T) {
+	setupOptionMapTestState(t)
+	registerOptionKeysForTest("SystemName", "billing_setting.billing_mode")
+	deleteOptionsForTest(t, "SystemName", "billing_setting.billing_mode")
+	t.Cleanup(func() {
+		deleteOptionsForTest(t, "SystemName", "billing_setting.billing_mode")
+	})
+
+	err := UpdateOptionsBulk(map[string]string{
+		"SystemName":                   "should-not-persist",
+		"billing_setting.billing_mode": "null",
+	})
+
+	require.Error(t, err)
+	require.False(t, optionExistsForTest(t, "SystemName"))
+	require.False(t, optionExistsForTest(t, "billing_setting.billing_mode"))
+	require.Equal(t, "", optionMapValueForTest("SystemName"))
+	require.Equal(t, "", optionMapValueForTest("billing_setting.billing_mode"))
+}
+
 func TestUpdateOptionsBulkRejectsRuntimeConfigErrorsBeforePersistence(t *testing.T) {
 	setupOptionMapTestState(t)
+	registerOptionKeysForTest("SystemName", "ModelRatio")
 	deleteOptionsForTest(t, "SystemName", "ModelRatio")
 	t.Cleanup(func() {
 		deleteOptionsForTest(t, "SystemName", "ModelRatio")
@@ -168,6 +359,6 @@ func TestUpdateOptionsBulkRejectsRuntimeConfigErrorsBeforePersistence(t *testing
 	require.Error(t, err)
 	require.False(t, optionExistsForTest(t, "SystemName"))
 	require.False(t, optionExistsForTest(t, "ModelRatio"))
-	require.False(t, optionMapContainsForTest("SystemName"))
-	require.False(t, optionMapContainsForTest("ModelRatio"))
+	require.Equal(t, "", optionMapValueForTest("SystemName"))
+	require.Equal(t, "", optionMapValueForTest("ModelRatio"))
 }

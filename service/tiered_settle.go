@@ -1,9 +1,16 @@
 package service
 
 import (
+	"fmt"
+	"net/http"
+
+	"github.com/MAX-API-Next/MAX-API/common"
 	"github.com/MAX-API-Next/MAX-API/dto"
 	"github.com/MAX-API-Next/MAX-API/pkg/billingexpr"
 	relaycommon "github.com/MAX-API-Next/MAX-API/relay/common"
+	pricehelper "github.com/MAX-API-Next/MAX-API/relay/helper"
+	"github.com/MAX-API-Next/MAX-API/types"
+	"github.com/gin-gonic/gin"
 )
 
 // TieredResultWrapper wraps billingexpr.TieredResult for use at the service layer.
@@ -102,6 +109,92 @@ func BuildRealtimeTieredTokenParams(usage *dto.RealtimeUsage, usedVars map[strin
 	return BuildTieredTokenParams(normalized, false, usedVars)
 }
 
+func refreshTieredBillingGroup(relayInfo *relaycommon.RelayInfo) (*billingexpr.BillingSnapshot, error) {
+	if relayInfo == nil {
+		return nil, nil
+	}
+	snap := relayInfo.TieredBillingSnapshot
+	if snap == nil || snap.BillingMode != "tiered_expr" {
+		return nil, nil
+	}
+
+	groupRatio := relayInfo.PriceData.GroupRatioInfo.GroupRatio
+	if snap.GroupRatio == groupRatio {
+		return snap, nil
+	}
+
+	estimatedQuotaAfterGroup := snap.EstimatedQuotaBeforeGroup * groupRatio
+	estimatedQuota, err := billingexpr.QuotaRoundStrict(estimatedQuotaAfterGroup)
+	if err != nil {
+		return nil, err
+	}
+	snap.GroupRatio = groupRatio
+	snap.EstimatedQuotaAfterGroup = estimatedQuota
+	return snap, nil
+}
+
+// PrepareTieredBillingForSelectedGroup refreshes routing-dependent tiered
+// billing after the final group for this upstream attempt has been selected.
+func PrepareTieredBillingForSelectedGroup(c *gin.Context, relayInfo *relaycommon.RelayInfo) *types.MaxAPIError {
+	snap, err := refreshTieredBillingGroup(relayInfo)
+	if err != nil {
+		return types.NewErrorWithStatusCode(
+			err,
+			types.ErrorCodeModelPriceError,
+			http.StatusBadRequest,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if snap == nil {
+		return nil
+	}
+	targetQuota, quotaErr := AlphaSearchPreConsumeQuota(
+		snap.EstimatedQuotaAfterGroup,
+		relayInfo,
+		relayInfo.PriceData.GroupRatioInfo.GroupRatio,
+	)
+	if quotaErr != nil {
+		return types.NewErrorWithStatusCode(
+			quotaErr,
+			types.ErrorCodeModelPriceError,
+			http.StatusBadRequest,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	targetQuota, quotaErr = pricehelper.ApplyPreConsumedQuotaFloor(targetQuota, snap.GroupRatio > 0)
+	if quotaErr != nil {
+		return types.NewErrorWithStatusCode(
+			quotaErr,
+			types.ErrorCodeModelPriceError,
+			http.StatusBadRequest,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	relayInfo.PriceData.QuotaToPreConsume = targetQuota
+	if snap.GroupRatio == 0 {
+		return nil
+	}
+
+	relayInfo.PriceData.FreeModel = false
+
+	if relayInfo.Billing == nil {
+		if c == nil {
+			return types.NewErrorWithStatusCode(
+				fmt.Errorf("tiered billing switched from free to paid group without request context"),
+				types.ErrorCodeModelPriceError,
+				http.StatusBadRequest,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
+		return PreConsumeBilling(c, targetQuota, relayInfo)
+	}
+	if err := relayInfo.Billing.Reserve(targetQuota); err != nil {
+		return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+	}
+	relayInfo.FinalPreConsumedQuota = relayInfo.Billing.GetPreConsumedQuota()
+	return nil
+}
+
 // TryTieredSettle checks if the request uses tiered_expr billing and, if so,
 // computes the actual quota using the frozen BillingSnapshot. Returns:
 //   - ok=true, quota, result  when tiered billing applies
@@ -120,9 +213,11 @@ func TryTieredSettle(relayInfo *relaycommon.RelayInfo, params billingexpr.TokenP
 	tr, err := billingexpr.ComputeTieredQuotaWithRequest(snap, params, requestInput)
 	if err != nil {
 		quota = relayInfo.FinalPreConsumedQuota
-		if quota <= 0 {
+		if snap.EstimatedQuotaAfterGroup > quota {
 			quota = snap.EstimatedQuotaAfterGroup
 		}
+		common.SysError(fmt.Sprintf("tiered billing settlement expression failed; using frozen fallback quota (requestId=%s, model=%s, preConsumed=%d, estimated=%d, fallback=%d): %v",
+			relayInfo.RequestId, relayInfo.OriginModelName, relayInfo.FinalPreConsumedQuota, snap.EstimatedQuotaAfterGroup, quota, err))
 		return true, quota, nil
 	}
 

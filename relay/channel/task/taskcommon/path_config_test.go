@@ -2,6 +2,7 @@ package taskcommon
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http/httptest"
 	"testing"
@@ -76,6 +77,28 @@ func TestBuildTaskQueryURLKeepsFallbackWithoutConfig(t *testing.T) {
 	}, "https://fallback.example.com/task_abc")
 
 	assert.Equal(t, "https://fallback.example.com/task_abc", got)
+}
+
+func TestParseConfiguredTaskResultReadsUsageTokens(t *testing.T) {
+	taskInfo, ok, err := ParseConfiguredTaskResult([]byte(`{
+		"object": "media.task",
+		"task_id": "task_123",
+		"status": "succeeded",
+		"progress": 100,
+		"result": {
+			"url": "https://example.com/result.mp4"
+		},
+		"usage": {
+			"completion_tokens": 12345,
+			"total_tokens": 40594
+		}
+	}`), dto.ChannelOtherSettings{TaskProtocol: TaskProtocolGenericVideo})
+
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NotNil(t, taskInfo)
+	assert.Equal(t, 12345, taskInfo.CompletionTokens)
+	assert.Equal(t, 40594, taskInfo.TotalTokens)
 }
 
 func TestBuildConfiguredTaskPassThroughBodyUsesChannelPassThrough(t *testing.T) {
@@ -269,6 +292,367 @@ func TestParseConfiguredTaskResultPromotesResultURLToSuccess(t *testing.T) {
 	assert.Equal(t, string(model.TaskStatusSuccess), result.Status)
 	assert.Equal(t, "100%", result.Progress)
 	assert.Equal(t, "https://example.com/video.mp4", result.Url)
+}
+
+func TestParseConfiguredTaskResultSupportsMiniMaxCompatibleRootFields(t *testing.T) {
+	settings := dto.ChannelOtherSettings{
+		TaskProtocol: TaskProtocolGenericVideo,
+		// These are common legacy guesses when the configured response is
+		// copied from the local task wrapper rather than the upstream body.
+		TaskProtocolConfig: &dto.TaskProtocolConfig{
+			TaskIDPath:     "data.id",
+			StatusPath:     "data.status",
+			ResultURLPaths: []string{"data.data.0.url"},
+		},
+	}
+	body := []byte(`{
+		"id": "439499419230570",
+		"object": "video.generation",
+		"status": "completed",
+		"data": [{"url": "https://cdn.example.com/minimax.mp4"}],
+		"usage": {"output_seconds": 5, "input_image_count": 1}
+	}`)
+
+	result, parsed, err := ParseConfiguredTaskResult(body, settings)
+
+	require.NoError(t, err)
+	require.True(t, parsed)
+	require.NotNil(t, result)
+	assert.Equal(t, "439499419230570", result.TaskID)
+	assert.Equal(t, string(model.TaskStatusSuccess), result.Status)
+	assert.Equal(t, "https://cdn.example.com/minimax.mp4", result.Url)
+}
+
+func TestParseConfiguredTaskResultUnwrapsMaxSuccessEnvelope(t *testing.T) {
+	settings := dto.ChannelOtherSettings{
+		TaskProtocol: TaskProtocolGenericVideo,
+		TaskProtocolConfig: &dto.TaskProtocolConfig{
+			TaskIDPath:     "data.id",
+			StatusPath:     "data.status",
+			ResultURLPaths: []string{"data.data.0.url"},
+		},
+	}
+	body := []byte(`{
+		"code": "success",
+		"data": {
+			"id": 10,
+			"task_id": "task_public",
+			"status": "IN_PROGRESS",
+			"data": {
+				"id": "439499419230570",
+				"object": "video.generation",
+				"status": "completed",
+				"data": [{"url": "https://cdn.example.com/wrapped.mp4"}]
+			}
+		}
+	}`)
+
+	result, parsed, err := ParseConfiguredTaskResult(body, settings)
+
+	require.NoError(t, err)
+	require.True(t, parsed)
+	require.NotNil(t, result)
+	assert.Equal(t, "439499419230570", result.TaskID)
+	assert.Equal(t, string(model.TaskStatusSuccess), result.Status)
+	assert.Equal(t, "https://cdn.example.com/wrapped.mp4", result.Url)
+}
+
+func TestParseConfiguredTaskResultBoundsNestedSuccessEnvelopes(t *testing.T) {
+	settings := dto.ChannelOtherSettings{
+		TaskProtocol: TaskProtocolGenericVideo,
+		TaskProtocolConfig: &dto.TaskProtocolConfig{
+			TaskIDPath:     "id",
+			StatusPath:     "status",
+			ResultURLPaths: []string{"data.0.url"},
+		},
+	}
+	payload := map[string]any{
+		"id":     "provider-task",
+		"object": "video.generation",
+		"status": "completed",
+		"data":   []any{map[string]any{"url": "https://cdn.example.com/deep.mp4"}},
+	}
+	for depth := 0; depth < MaxWrappedTaskUnwrapDepth+2; depth++ {
+		payload = map[string]any{
+			"code":   "success",
+			"id":     fmt.Sprintf("wrapper-%d", depth),
+			"status": "IN_PROGRESS",
+			"data":   map[string]any{"data": payload},
+		}
+	}
+	body, err := common.Marshal(payload)
+	require.NoError(t, err)
+
+	result, parsed, err := ParseConfiguredTaskResult(body, settings)
+
+	require.NoError(t, err)
+	require.True(t, parsed)
+	require.NotNil(t, result)
+	assert.NotEqual(t, "provider-task", result.TaskID)
+	assert.Equal(t, string(model.TaskStatusInProgress), result.Status)
+	assert.Empty(t, result.Url)
+}
+
+func TestParseConfiguredTaskResultDoesNotUseObjectlessMiniMaxFallback(t *testing.T) {
+	settings := dto.ChannelOtherSettings{
+		TaskProtocol: TaskProtocolGenericVideo,
+		TaskProtocolConfig: &dto.TaskProtocolConfig{
+			TaskIDPath:     "id",
+			StatusPath:     "status",
+			ResultURLPaths: []string{"result.url"},
+			StatusMap:      map[string]string{"completed": "SUCCESS"},
+		},
+	}
+	body := []byte(`{
+		"id": "provider-task-2",
+		"status": "completed",
+		"data": [{"url": "https://cdn.example.com/unrelated.mp4"}]
+	}`)
+
+	result, parsed, err := ParseConfiguredTaskResult(body, settings)
+
+	require.NoError(t, err)
+	require.True(t, parsed)
+	require.NotNil(t, result)
+	assert.Equal(t, "provider-task-2", result.TaskID)
+	assert.Equal(t, string(model.TaskStatusSuccess), result.Status)
+	assert.Empty(t, result.Url)
+}
+
+func TestParseConfiguredTaskResultKeepsMiniMaxCompatibleRootPendingWithoutURL(t *testing.T) {
+	settings := dto.ChannelOtherSettings{
+		TaskProtocol: TaskProtocolGenericVideo,
+		TaskProtocolConfig: &dto.TaskProtocolConfig{
+			TaskIDPath:     "data.id",
+			StatusPath:     "data.status",
+			ResultURLPaths: []string{"data.data.0.url"},
+		},
+	}
+	body := []byte(`{
+		"id": "439499419230570",
+		"object": "video.generation",
+		"status": "completed",
+		"data": []
+	}`)
+
+	result, parsed, err := ParseConfiguredTaskResult(body, settings)
+
+	require.NoError(t, err)
+	require.True(t, parsed)
+	require.NotNil(t, result)
+	assert.Equal(t, "439499419230570", result.TaskID)
+	assert.Equal(t, string(model.TaskStatusInProgress), result.Status)
+	assert.Equal(t, "50%", result.Progress)
+	assert.Empty(t, result.Url)
+}
+
+func TestParseConfiguredTaskResultDoesNotUseMiniMaxFallbackForOtherEnvelope(t *testing.T) {
+	settings := dto.ChannelOtherSettings{
+		TaskProtocol: TaskProtocolGenericVideo,
+		TaskProtocolConfig: &dto.TaskProtocolConfig{
+			TaskIDPath:     "id",
+			StatusPath:     "status",
+			ResultURLPaths: []string{"result.url"},
+		},
+	}
+	body := []byte(`{
+		"id": "provider-task-1",
+		"object": "media.task",
+		"status": "in_progress",
+		"data": [{"url": "https://cdn.example.com/should-not-be-used.mp4"}]
+	}`)
+
+	result, parsed, err := ParseConfiguredTaskResult(body, settings)
+
+	require.NoError(t, err)
+	require.True(t, parsed)
+	require.NotNil(t, result)
+	assert.Equal(t, "provider-task-1", result.TaskID)
+	assert.Equal(t, string(model.TaskStatusInProgress), result.Status)
+	assert.Empty(t, result.Url)
+}
+
+func TestParseConfiguredTaskResultDoesNotUseRootIDFallbackForNonMiniMax(t *testing.T) {
+	settings := dto.ChannelOtherSettings{TaskProtocol: TaskProtocolGenericVideo}
+	body := []byte(`{
+		"id": "provider-task-root",
+		"object": "media.task",
+		"status": "in_progress"
+	}`)
+
+	result, parsed, err := ParseConfiguredTaskResult(body, settings)
+
+	require.NoError(t, err)
+	require.True(t, parsed)
+	require.NotNil(t, result)
+	assert.Empty(t, result.TaskID)
+	assert.Equal(t, string(model.TaskStatusInProgress), result.Status)
+}
+
+func TestParseConfiguredTaskResultDoesNotUseRootStatusFallbackForNonMiniMax(t *testing.T) {
+	settings := dto.ChannelOtherSettings{
+		TaskProtocol: TaskProtocolGenericVideo,
+		TaskProtocolConfig: &dto.TaskProtocolConfig{
+			TaskIDPath: "id",
+			StatusPath: "task.status",
+		},
+	}
+	body := []byte(`{
+		"object": "media.task",
+		"id": "provider-task-root",
+		"status": "completed"
+	}`)
+
+	result, parsed, err := ParseConfiguredTaskResult(body, settings)
+
+	require.NoError(t, err)
+	require.True(t, parsed)
+	require.NotNil(t, result)
+	assert.Equal(t, "provider-task-root", result.TaskID)
+	assert.Equal(t, string(model.TaskStatusInProgress), result.Status)
+}
+
+func TestParseConfiguredTaskResultLeavesErrorOnlyResponseForAdaptor(t *testing.T) {
+	settings := dto.ChannelOtherSettings{TaskProtocol: TaskProtocolGenericVideo}
+	result, parsed, err := ParseConfiguredTaskResult([]byte(`{
+		"error": {"message": "temporary upstream failure"}
+	}`), settings)
+
+	require.NoError(t, err)
+	assert.False(t, parsed)
+	assert.Nil(t, result)
+}
+
+func TestParseConfiguredTaskResultReadsGenericFailureReason(t *testing.T) {
+	settings := dto.ChannelOtherSettings{
+		TaskProtocol:       TaskProtocolGenericVideo,
+		TaskProtocolConfig: &dto.TaskProtocolConfig{TaskIDPath: "id"},
+	}
+	body := []byte(`{
+		"id": "439499419230570",
+		"status": "failed",
+		"error": {"message": "provider rejected the prompt"}
+	}`)
+
+	result, parsed, err := ParseConfiguredTaskResult(body, settings)
+
+	require.NoError(t, err)
+	require.True(t, parsed)
+	require.NotNil(t, result)
+	assert.Equal(t, "439499419230570", result.TaskID)
+	assert.Equal(t, string(model.TaskStatusFailure), result.Status)
+	assert.Equal(t, "provider rejected the prompt", result.Reason)
+}
+
+func TestParseConfiguredTaskResultSupportsOfficialMiniMaxTaskEnvelope(t *testing.T) {
+	settings := dto.ChannelOtherSettings{
+		TaskProtocol: TaskProtocolGenericVideo,
+		// Keep legacy paths to prove the official envelope is a compatibility
+		// fallback rather than a requirement to reconfigure the channel.
+		TaskProtocolConfig: &dto.TaskProtocolConfig{
+			TaskIDPath:     "data.id",
+			StatusPath:     "data.status",
+			ResultURLPaths: []string{"data.data.0.url"},
+		},
+	}
+	body := []byte(`{
+		"task": {
+			"id": "424010985738629",
+			"model": "MiniMax-H3",
+			"status": "succeeded",
+			"content": {"url": "https://cdn.example.com/h3.mp4"},
+			"usage": {"prompt_tokens": 1234}
+		}
+	}`)
+
+	result, parsed, err := ParseConfiguredTaskResult(body, settings)
+
+	require.NoError(t, err)
+	require.True(t, parsed)
+	require.NotNil(t, result)
+	assert.Equal(t, "424010985738629", result.TaskID)
+	assert.Equal(t, string(model.TaskStatusSuccess), result.Status)
+	assert.Equal(t, "https://cdn.example.com/h3.mp4", result.Url)
+	assert.Equal(t, 1234, result.PromptTokens)
+}
+
+func TestParseConfiguredTaskResultReadsAllOfficialTaskUsageTokens(t *testing.T) {
+	settings := dto.ChannelOtherSettings{TaskProtocol: TaskProtocolGenericVideo}
+	result, parsed, err := ParseConfiguredTaskResult([]byte(`{
+		"task": {
+			"id": "424010985738629",
+			"status": "succeeded",
+			"content": {"url": "https://cdn.example.com/h3.mp4"},
+			"usage": {"prompt_tokens": 1234, "completion_tokens": 567, "total_tokens": 1801}
+		}
+	}`), settings)
+
+	require.NoError(t, err)
+	require.True(t, parsed)
+	require.NotNil(t, result)
+	assert.Equal(t, 1234, result.PromptTokens)
+	assert.Equal(t, 567, result.CompletionTokens)
+	assert.Equal(t, 1801, result.TotalTokens)
+}
+
+func TestParseConfiguredTaskResultPreservesExplicitOfficialTokenZeros(t *testing.T) {
+	settings := dto.ChannelOtherSettings{TaskProtocol: TaskProtocolGenericVideo}
+	result, parsed, err := ParseConfiguredTaskResult([]byte(`{
+		"usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+		"task": {
+			"id": "424010985738629",
+			"status": "succeeded",
+			"content": {"url": "https://cdn.example.com/h3.mp4"},
+			"usage": {"prompt_tokens": 1234, "completion_tokens": 567, "total_tokens": 1801}
+		}
+	}`), settings)
+
+	require.NoError(t, err)
+	require.True(t, parsed)
+	require.NotNil(t, result)
+	assert.Zero(t, result.PromptTokens)
+	assert.Zero(t, result.CompletionTokens)
+	assert.Zero(t, result.TotalTokens)
+}
+
+func TestParseConfiguredTaskResultPreservesOfficialPromptTokenZero(t *testing.T) {
+	settings := dto.ChannelOtherSettings{TaskProtocol: TaskProtocolGenericVideo}
+	body := []byte(`{
+		"task": {
+			"id": "424010985738629",
+			"model": "MiniMax-H3",
+			"status": "succeeded",
+			"content": {"url": "https://cdn.example.com/h3.mp4"},
+			"usage": {"prompt_tokens": 0}
+		}
+	}`)
+
+	result, parsed, err := ParseConfiguredTaskResult(body, settings)
+
+	require.NoError(t, err)
+	require.True(t, parsed)
+	require.NotNil(t, result)
+	assert.Equal(t, 0, result.PromptTokens)
+}
+
+func TestParseConfiguredTaskResultKeepsOfficialMiniMaxTaskPendingWithoutURL(t *testing.T) {
+	settings := dto.ChannelOtherSettings{TaskProtocol: TaskProtocolGenericVideo}
+	body := []byte(`{
+		"task": {
+			"id": "424010985738629",
+			"model": "MiniMax-H3",
+			"status": "succeeded"
+		}
+	}`)
+
+	result, parsed, err := ParseConfiguredTaskResult(body, settings)
+
+	require.NoError(t, err)
+	require.True(t, parsed)
+	require.NotNil(t, result)
+	assert.Equal(t, string(model.TaskStatusInProgress), result.Status)
+	assert.Equal(t, "50%", result.Progress)
+	assert.Empty(t, result.Url)
 }
 
 func TestParseConfiguredTaskResultReadsOpenAIVideoMetadataURL(t *testing.T) {

@@ -17,6 +17,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact https://github.com/MAX-API-Next/MAX-API/issues
 */
 import { api } from '@/lib/api'
+import {
+  adminCustomOAuthUnbindPath,
+  type CustomOAuthBinding,
+} from '@/lib/oauth'
 import type {
   User,
   GetUsersParams,
@@ -26,6 +30,8 @@ import type {
   ManageUserAction,
   ManageUserQuotaPayload,
   ApiResponse,
+  BatchUserStatusAction,
+  BatchUserStatusResult,
 } from './types'
 
 // ============================================================================
@@ -117,6 +123,14 @@ export async function manageUser(
   return res.data
 }
 
+export async function batchManageUserStatus(
+  action: BatchUserStatusAction,
+  users: { id: number; status: number }[]
+): Promise<ApiResponse<{ results: BatchUserStatusResult[] }>> {
+  const res = await api.post('/api/user/manage/batch', { action, users })
+  return res.data
+}
+
 /**
  * Adjust user quota atomically (add/subtract/override)
  */
@@ -155,12 +169,7 @@ export async function getGroups(): Promise<ApiResponse<string[]>> {
 // Admin Binding Management APIs
 // ============================================================================
 
-export interface OAuthBinding {
-  provider_id: string
-  provider_name: string
-  user_id?: number
-  external_id?: string
-}
+export type OAuthBinding = CustomOAuthBinding
 
 /**
  * Get user's custom OAuth bindings (admin)
@@ -188,10 +197,8 @@ export async function adminClearUserBinding(
  */
 export async function adminUnbindCustomOAuth(
   userId: number,
-  providerId: string
+  providerId: number
 ): Promise<ApiResponse> {
-  const res = await api.delete(
-    `/api/user/${userId}/oauth/bindings/${providerId}`
-  )
+  const res = await api.delete(adminCustomOAuthUnbindPath(userId, providerId))
   return res.data
 }

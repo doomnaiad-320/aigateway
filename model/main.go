@@ -1,7 +1,12 @@
 package model
 
 import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/tls"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -15,6 +20,7 @@ import (
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/glebarez/sqlite"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -51,14 +57,30 @@ var userOAuthIdentityMigrations = []userOAuthIdentityMigration{
 	{column: "linux_do_id", indexName: "ux_users_linux_do_id", mysqlGeneratedColumn: "linux_do_id_unique"},
 }
 
+func hasSeparateLogDatabase() bool {
+	return os.Getenv("LOG_SQL_DSN") != "" || strings.TrimSpace(os.Getenv("LOG_SQLITE_PATH")) != ""
+}
+
+func sqliteDatabasePath(isLog bool) string {
+	if isLog {
+		if path := strings.TrimSpace(os.Getenv("LOG_SQLITE_PATH")); path != "" {
+			return path
+		}
+	}
+	return common.SQLitePath
+}
+
 func logRetryMarkerBackfillCompletionKey() string {
 	logDSN := strings.TrimSpace(os.Getenv("LOG_SQL_DSN"))
-	if logDSN == "" {
+	if !hasSeparateLogDatabase() {
 		return logRetryMarkerBackfillOptionKey
+	}
+	if logDSN == "" {
+		logDSN = "local"
 	}
 
 	if strings.HasPrefix(logDSN, "local") {
-		logDSN = logDSN + "\n" + common.SQLitePath
+		logDSN = logDSN + "\n" + sqliteDatabasePath(true)
 	}
 
 	fingerprint := common.Sha1([]byte(common.LogSqlType + "\n" + logDSN))
@@ -78,17 +100,20 @@ func initCol() {
 		commonTrueVal = "1"
 		commonFalseVal = "0"
 	}
-	if os.Getenv("LOG_SQL_DSN") != "" {
+	if hasSeparateLogDatabase() {
 		switch common.LogSqlType {
 		case common.DatabaseTypePostgreSQL:
 			logGroupCol = `"group"`
 			logKeyCol = `"key"`
+		case common.DatabaseTypeMySQL, common.DatabaseTypeSQLite:
+			logGroupCol = "`group`"
+			logKeyCol = "`key`"
 		default:
-			logGroupCol = commonGroupCol
-			logKeyCol = commonKeyCol
+			logGroupCol = "`group`"
+			logKeyCol = "`key`"
 		}
 	} else {
-		// LOG_SQL_DSN 为空时，日志数据库与主数据库相同
+		// No separate log database is configured.
 		if common.UsingPostgreSQL {
 			logGroupCol = `"group"`
 			logKeyCol = `"key"`
@@ -167,6 +192,9 @@ func chooseDB(envName string, isLog bool) (*gorm.DB, error) {
 		initCol()
 	}()
 	dsn := os.Getenv(envName)
+	if isLog && strings.TrimSpace(os.Getenv("LOG_SQLITE_PATH")) != "" && dsn != "" && !strings.HasPrefix(dsn, "local") {
+		return nil, errors.New("LOG_SQLITE_PATH requires an empty or local LOG_SQL_DSN")
+	}
 	if dsn != "" {
 		if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
 			// Use PostgreSQL
@@ -190,12 +218,17 @@ func chooseDB(envName string, isLog bool) (*gorm.DB, error) {
 			} else {
 				common.LogSqlType = common.DatabaseTypeSQLite
 			}
-			return gorm.Open(sqlite.Open(common.SQLitePath), &gorm.Config{
+			return gorm.Open(sqlite.Open(sqliteDatabasePath(isLog)), &gorm.Config{
 				PrepareStmt: true, // precompile SQL
 			})
 		}
 		// Use MySQL
 		common.SysLog("using MySQL as database")
+		pinnedDSN, err := mysqlDSNWithPinnedCertificate(dsn)
+		if err != nil {
+			return nil, err
+		}
+		dsn = pinnedDSN
 		// check parseTime
 		if !strings.Contains(dsn, "parseTime") {
 			if strings.Contains(dsn, "?") {
@@ -215,10 +248,56 @@ func chooseDB(envName string, isLog bool) (*gorm.DB, error) {
 	}
 	// Use SQLite
 	common.SysLog("SQL_DSN not set, using SQLite as database")
-	common.UsingSQLite = true
-	return gorm.Open(sqlite.Open(common.SQLitePath), &gorm.Config{
+	if !isLog {
+		common.UsingSQLite = true
+	} else {
+		common.LogSqlType = common.DatabaseTypeSQLite
+	}
+	return gorm.Open(sqlite.Open(sqliteDatabasePath(isLog)), &gorm.Config{
 		PrepareStmt: true, // precompile SQL
 	})
+}
+
+var mysqlPinnedTLSConfigs sync.Map
+
+func mysqlDSNWithPinnedCertificate(dsn string) (string, error) {
+	fingerprint := strings.TrimSpace(os.Getenv("MYSQL_TLS_CERT_SHA256"))
+	if fingerprint == "" {
+		return dsn, nil
+	}
+	expected, err := hex.DecodeString(fingerprint)
+	if err != nil || len(expected) != sha256.Size {
+		return "", errors.New("MYSQL_TLS_CERT_SHA256 must be a 64-character SHA-256 fingerprint")
+	}
+	configName := "max-api-mysql-pin-" + hex.EncodeToString(expected)
+	if _, loaded := mysqlPinnedTLSConfigs.LoadOrStore(configName, struct{}{}); !loaded {
+		config := &tls.Config{
+			//nolint:gosec // VerifyConnection enforces the configured exact leaf SHA-256 pin.
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS12,
+			VerifyConnection: func(state tls.ConnectionState) error {
+				if len(state.PeerCertificates) == 0 {
+					return errors.New("mysql server returned no certificate")
+				}
+				actual := sha256.Sum256(state.PeerCertificates[0].Raw)
+				if !hmac.Equal(actual[:], expected) {
+					return errors.New("mysql certificate pin mismatch")
+				}
+				return nil
+			},
+		}
+		if err := mysqldriver.RegisterTLSConfig(configName, config); err != nil {
+			mysqlPinnedTLSConfigs.Delete(configName)
+			return "", fmt.Errorf("register MySQL certificate pin: %w", err)
+		}
+	}
+	cfg, err := mysqldriver.ParseDSN(dsn)
+	if err != nil {
+		return "", fmt.Errorf("parse MySQL DSN: %w", err)
+	}
+	cfg.TLS = nil
+	cfg.TLSConfig = configName
+	return cfg.FormatDSN(), nil
 }
 
 func InitDB() (err error) {
@@ -258,45 +337,63 @@ func InitDB() (err error) {
 }
 
 func InitLogDB() (err error) {
-	if os.Getenv("LOG_SQL_DSN") == "" {
+	if !hasSeparateLogDatabase() {
 		LOG_DB = DB
 		return
 	}
 	db, err := chooseDB("LOG_SQL_DSN", true)
-	if err == nil {
-		if common.DebugEnabled {
-			db = db.Debug()
+	if err != nil {
+		if db != nil {
+			_ = closeDB(db)
 		}
-		LOG_DB = db
-		// If log DB is MySQL, also ensure Chinese-capable charset
-		if common.LogSqlType == common.DatabaseTypeMySQL {
-			if err := checkMySQLChineseSupport(LOG_DB); err != nil {
-				panic(err)
-			}
-		}
-		sqlDB, err := LOG_DB.DB()
-		if err != nil {
-			return err
-		}
-		sqlDB.SetMaxIdleConns(common.GetEnvOrDefault("SQL_MAX_IDLE_CONNS", 100))
-		sqlDB.SetMaxOpenConns(common.GetEnvOrDefault("SQL_MAX_OPEN_CONNS", 1000))
-		sqlDB.SetConnMaxLifetime(time.Second * time.Duration(common.GetEnvOrDefault("SQL_MAX_LIFETIME", 60)))
-
-		if !common.IsMasterNode {
-			return nil
-		}
-		common.SysLog("database migration started")
-		err = migrateLOGDB()
-		return err
-	} else {
-		common.FatalLog(err)
+		return fmt.Errorf("failed to initialize log database: %w", err)
 	}
-	return err
+	previousLogDB := LOG_DB
+	defer func() {
+		if err != nil {
+			_ = closeDB(db)
+			LOG_DB = previousLogDB
+		}
+	}()
+	if common.DebugEnabled {
+		db = db.Debug()
+	}
+	LOG_DB = db
+	// If log DB is MySQL, also ensure Chinese-capable charset
+	if common.LogSqlType == common.DatabaseTypeMySQL {
+		if err := checkMySQLChineseSupport(LOG_DB); err != nil {
+			panic(err)
+		}
+	}
+	sqlDB, err := LOG_DB.DB()
+	if err != nil {
+		return err
+	}
+	sqlDB.SetMaxIdleConns(common.GetEnvOrDefault("SQL_MAX_IDLE_CONNS", 100))
+	sqlDB.SetMaxOpenConns(common.GetEnvOrDefault("SQL_MAX_OPEN_CONNS", 1000))
+	sqlDB.SetConnMaxLifetime(time.Second * time.Duration(common.GetEnvOrDefault("SQL_MAX_LIFETIME", 60)))
+
+	if !common.IsMasterNode {
+		return nil
+	}
+	common.SysLog("database migration started")
+	return migrateLOGDB()
 }
 
 func migrateDB() error {
-	// Migrate price_amount column from float/double to decimal for existing tables
-	migrateSubscriptionPlanPriceAmount()
+	// Capture whether the policy columns existed before AutoMigrate so legacy
+	// rows can be initialized to the historical allow-wallet default instead of
+	// inheriting a bool zero value when the column is first introduced.
+	userSubscriptionsTableExisted := DB != nil && DB.Migrator().HasTable(&UserSubscription{})
+	userSubscriptionWalletColumnExisted := userSubscriptionsTableExisted && DB.Migrator().HasColumn(&UserSubscription{}, "allow_wallet_overflow")
+	userSubscriptionDowngradeColumnExisted := userSubscriptionsTableExisted && DB.Migrator().HasColumn(&UserSubscription{}, "downgrade_group")
+	planTableExisted := DB != nil && DB.Migrator().HasTable(&SubscriptionPlan{})
+	planWalletColumnExisted := planTableExisted && DB.Migrator().HasColumn(&SubscriptionPlan{}, "allow_wallet_overflow")
+	planDowngradeColumnExisted := planTableExisted && DB.Migrator().HasColumn(&SubscriptionPlan{}, "downgrade_group")
+	if err := ensureUserSubscriptionPolicyColumns(userSubscriptionsTableExisted, userSubscriptionWalletColumnExisted, userSubscriptionDowngradeColumnExisted); err != nil {
+		return err
+	}
+
 	// Migrate model_limits column from varchar to text for existing tables
 	if err := migrateTokenModelLimitsToText(); err != nil {
 		return err
@@ -317,6 +414,7 @@ func migrateDB() error {
 		&Redemption{},
 		&Ability{},
 		&Log{},
+		&BillingLogReceipt{},
 		&Midjourney{},
 		&TopUp{},
 		&QuotaData{},
@@ -333,15 +431,32 @@ func migrateDB() error {
 		&SubscriptionOrder{},
 		&UserSubscription{},
 		&SubscriptionPreConsumeRecord{},
+		&BillingSettlement{},
+		&BillingPreConsumeSelection{},
+		&MidjourneyBillingClaim{},
+		&CacheInvalidationTask{},
 		&CustomOAuthProvider{},
 		&UserOAuthBinding{},
+		&AuthFlow{},
 		&PerfMetric{},
+		&PerfMetricFlushReceipt{},
 		&SystemTask{},
 		&SystemInstance{},
+		&AuthzUserOverride{},
 	)
 	if err != nil {
 		return err
 	}
+	if err := migrateUserSubscriptionPolicyDefaults(userSubscriptionsTableExisted, userSubscriptionWalletColumnExisted, userSubscriptionDowngradeColumnExisted); err != nil {
+		return err
+	}
+	if err := migrateMetadataNameKeys(); err != nil {
+		return err
+	}
+	// Run the legacy subscription price migration only after current core schemas exist.
+	if err := migrateSubscriptionPlanPriceAmount(); err != nil {
+		return err
+	}
 	if err := migrateQuotaDataAggregateKeysOnStartup(); err != nil {
 		return err
 	}
@@ -356,103 +471,20 @@ func migrateDB() error {
 			return err
 		}
 	} else {
+		if err := ensureSubscriptionPlanPolicyColumns(planTableExisted, planWalletColumnExisted, planDowngradeColumnExisted); err != nil {
+			return err
+		}
 		if err := DB.AutoMigrate(&SubscriptionPlan{}); err != nil {
 			return err
 		}
 	}
-	if os.Getenv("LOG_SQL_DSN") == "" {
+	if err := migrateSubscriptionPlanPolicyDefaults(planTableExisted, planWalletColumnExisted, planDowngradeColumnExisted); err != nil {
+		return err
+	}
+	if !hasSeparateLogDatabase() {
 		LOG_DB = DB
 		scheduleLogRetryMarkerBackfill()
 	}
-	return nil
-}
-
-func migrateDBFast() error {
-	if err := migrateUserQuotaColumnsToBigInt(); err != nil {
-		return err
-	}
-	if err := migrateTokenQuotaColumnsToBigInt(); err != nil {
-		return err
-	}
-
-	var wg sync.WaitGroup
-
-	migrations := []struct {
-		model interface{}
-		name  string
-	}{
-		{&Channel{}, "Channel"},
-		{&Token{}, "Token"},
-		{&User{}, "User"},
-		{&PasskeyCredential{}, "PasskeyCredential"},
-		{&Option{}, "Option"},
-		{&Redemption{}, "Redemption"},
-		{&Ability{}, "Ability"},
-		{&Log{}, "Log"},
-		{&Midjourney{}, "Midjourney"},
-		{&TopUp{}, "TopUp"},
-		{&QuotaData{}, "QuotaData"},
-		{&QuotaDataSnapshot{}, "QuotaDataSnapshot"},
-		{&QuotaDataSnapshotRetry{}, "QuotaDataSnapshotRetry"},
-		{&Task{}, "Task"},
-		{&Model{}, "Model"},
-		{&Vendor{}, "Vendor"},
-		{&PrefillGroup{}, "PrefillGroup"},
-		{&Setup{}, "Setup"},
-		{&TwoFA{}, "TwoFA"},
-		{&TwoFABackupCode{}, "TwoFABackupCode"},
-		{&Checkin{}, "Checkin"},
-		{&SubscriptionOrder{}, "SubscriptionOrder"},
-		{&UserSubscription{}, "UserSubscription"},
-		{&SubscriptionPreConsumeRecord{}, "SubscriptionPreConsumeRecord"},
-		{&CustomOAuthProvider{}, "CustomOAuthProvider"},
-		{&UserOAuthBinding{}, "UserOAuthBinding"},
-		{&PerfMetric{}, "PerfMetric"},
-		{&SystemTask{}, "SystemTask"},
-		{&SystemInstance{}, "SystemInstance"},
-	}
-	// 动态计算migration数量，确保errChan缓冲区足够大
-	errChan := make(chan error, len(migrations))
-
-	for _, m := range migrations {
-		wg.Add(1)
-		go func(model interface{}, name string) {
-			defer wg.Done()
-			if err := DB.AutoMigrate(model); err != nil {
-				errChan <- fmt.Errorf("failed to migrate %s: %v", name, err)
-			}
-		}(m.model, m.name)
-	}
-
-	// Wait for all migrations to complete
-	wg.Wait()
-	close(errChan)
-
-	// Check for any errors
-	for err := range errChan {
-		if err != nil {
-			return err
-		}
-	}
-	if err := migrateQuotaDataAggregateKeysOnStartup(); err != nil {
-		return err
-	}
-	if err := migrateUserOAuthIdentityConstraints(); err != nil {
-		return err
-	}
-	if err := backfillUserNormalizedEmails(); err != nil {
-		return err
-	}
-	if common.UsingSQLite {
-		if err := ensureSubscriptionPlanTableSQLite(); err != nil {
-			return err
-		}
-	} else {
-		if err := DB.AutoMigrate(&SubscriptionPlan{}); err != nil {
-			return err
-		}
-	}
-	common.SysLog("database migrated")
 	return nil
 }
 
@@ -683,7 +715,7 @@ func userOAuthIdentityGeneratedColumnSQL(identity userOAuthIdentityMigration) st
 
 func migrateLOGDB() error {
 	var err error
-	if err = LOG_DB.AutoMigrate(&Log{}); err != nil {
+	if err = LOG_DB.AutoMigrate(&Log{}, &BillingLogReceipt{}); err != nil {
 		return err
 	}
 	scheduleLogRetryMarkerBackfill()
@@ -795,6 +827,128 @@ type sqliteColumnDef struct {
 	DDL  string
 }
 
+func ensureUserSubscriptionPolicyColumns(tableExisted, walletColumnExisted, downgradeColumnExisted bool) error {
+	if DB == nil || !tableExisted {
+		return nil
+	}
+	addColumn := func(name string, exists bool) error {
+		return addSubscriptionPolicyColumn(&UserSubscription{}, "user_subscriptions", name, exists)
+	}
+	if err := addColumn("allow_wallet_overflow", walletColumnExisted); err != nil {
+		return err
+	}
+	return addColumn("downgrade_group", downgradeColumnExisted)
+}
+
+func ensureSubscriptionPlanPolicyColumns(tableExisted, walletColumnExisted, downgradeColumnExisted bool) error {
+	if DB == nil || !tableExisted {
+		return nil
+	}
+	addColumn := func(name string, exists bool) error {
+		return addSubscriptionPolicyColumn(&SubscriptionPlan{}, "subscription_plans", name, exists)
+	}
+	if err := addColumn("allow_wallet_overflow", walletColumnExisted); err != nil {
+		return err
+	}
+	return addColumn("downgrade_group", downgradeColumnExisted)
+}
+
+func addSubscriptionPolicyColumn(modelValue any, tableName, columnName string, existed bool) error {
+	if existed {
+		return nil
+	}
+	if err := execSubscriptionPolicyColumnDDL(tableName, columnName); err != nil {
+		// Another application node can add the same column after this node's
+		// startup HasColumn snapshot. Suppress only that successful concurrent
+		// outcome; every other DDL failure keeps its original error context.
+		if DB.Migrator().HasColumn(modelValue, columnName) {
+			return nil
+		}
+		return fmt.Errorf("failed to add %s.%s: %w", tableName, columnName, err)
+	}
+	return nil
+}
+
+func execSubscriptionPolicyColumnDDL(tableName, columnName string) error {
+	if !common.UsingPostgreSQL && !common.UsingMySQL && !common.UsingSQLite {
+		return fmt.Errorf("database dialect is not configured for subscription policy column %s.%s", tableName, columnName)
+	}
+	switch tableName {
+	case "user_subscriptions":
+		switch columnName {
+		case "allow_wallet_overflow":
+			if common.UsingPostgreSQL {
+				return DB.Exec(`ALTER TABLE "user_subscriptions" ADD COLUMN "allow_wallet_overflow" boolean NOT NULL DEFAULT true`).Error
+			} else if common.UsingMySQL {
+				return DB.Exec("ALTER TABLE `user_subscriptions` ADD COLUMN `allow_wallet_overflow` boolean NOT NULL DEFAULT TRUE").Error
+			} else {
+				return DB.Exec("ALTER TABLE `user_subscriptions` ADD COLUMN `allow_wallet_overflow` numeric NOT NULL DEFAULT 1").Error
+			}
+		case "downgrade_group":
+			if common.UsingPostgreSQL {
+				return DB.Exec(`ALTER TABLE "user_subscriptions" ADD COLUMN "downgrade_group" varchar(64) NOT NULL DEFAULT ''`).Error
+			} else {
+				return DB.Exec("ALTER TABLE `user_subscriptions` ADD COLUMN `downgrade_group` varchar(64) NOT NULL DEFAULT ''").Error
+			}
+		}
+	case "subscription_plans":
+		switch columnName {
+		case "allow_wallet_overflow":
+			if common.UsingPostgreSQL {
+				return DB.Exec(`ALTER TABLE "subscription_plans" ADD COLUMN "allow_wallet_overflow" boolean DEFAULT true`).Error
+			} else if common.UsingMySQL {
+				return DB.Exec("ALTER TABLE `subscription_plans` ADD COLUMN `allow_wallet_overflow` boolean DEFAULT TRUE").Error
+			} else {
+				return DB.Exec("ALTER TABLE `subscription_plans` ADD COLUMN `allow_wallet_overflow` numeric DEFAULT 1").Error
+			}
+		case "downgrade_group":
+			if common.UsingPostgreSQL {
+				return DB.Exec(`ALTER TABLE "subscription_plans" ADD COLUMN "downgrade_group" varchar(64) NOT NULL DEFAULT ''`).Error
+			} else {
+				return DB.Exec("ALTER TABLE `subscription_plans` ADD COLUMN `downgrade_group` varchar(64) NOT NULL DEFAULT ''").Error
+			}
+		}
+	}
+	return fmt.Errorf("unsupported subscription policy column %s.%s", tableName, columnName)
+}
+
+func migrateUserSubscriptionPolicyDefaults(tableExisted, walletColumnExisted, downgradeColumnExisted bool) error {
+	if DB == nil || !DB.Migrator().HasTable(&UserSubscription{}) {
+		return nil
+	}
+	// A newly added bool column cannot distinguish legacy rows from an explicit
+	// false value after the fact. Initialize only rows that predate the column,
+	// and repair nullable legacy rows, preserving every persisted false value.
+	if !walletColumnExisted {
+		if tableExisted {
+			if err := DB.Model(&UserSubscription{}).Where("allow_wallet_overflow IS NULL").Update("allow_wallet_overflow", true).Error; err != nil {
+				return fmt.Errorf("failed to backfill user subscription wallet policy: %w", err)
+			}
+		}
+	} else if err := DB.Model(&UserSubscription{}).Where("allow_wallet_overflow IS NULL").Update("allow_wallet_overflow", true).Error; err != nil {
+		return fmt.Errorf("failed to repair user subscription wallet policy: %w", err)
+	}
+	if err := DB.Model(&UserSubscription{}).Where("downgrade_group IS NULL").Update("downgrade_group", "").Error; err != nil {
+		return fmt.Errorf("failed to backfill user subscription downgrade policy: %w", err)
+	}
+	return nil
+}
+
+func migrateSubscriptionPlanPolicyDefaults(tableExisted, walletColumnExisted, downgradeColumnExisted bool) error {
+	if DB == nil || !DB.Migrator().HasTable(&SubscriptionPlan{}) {
+		return nil
+	}
+	if walletColumnExisted || tableExisted {
+		if err := DB.Model(&SubscriptionPlan{}).Where("allow_wallet_overflow IS NULL").Update("allow_wallet_overflow", true).Error; err != nil {
+			return fmt.Errorf("failed to backfill subscription plan wallet policy: %w", err)
+		}
+	}
+	if err := DB.Model(&SubscriptionPlan{}).Where("downgrade_group IS NULL").Update("downgrade_group", "").Error; err != nil {
+		return fmt.Errorf("failed to backfill subscription plan downgrade policy: %w", err)
+	}
+	return nil
+}
+
 func ensureSubscriptionPlanTableSQLite() error {
 	if !common.UsingSQLite {
 		return nil
@@ -813,11 +967,13 @@ func ensureSubscriptionPlanTableSQLite() error {
 ` + "`enabled`" + ` numeric DEFAULT 1,
 ` + "`sort_order`" + ` integer DEFAULT 0,
 ` + "`allow_balance_pay`" + ` numeric DEFAULT 1,
+` + "`allow_wallet_overflow`" + ` numeric DEFAULT 1,
 ` + "`stripe_price_id`" + ` varchar(128) DEFAULT '',
 ` + "`creem_product_id`" + ` varchar(128) DEFAULT '',
 ` + "`waffo_pancake_product_id`" + ` varchar(128) DEFAULT '',
 ` + "`max_purchase_per_user`" + ` integer DEFAULT 0,
 ` + "`upgrade_group`" + ` varchar(64) DEFAULT '',
+` + "`downgrade_group`" + ` varchar(64) DEFAULT '',
 ` + "`total_amount`" + ` bigint NOT NULL DEFAULT 0,
 ` + "`quota_reset_period`" + ` varchar(16) DEFAULT 'never',
 ` + "`quota_reset_custom_seconds`" + ` bigint DEFAULT 0,
@@ -848,11 +1004,13 @@ PRIMARY KEY (` + "`id`" + `)
 		{Name: "enabled", DDL: "`enabled` numeric DEFAULT 1"},
 		{Name: "sort_order", DDL: "`sort_order` integer DEFAULT 0"},
 		{Name: "allow_balance_pay", DDL: "`allow_balance_pay` numeric DEFAULT 1"},
+		{Name: "allow_wallet_overflow", DDL: "`allow_wallet_overflow` numeric DEFAULT 1"},
 		{Name: "stripe_price_id", DDL: "`stripe_price_id` varchar(128) DEFAULT ''"},
 		{Name: "creem_product_id", DDL: "`creem_product_id` varchar(128) DEFAULT ''"},
 		{Name: "waffo_pancake_product_id", DDL: "`waffo_pancake_product_id` varchar(128) DEFAULT ''"},
 		{Name: "max_purchase_per_user", DDL: "`max_purchase_per_user` integer DEFAULT 0"},
 		{Name: "upgrade_group", DDL: "`upgrade_group` varchar(64) DEFAULT ''"},
+		{Name: "downgrade_group", DDL: "`downgrade_group` varchar(64) DEFAULT ''"},
 		{Name: "total_amount", DDL: "`total_amount` bigint NOT NULL DEFAULT 0"},
 		{Name: "quota_reset_period", DDL: "`quota_reset_period` varchar(16) DEFAULT 'never'"},
 		{Name: "quota_reset_custom_seconds", DDL: "`quota_reset_custom_seconds` bigint DEFAULT 0"},
@@ -1022,11 +1180,11 @@ func isZeroColumnDefault(defaultValue sql.NullString) bool {
 
 // migrateSubscriptionPlanPriceAmount migrates price_amount column from float/double to decimal(10,6)
 // This is safe to run multiple times - it checks the column type first
-func migrateSubscriptionPlanPriceAmount() {
+func migrateSubscriptionPlanPriceAmount() error {
 	// SQLite doesn't support ALTER COLUMN, and its type affinity handles this automatically
 	// Skip early to avoid GORM parsing the existing table DDL which may cause issues
 	if common.UsingSQLite {
-		return
+		return nil
 	}
 
 	tableName := "subscription_plans"
@@ -1034,12 +1192,12 @@ func migrateSubscriptionPlanPriceAmount() {
 
 	// Check if table exists first
 	if !DB.Migrator().HasTable(tableName) {
-		return
+		return nil
 	}
 
 	// Check if column exists
 	if !DB.Migrator().HasColumn(&SubscriptionPlan{}, columnName) {
-		return
+		return nil
 	}
 
 	var alterSQL string
@@ -1049,9 +1207,9 @@ func migrateSubscriptionPlanPriceAmount() {
 		if err := DB.Raw(`SELECT data_type FROM information_schema.columns
 			WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?`,
 			tableName, columnName).Scan(&dataType).Error; err != nil {
-			common.SysLog(fmt.Sprintf("Warning: failed to query metadata for %s.%s: %v", tableName, columnName, err))
+			return fmt.Errorf("failed to query metadata for %s.%s: %w", tableName, columnName, err)
 		} else if dataType == "numeric" {
-			return // Already decimal/numeric
+			return nil // Already decimal/numeric
 		}
 		alterSQL = fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s TYPE decimal(10,6) USING %s::decimal(10,6)`,
 			tableName, columnName, columnName)
@@ -1061,23 +1219,23 @@ func migrateSubscriptionPlanPriceAmount() {
 		if err := DB.Raw(`SELECT COLUMN_TYPE FROM information_schema.columns
 				WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
 			tableName, columnName).Scan(&columnType).Error; err != nil {
-			common.SysLog(fmt.Sprintf("Warning: failed to query metadata for %s.%s: %v", tableName, columnName, err))
+			return fmt.Errorf("failed to query metadata for %s.%s: %w", tableName, columnName, err)
 		} else if strings.HasPrefix(strings.ToLower(columnType), "decimal") {
-			return // Already decimal
+			return nil // Already decimal
 		}
 		alterSQL = fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s decimal(10,6) NOT NULL DEFAULT 0",
 			tableName, columnName)
 	} else {
-		return
+		return nil
 	}
 
 	if alterSQL != "" {
 		if err := DB.Exec(alterSQL).Error; err != nil {
-			common.SysLog(fmt.Sprintf("Warning: failed to migrate %s.%s to decimal: %v", tableName, columnName, err))
-		} else {
-			common.SysLog(fmt.Sprintf("Successfully migrated %s.%s to decimal(10,6)", tableName, columnName))
+			return fmt.Errorf("failed to migrate %s.%s to decimal: %w", tableName, columnName, err)
 		}
+		common.SysLog(fmt.Sprintf("Successfully migrated %s.%s to decimal(10,6)", tableName, columnName))
 	}
+	return nil
 }
 
 func closeDB(db *gorm.DB) error {
@@ -1204,19 +1362,35 @@ func PingDB() error {
 		return nil
 	}
 
+	if err := PingDBUncached(); err != nil {
+		return err
+	}
+
+	lastPingTime = time.Now()
+	common.SysLog("Database pinged successfully")
+	return nil
+}
+
+func PingDBUncached() error {
+	return PingDBContext(context.Background())
+}
+
+func PingDBContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	sqlDB, err := DB.DB()
 	if err != nil {
 		log.Printf("Error getting sql.DB from GORM: %v", err)
 		return err
 	}
 
-	err = sqlDB.Ping()
+	err = sqlDB.PingContext(ctx)
 	if err != nil {
 		log.Printf("Error pinging DB: %v", err)
 		return err
 	}
 
-	lastPingTime = time.Now()
-	common.SysLog("Database pinged successfully")
 	return nil
 }

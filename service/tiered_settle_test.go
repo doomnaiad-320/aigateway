@@ -3,12 +3,16 @@ package service
 import (
 	"math"
 	"math/rand"
+	"net/http"
 	"sync"
 	"testing"
 
+	"github.com/MAX-API-Next/MAX-API/common"
 	"github.com/MAX-API-Next/MAX-API/dto"
 	"github.com/MAX-API-Next/MAX-API/pkg/billingexpr"
 	relaycommon "github.com/MAX-API-Next/MAX-API/relay/common"
+	"github.com/MAX-API-Next/MAX-API/types"
+	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/require"
 )
@@ -26,6 +30,35 @@ const cacheExpr = `tier("default", p * 2 + c * 10 + cr * 0.2 + cc * 2.5 + cc1h *
 const probeExpr = `param("service_tier") == "fast" ? tier("fast", p * 4 + c * 20) : tier("normal", p * 2 + c * 10)`
 
 const testQuotaPerUnit = 500_000.0
+
+func TestVisualZeroPriceContractKeepsNormalizationAndQuota(t *testing.T) {
+	for _, variable := range []string{"cr", "cc", "cc1h", "img", "img_o", "ai", "ao"} {
+		expr := `tier("base", p * 3 + c * 15 + ` + variable + ` * 0)`
+		require.True(t, billingexpr.UsedVars(expr)[variable], "zero coefficient must not remove %s from the normalization contract", variable)
+	}
+	usage := &dto.Usage{PromptTokens: 1000, CompletionTokens: 100, TotalTokens: 1100}
+	usage.PromptTokensDetails.CachedTokens = 800
+	usage.CompletionTokenDetails.ImageTokens = 80
+	for _, tc := range []struct {
+		expr  string
+		p, c  float64
+		quota int
+	}{
+		{`tier("base", p * 3 + c * 15)`, 1000, 100, 2250},
+		{`tier("base", p * 3 + c * 15 + cr * 0)`, 200, 100, 1050},
+		{`tier("base", p * 3 + c * 15 + cr * 0 + img_o * 0)`, 200, 20, 450},
+		{`len < 2000 ? tier("base", p * 3 + c * 15 + cr * 0 + img_o * 0) : tier("other", p * 6 + c * 30)`, 200, 20, 450},
+	} {
+		t.Run(tc.expr, func(t *testing.T) {
+			params := BuildTieredTokenParams(usage, false, billingexpr.UsedVars(tc.expr))
+			require.Equal(t, tc.p, params.P)
+			require.Equal(t, tc.c, params.C)
+			ok, quota, _ := TryTieredSettle(makeRelayInfo(tc.expr, 1, 1000, 100), params)
+			require.True(t, ok)
+			require.Equal(t, tc.quota, quota)
+		})
+	}
+}
 
 func makeSnapshot(expr string, groupRatio float64, estPrompt, estCompletion int) *billingexpr.BillingSnapshot {
 	return &billingexpr.BillingSnapshot{
@@ -109,6 +142,24 @@ func TestTryTieredSettleFallsBackToFrozenPreConsumeOnExprError(t *testing.T) {
 	if result != nil {
 		t.Fatalf("result = %#v, want nil", result)
 	}
+}
+
+func TestTryTieredSettleErrorFallbackUsesHigherFrozenEstimate(t *testing.T) {
+	relayInfo := &relaycommon.RelayInfo{
+		FinalPreConsumedQuota: 123,
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode:              "tiered_expr",
+			ExprString:               `invalid +-+ expr`,
+			ExprHash:                 billingexpr.ExprHashString(`invalid +-+ expr`),
+			GroupRatio:               1.0,
+			EstimatedQuotaAfterGroup: 999,
+		},
+	}
+
+	ok, quota, result := TryTieredSettle(relayInfo, billingexpr.TokenParams{P: 100})
+	require.True(t, ok)
+	require.Equal(t, 999, quota)
+	require.Nil(t, result)
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +385,181 @@ func TestTryTieredSettle_GroupRatioZero(t *testing.T) {
 	if quota != 0 {
 		t.Fatalf("quota = %d, want 0 (group ratio = 0)", quota)
 	}
+}
+
+func TestPrepareTieredBillingForSelectedGroupUpdatesReservation(t *testing.T) {
+	const expr = `tier("base", p)`
+	billing := &recordingBillingSettler{preConsumed: 50_000}
+	relayInfo := &relaycommon.RelayInfo{
+		Billing:               billing,
+		FinalPreConsumedQuota: 50_000,
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode:               "tiered_expr",
+			ExprString:                expr,
+			ExprHash:                  billingexpr.ExprHashString(expr),
+			GroupRatio:                0.10,
+			EstimatedQuotaBeforeGroup: 500_000,
+			EstimatedQuotaAfterGroup:  50_000,
+			QuotaPerUnit:              testQuotaPerUnit,
+		},
+		PriceData: types.PriceData{
+			GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 0.20},
+		},
+	}
+
+	require.Nil(t, PrepareTieredBillingForSelectedGroup(nil, relayInfo))
+	require.Equal(t, []int{100_000}, billing.reserves)
+	require.Equal(t, 100_000, billing.preConsumed)
+	require.Equal(t, 100_000, relayInfo.FinalPreConsumedQuota)
+	require.Equal(t, 0.20, relayInfo.TieredBillingSnapshot.GroupRatio)
+	require.Equal(t, 100_000, relayInfo.TieredBillingSnapshot.EstimatedQuotaAfterGroup)
+}
+
+func TestPrepareTieredBillingForSelectedGroupPaidToFreeDoesNotReserve(t *testing.T) {
+	const expr = `tier("base", p)`
+	billing := &recordingBillingSettler{preConsumed: 50_000}
+	relayInfo := &relaycommon.RelayInfo{
+		Billing:               billing,
+		FinalPreConsumedQuota: 50_000,
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode:               "tiered_expr",
+			ExprString:                expr,
+			ExprHash:                  billingexpr.ExprHashString(expr),
+			GroupRatio:                0.10,
+			EstimatedQuotaBeforeGroup: 500_000,
+			EstimatedQuotaAfterGroup:  50_000,
+			QuotaPerUnit:              testQuotaPerUnit,
+		},
+		PriceData: types.PriceData{
+			GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 0},
+		},
+	}
+
+	require.Nil(t, PrepareTieredBillingForSelectedGroup(nil, relayInfo))
+	require.Empty(t, billing.reserves)
+	require.Equal(t, 50_000, relayInfo.FinalPreConsumedQuota)
+	require.Equal(t, 0.0, relayInfo.TieredBillingSnapshot.GroupRatio)
+	require.Equal(t, 0, relayInfo.TieredBillingSnapshot.EstimatedQuotaAfterGroup)
+}
+
+func TestPrepareTieredBillingForSelectedGroupFreeToPaidInitializesBilling(t *testing.T) {
+	truncate(t)
+	const (
+		userID        = 921
+		tokenID       = 922
+		tokenKey      = "tiered-free-to-paid-token"
+		initialQuota  = 200_000
+		expectedQuota = 100_000
+	)
+	seedUser(t, userID, initialQuota)
+	seedToken(t, tokenID, userID, tokenKey, initialQuota)
+
+	ctx, _ := gin.CreateTestContext(nil)
+	// This fixture covers generic tiered free-to-paid group repricing. Alpha
+	// Search adds its surcharge before the floor and is covered separately in
+	// alpha_search_billing_test.go, so it intentionally keeps the normal mode.
+	relayInfo := &relaycommon.RelayInfo{
+		RequestId:       "tiered-free-to-paid-request",
+		UserId:          userID,
+		TokenId:         tokenID,
+		TokenKey:        tokenKey,
+		OriginModelName: "tiered-free-to-paid-model",
+		UsingGroup:      "paid",
+		UserSetting: dto.UserSetting{
+			BillingPreference: "wallet_only",
+		},
+		PriceData: types.PriceData{
+			FreeModel:      true,
+			GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 0.20},
+		},
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode:               "tiered_expr",
+			ExprString:                `tier("base", p)`,
+			ExprHash:                  billingexpr.ExprHashString(`tier("base", p)`),
+			GroupRatio:                0,
+			EstimatedQuotaBeforeGroup: 500_000,
+			EstimatedQuotaAfterGroup:  0,
+			QuotaPerUnit:              testQuotaPerUnit,
+		},
+	}
+
+	require.Nil(t, PrepareTieredBillingForSelectedGroup(ctx, relayInfo))
+	require.NotNil(t, relayInfo.Billing)
+	require.Equal(t, expectedQuota, relayInfo.FinalPreConsumedQuota)
+	require.Equal(t, expectedQuota, relayInfo.Billing.GetPreConsumedQuota())
+	require.False(t, relayInfo.PriceData.FreeModel)
+	require.Equal(t, 0.20, relayInfo.TieredBillingSnapshot.GroupRatio)
+	require.Equal(t, expectedQuota, relayInfo.TieredBillingSnapshot.EstimatedQuotaAfterGroup)
+	require.EqualValues(t, initialQuota-expectedQuota, getUserQuota(t, userID))
+	require.Equal(t, initialQuota-expectedQuota, getTokenRemainQuota(t, tokenID))
+}
+
+func TestPrepareTieredBillingForSelectedGroupFreeToPaidAppliesPreConsumedQuota(t *testing.T) {
+	truncate(t)
+	const (
+		userID       = 923
+		tokenID      = 924
+		tokenKey     = "tiered-free-to-paid-preconsume-token"
+		initialQuota = 200_000
+		configured   = 150_000
+	)
+	originalPreConsumedQuota := common.PreConsumedQuota
+	common.PreConsumedQuota = configured
+	t.Cleanup(func() { common.PreConsumedQuota = originalPreConsumedQuota })
+	seedUser(t, userID, initialQuota)
+	seedToken(t, tokenID, userID, tokenKey, initialQuota)
+
+	ctx, _ := gin.CreateTestContext(nil)
+	relayInfo := &relaycommon.RelayInfo{
+		RequestId:       "tiered-free-to-paid-preconsume-request",
+		UserId:          userID,
+		TokenId:         tokenID,
+		TokenKey:        tokenKey,
+		OriginModelName: "tiered-free-to-paid-preconsume-model",
+		UsingGroup:      "paid",
+		UserSetting: dto.UserSetting{
+			BillingPreference: "wallet_only",
+		},
+		PriceData: types.PriceData{
+			FreeModel:      true,
+			GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 0.20},
+		},
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode:               "tiered_expr",
+			ExprString:                `tier("base", p)`,
+			ExprHash:                  billingexpr.ExprHashString(`tier("base", p)`),
+			GroupRatio:                0,
+			EstimatedQuotaBeforeGroup: 500_000,
+			EstimatedQuotaAfterGroup:  0,
+			QuotaPerUnit:              testQuotaPerUnit,
+		},
+	}
+
+	require.Nil(t, PrepareTieredBillingForSelectedGroup(ctx, relayInfo))
+	require.Equal(t, configured, relayInfo.FinalPreConsumedQuota)
+	require.Equal(t, configured, relayInfo.Billing.GetPreConsumedQuota())
+	require.Equal(t, 100_000, relayInfo.TieredBillingSnapshot.EstimatedQuotaAfterGroup)
+	require.EqualValues(t, initialQuota-configured, getUserQuota(t, userID))
+	require.Equal(t, initialQuota-configured, getTokenRemainQuota(t, tokenID))
+}
+
+func TestPrepareTieredBillingForSelectedGroupFreeToPaidRequiresContext(t *testing.T) {
+	const expr = `tier("base", p)`
+	relayInfo := makeRelayInfo(expr, 0, 1_000_000, 0)
+	relayInfo.PriceData = types.PriceData{
+		FreeModel:      true,
+		GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 0.20},
+	}
+
+	err := PrepareTieredBillingForSelectedGroup(nil, relayInfo)
+
+	require.NotNil(t, err)
+	require.Equal(t, types.ErrorCodeModelPriceError, err.GetErrorCode())
+	require.Equal(t, http.StatusBadRequest, err.StatusCode)
+	require.True(t, types.IsSkipRetryError(err))
+	require.ErrorContains(t, err, "without request context")
+	require.Nil(t, relayInfo.Billing)
+	require.Zero(t, relayInfo.FinalPreConsumedQuota)
 }
 
 // ---------------------------------------------------------------------------

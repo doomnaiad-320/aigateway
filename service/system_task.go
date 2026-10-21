@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -29,6 +30,8 @@ var (
 	systemTaskHandlersMu sync.RWMutex
 	systemTaskHandlers   = map[string]SystemTaskHandler{}
 )
+
+var updateSystemTaskState = model.UpdateSystemTaskState
 
 func RegisterSystemTaskHandler(h SystemTaskHandler) {
 	if h == nil {
@@ -95,7 +98,12 @@ func StartSystemTaskRunner() {
 			return
 		}
 
-		runnerID := fmt.Sprintf("%s-%s", common.NodeName, common.GetRandomString(8))
+		randomPart, err := common.GenerateRandomCharsKey(8)
+		if err != nil {
+			logger.LogError(context.Background(), "failed to generate system task runner ID: "+err.Error())
+			randomPart = fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+		}
+		runnerID := fmt.Sprintf("%s-%s", common.NodeName, randomPart)
 		gopool.Go(func() {
 			logger.LogInfo(context.Background(), fmt.Sprintf("system task runner started: runner=%s idle_interval=%s", runnerID, systemTaskRunnerIdleInterval))
 
@@ -218,7 +226,7 @@ func runLogCleanupTask(ctx context.Context, task *model.SystemTask, runnerID str
 			return
 		}
 		syncLogCleanupStateFromRemaining(&state, remaining)
-		if err := model.UpdateSystemTaskState(task.TaskID, runnerID, state, systemTaskLockUntil()); err != nil {
+		if err := updateSystemTaskState(task.TaskID, runnerID, state, systemTaskLockUntil()); err != nil {
 			logSystemTaskLockError(ctx, task, err)
 			return
 		}
@@ -249,7 +257,7 @@ func runLogCleanupTask(ctx context.Context, task *model.SystemTask, runnerID str
 			}
 			state.Progress = logCleanupProgress(state.Processed, state.Total)
 
-			if err := model.UpdateSystemTaskState(task.TaskID, runnerID, state, systemTaskLockUntil()); err != nil {
+			if err := updateSystemTaskState(task.TaskID, runnerID, state, systemTaskLockUntil()); err != nil {
 				logSystemTaskLockError(ctx, task, err)
 				return
 			}
@@ -266,9 +274,19 @@ func runLogCleanupTask(ctx context.Context, task *model.SystemTask, runnerID str
 	if state.Total < state.Processed {
 		state.Total = state.Processed
 	}
-	if err := model.UpdateSystemTaskState(task.TaskID, runnerID, state, systemTaskLockUntil()); err != nil {
-		logSystemTaskLockError(ctx, task, err)
-		return
+	for {
+		rowsAffected, err := model.DeleteOldBillingLogReceiptsBatch(ctx, payload.TargetTimestamp, payload.BatchSize)
+		if err != nil {
+			failSystemTask(task, runnerID, err)
+			return
+		}
+		if err := updateSystemTaskState(task.TaskID, runnerID, state, systemTaskLockUntil()); err != nil {
+			logSystemTaskLockError(ctx, task, err)
+			return
+		}
+		if rowsAffected < int64(payload.BatchSize) {
+			break
+		}
 	}
 
 	result := LogCleanupResult{DeletedCount: state.Processed}
@@ -346,7 +364,7 @@ func NewSystemTaskProgressReporter(task *model.SystemTask, runnerID string) func
 		lastWriteAt = time.Now()
 
 		state := SystemTaskProgress{Total: total, Processed: processed, Progress: progress}
-		_ = model.UpdateSystemTaskState(task.TaskID, runnerID, state, systemTaskLockUntil())
+		_ = updateSystemTaskState(task.TaskID, runnerID, state, systemTaskLockUntil())
 	}
 }
 

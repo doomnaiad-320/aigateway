@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"strings"
@@ -25,6 +24,14 @@ const (
 	upstreamModelsURL  = "https://basellm.github.io/llm-metadata/api/newapi/models.json"
 	upstreamVendorsURL = "https://basellm.github.io/llm-metadata/api/newapi/vendors.json"
 )
+
+func modelSyncJitter(maxMillis int) time.Duration {
+	jitter, err := common.SecureRandomInt(maxMillis)
+	if err != nil {
+		return 0
+	}
+	return time.Duration(jitter) * time.Millisecond
+}
 
 func normalizeLocale(locale string) (string, bool) {
 	l := strings.ToLower(strings.TrimSpace(locale))
@@ -61,7 +68,7 @@ type upstreamModel struct {
 	Icon        string          `json:"icon"`
 	ModelName   string          `json:"model_name"`
 	NameRule    int             `json:"name_rule"`
-	Status      int             `json:"status"`
+	Status      *int            `json:"status"`
 	Tags        string          `json:"tags"`
 	VendorName  string          `json:"vendor_name"`
 }
@@ -70,7 +77,7 @@ type upstreamVendor struct {
 	Description string `json:"description"`
 	Icon        string `json:"icon"`
 	Name        string `json:"name"`
-	Status      int    `json:"status"`
+	Status      *int   `json:"status"`
 }
 
 var (
@@ -156,7 +163,7 @@ func fetchJSON[T any](ctx context.Context, url string, out *upstreamEnvelope[T])
 			lastErr = err
 			// backoff with jitter
 			sleep := baseDelay * time.Duration(1<<attempt)
-			jitter := time.Duration(rand.Intn(150)) * time.Millisecond
+			jitter := modelSyncJitter(150)
 			time.Sleep(sleep + jitter)
 			continue
 		}
@@ -228,7 +235,7 @@ func fetchJSON[T any](ctx context.Context, url string, out *upstreamEnvelope[T])
 			return nil
 		}
 		sleep := baseDelay * time.Duration(1<<attempt)
-		jitter := time.Duration(rand.Intn(150)) * time.Millisecond
+		jitter := modelSyncJitter(150)
 		time.Sleep(sleep + jitter)
 	}
 	return lastErr
@@ -260,6 +267,45 @@ func ensureVendorID(vendorName string, vendorByName map[string]upstreamVendor, v
 	}
 	vendorIDCache[vendorName] = 0
 	return 0
+}
+
+func fetchUpstreamMetadata(ctx context.Context, modelsURL, vendorsURL string) (upstreamEnvelope[upstreamVendor], upstreamEnvelope[upstreamModel], error) {
+	var vendorsEnv upstreamEnvelope[upstreamVendor]
+	var modelsEnv upstreamEnvelope[upstreamModel]
+	var vendorsErr error
+	var modelsErr error
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		vendorsErr = fetchJSON(ctx, vendorsURL, &vendorsEnv)
+	}()
+	go func() {
+		defer wg.Done()
+		modelsErr = fetchJSON(ctx, modelsURL, &modelsEnv)
+	}()
+	wg.Wait()
+	if vendorsErr != nil {
+		return vendorsEnv, modelsEnv, fmt.Errorf("fetch upstream vendors: %w", vendorsErr)
+	}
+	if !vendorsEnv.Success {
+		message := vendorsEnv.Message
+		if message == "" {
+			message = "upstream response reported failure"
+		}
+		return vendorsEnv, modelsEnv, fmt.Errorf("fetch upstream vendors: %s", message)
+	}
+	if modelsErr != nil {
+		return vendorsEnv, modelsEnv, fmt.Errorf("fetch upstream models: %w", modelsErr)
+	}
+	if !modelsEnv.Success {
+		message := modelsEnv.Message
+		if message == "" {
+			message = "upstream response reported failure"
+		}
+		return vendorsEnv, modelsEnv, fmt.Errorf("fetch upstream models: %s", message)
+	}
+	return vendorsEnv, modelsEnv, nil
 }
 
 // SyncUpstreamModels 同步上游模型与供应商：
@@ -305,25 +351,9 @@ func SyncUpstreamModels(c *gin.Context) {
 	defer cancel()
 
 	modelsURL, vendorsURL := getUpstreamURLs(req.Locale)
-	var vendorsEnv upstreamEnvelope[upstreamVendor]
-	var modelsEnv upstreamEnvelope[upstreamModel]
-	var fetchErr error
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		// vendor 失败不拦截
-		_ = fetchJSON(ctx, vendorsURL, &vendorsEnv)
-	}()
-	go func() {
-		defer wg.Done()
-		if err := fetchJSON(ctx, modelsURL, &modelsEnv); err != nil {
-			fetchErr = err
-		}
-	}()
-	wg.Wait()
+	vendorsEnv, modelsEnv, fetchErr := fetchUpstreamMetadata(ctx, modelsURL, vendorsURL)
 	if fetchErr != nil {
-		c.JSON(http.StatusOK, gin.H{"success": false, "message": "获取上游模型失败: " + fetchErr.Error(), "locale": req.Locale, "source_urls": gin.H{"models_url": modelsURL, "vendors_url": vendorsURL}})
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": "获取上游元数据失败: " + fetchErr.Error(), "locale": req.Locale, "source_urls": gin.H{"models_url": modelsURL, "vendors_url": vendorsURL}})
 		return
 	}
 
@@ -485,14 +515,11 @@ func coalesce(a, b string) string {
 	return b
 }
 
-func chooseStatus(primary, fallback int) int {
-	if primary == 0 && fallback != 0 {
-		return fallback
+func chooseStatus(primary *int, fallback int) int {
+	if primary != nil {
+		return *primary
 	}
-	if primary != 0 {
-		return primary
-	}
-	return 1
+	return fallback
 }
 
 // SyncUpstreamPreview 预览上游与本地的差异（仅用于弹窗选择）
@@ -505,24 +532,9 @@ func SyncUpstreamPreview(c *gin.Context) {
 	locale := c.Query("locale")
 	modelsURL, vendorsURL := getUpstreamURLs(locale)
 
-	var vendorsEnv upstreamEnvelope[upstreamVendor]
-	var modelsEnv upstreamEnvelope[upstreamModel]
-	var fetchErr error
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		_ = fetchJSON(ctx, vendorsURL, &vendorsEnv)
-	}()
-	go func() {
-		defer wg.Done()
-		if err := fetchJSON(ctx, modelsURL, &modelsEnv); err != nil {
-			fetchErr = err
-		}
-	}()
-	wg.Wait()
+	vendorsEnv, modelsEnv, fetchErr := fetchUpstreamMetadata(ctx, modelsURL, vendorsURL)
 	if fetchErr != nil {
-		c.JSON(http.StatusOK, gin.H{"success": false, "message": "获取上游模型失败: " + fetchErr.Error(), "locale": locale, "source_urls": gin.H{"models_url": modelsURL, "vendors_url": vendorsURL}})
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": "获取上游元数据失败: " + fetchErr.Error(), "locale": locale, "source_urls": gin.H{"models_url": modelsURL, "vendors_url": vendorsURL}})
 		return
 	}
 

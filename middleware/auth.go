@@ -14,7 +14,6 @@ import (
 	"github.com/MAX-API-Next/MAX-API/logger"
 	"github.com/MAX-API-Next/MAX-API/model"
 	"github.com/MAX-API-Next/MAX-API/service"
-	"github.com/MAX-API-Next/MAX-API/setting/ratio_setting"
 	"github.com/MAX-API-Next/MAX-API/types"
 
 	"github.com/gin-contrib/sessions"
@@ -46,6 +45,35 @@ func sessionInt(value any) (int, bool) {
 	}
 }
 
+func sessionInt64(value any) (int64, bool) {
+	switch v := value.(type) {
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	case float64:
+		return int64(v), true
+	default:
+		return 0, false
+	}
+}
+
+func sessionGenerationMatches(session sessions.Session, user *model.UserBase) bool {
+	value := session.Get("session_generation")
+	if value == nil {
+		return user.SessionGeneration == 0
+	}
+	generation, ok := sessionInt64(value)
+	return ok && generation == user.SessionGeneration
+}
+
+func clearInvalidSession(session sessions.Session) {
+	session.Clear()
+	if err := session.Save(); err != nil {
+		common.SysLog("failed to clear invalid session: " + err.Error())
+	}
+}
+
 func refreshSessionFromUser(session sessions.Session, user *model.UserBase) {
 	changed := false
 	setIfChanged := func(key string, value any) {
@@ -59,6 +87,7 @@ func refreshSessionFromUser(session sessions.Session, user *model.UserBase) {
 	setIfChanged("role", user.Role)
 	setIfChanged("status", user.Status)
 	setIfChanged("group", user.Group)
+	setIfChanged("session_generation", user.SessionGeneration)
 	if changed {
 		if err := session.Save(); err != nil {
 			common.SysLog(fmt.Sprintf("failed to refresh session for user %d: %v", user.Id, err))
@@ -72,6 +101,18 @@ func getSessionUser(session sessions.Session) (*model.UserBase, error) {
 		return nil, gorm.ErrRecordNotFound
 	}
 	return model.GetUserCache(id)
+}
+
+func sessionUserForRequest(session sessions.Session) (*model.UserBase, error) {
+	user, err := getSessionUser(session)
+	if err != nil {
+		return nil, err
+	}
+	if !sessionGenerationMatches(session, user) {
+		clearInvalidSession(session)
+		return nil, nil
+	}
+	return user, nil
 }
 
 func writeSessionUserContext(c *gin.Context, user *model.UserBase) {
@@ -109,6 +150,15 @@ func freshAuthHelper(c *gin.Context, minRole int) {
 					"message": common.TranslateMessage(c, i18n.MsgDatabaseError),
 				})
 			}
+			c.Abort()
+			return
+		}
+		if !sessionGenerationMatches(session, userCache) {
+			clearInvalidSession(session)
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"success": false,
+				"message": common.TranslateMessage(c, i18n.MsgAuthNotLoggedIn),
+			})
 			c.Abort()
 			return
 		}
@@ -193,7 +243,7 @@ func freshAuthHelper(c *gin.Context, minRole int) {
 			return
 		}
 	}
-	if status == common.UserStatusDisabled {
+	if status != common.UserStatusEnabled {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": common.TranslateMessage(c, i18n.MsgAuthUserBanned),
@@ -240,7 +290,7 @@ func TryUserAuth() func(c *gin.Context) {
 	return func(c *gin.Context) {
 		session := sessions.Default(c)
 		if session.Get("id") != nil {
-			if userCache, err := getSessionUser(session); err == nil && userCache.Status == common.UserStatusEnabled {
+			if userCache, err := sessionUserForRequest(session); err == nil && userCache != nil && userCache.Status == common.UserStatusEnabled {
 				refreshSessionFromUser(session, userCache)
 				writeSessionUserContext(c, userCache)
 			}
@@ -278,8 +328,8 @@ func TokenOrUserAuth() func(c *gin.Context) {
 		// Try session auth first (dashboard users)
 		session := sessions.Default(c)
 		if session.Get("id") != nil {
-			userCache, err := getSessionUser(session)
-			if err == nil && userCache.Status == common.UserStatusEnabled {
+			userCache, err := sessionUserForRequest(session)
+			if err == nil && userCache != nil && userCache.Status == common.UserStatusEnabled {
 				refreshSessionFromUser(session, userCache)
 				writeSessionUserContext(c, userCache)
 				c.Next()
@@ -335,6 +385,14 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 
 		userCache, err := model.GetUserCache(token.UserId)
 		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				c.JSON(http.StatusForbidden, gin.H{
+					"success": false,
+					"message": common.TranslateMessage(c, i18n.MsgAuthUserBanned),
+				})
+				c.Abort()
+				return
+			}
 			common.SysLog(fmt.Sprintf("TokenAuthReadOnly GetUserCache error for user %d: %v", token.UserId, err))
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"success": false,
@@ -384,7 +442,8 @@ func TokenAuth() func(c *gin.Context) {
 			}
 		}
 		// gemini api 从query中获取key
-		if strings.HasPrefix(c.Request.URL.Path, "/v1beta/models") ||
+		if c.Request.URL.Path == "/v1/models" ||
+			strings.HasPrefix(c.Request.URL.Path, "/v1beta/models") ||
 			strings.HasPrefix(c.Request.URL.Path, "/v1beta/openai/models") ||
 			strings.HasPrefix(c.Request.URL.Path, "/v1/models/") {
 			skKey := c.Query("key")
@@ -452,6 +511,10 @@ func TokenAuth() func(c *gin.Context) {
 
 		userCache, err := model.GetUserCache(token.UserId)
 		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				abortWithOpenAiMessage(c, http.StatusForbidden, common.TranslateMessage(c, i18n.MsgAuthUserBanned))
+				return
+			}
 			common.SysLog(fmt.Sprintf("TokenAuth GetUserCache error for user %d: %v", token.UserId, err))
 			abortWithOpenAiMessage(c, http.StatusInternalServerError,
 				common.TranslateMessage(c, i18n.MsgDatabaseError))
@@ -466,18 +529,13 @@ func TokenAuth() func(c *gin.Context) {
 		userCache.WriteContext(c)
 
 		userGroup := userCache.Group
-		tokenGroup := token.Group
+		routingPolicy, legacyRouting, routingErr := service.ResolveTokenRoutingPolicy(token, userGroup)
+		if routingErr != nil {
+			abortWithOpenAiMessage(c, http.StatusForbidden, common.TranslateMessage(c, routingErr.Error()))
+			return
+		}
+		tokenGroup, crossGroupRetry := service.ProjectTokenRoutingPolicy(routingPolicy)
 		if tokenGroup != "" {
-			// check common.UserUsableGroups[userGroup]
-			if !service.CanUseTokenGroupRuntime(userGroup, tokenGroup) {
-				abortWithOpenAiMessage(c, http.StatusForbidden, fmt.Sprintf("无权访问 %s 分组", tokenGroup))
-				return
-			}
-			// check group in common.GroupRatio
-			if !service.IsAutoRouteKey(tokenGroup) && !ratio_setting.ContainsGroupRatio(tokenGroup) {
-				abortWithOpenAiMessage(c, http.StatusForbidden, fmt.Sprintf("分组 %s 已被弃用", tokenGroup))
-				return
-			}
 			userGroup = tokenGroup
 		}
 		common.SetContextKey(c, constant.ContextKeyUsingGroup, userGroup)
@@ -485,6 +543,11 @@ func TokenAuth() func(c *gin.Context) {
 		err = SetupContextForToken(c, token, parts...)
 		if err != nil {
 			return
+		}
+		common.SetContextKey(c, constant.ContextKeyTokenGroup, tokenGroup)
+		common.SetContextKey(c, constant.ContextKeyTokenCrossGroupRetry, crossGroupRetry)
+		if !legacyRouting {
+			common.SetContextKey(c, constant.ContextKeyTokenRoutingPolicy, routingPolicy)
 		}
 		c.Next()
 	}

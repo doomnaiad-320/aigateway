@@ -83,6 +83,18 @@ export const STATIC_I18N_KEYS = [
   'User',
   'Guest',
 
+  // Billing statuses
+  'Paid - Needs Reconciliation',
+
+  // SmartOps alert delivery statuses (dynamic labels)
+  'Queued',
+  'Sending',
+  'Sent',
+  'Skipped (repeat interval)',
+  'Skipped (not configured)',
+  'Delivery failed',
+  'Delivery status unknown',
+
   // API Keys
   'Enabled',
   'Disabled',
@@ -103,7 +115,6 @@ export const STATIC_I18N_KEYS = [
   'Successfully created {{count}} API Key(s)',
   'Successfully deleted {{count}} API key(s)',
   'Enter API key for this channel',
-
   // Users
   'Root',
   'Deleted',
@@ -298,6 +309,11 @@ export const STATIC_I18N_KEYS = [
   'Received',
   'Payment initiated',
   'Payment page opened',
+  'Allow wallet fallback after quota exhaustion',
+  'Downgrade Group',
+  'No Downgrade',
+  'Wallet fallback',
+  'Wallet fallback disabled',
 
   // Upstream model updates
   'Upstream Model Updates',
@@ -328,6 +344,23 @@ export const STATIC_I18N_KEYS = [
   'Return Error',
   'Param Override',
   'Override request parameters',
+
+  // Playground parameter controls
+  'Caps the response length',
+  'Controls randomness and creativity',
+  'Encourages new topics',
+  'Frequency Penalty',
+  'Keeps compatible responses more repeatable',
+  'Limits token selection to a probability mass',
+  'Max Tokens',
+  'Not Set',
+  'Only enabled parameters are sent with the request.',
+  'Parameter settings',
+  'Presence Penalty',
+  'Reduces repeated wording',
+  'Seed',
+  'Temperature',
+  'Top P',
 
   // Profile / 2FA
   'Backed up',

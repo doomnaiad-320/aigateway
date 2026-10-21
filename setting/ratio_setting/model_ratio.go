@@ -130,6 +130,8 @@ var defaultModelRatio = map[string]float64{
 	"text-search-ada-doc-001":                   10,
 	"text-moderation-stable":                    0.1,
 	"text-moderation-latest":                    0.1,
+	"omni-moderation-latest":                    0, // OpenAI moderation models are free
+	"omni-moderation-2024-09-26":                0,
 	"claude-3-haiku-20240307":                   0.125, // $0.25 / 1M tokens
 	"claude-3-5-haiku-20241022":                 0.5,   // $1 / 1M tokens
 	"claude-haiku-4-5-20251001":                 0.5,   // $1 / 1M tokens
@@ -366,7 +368,7 @@ func ModelPrice2JSONString() string {
 }
 
 func UpdateModelPriceByJSONString(jsonStr string) error {
-	return types.LoadFromJsonStringWithCallback(modelPriceMap, jsonStr, InvalidateExposedDataCache)
+	return loadPricingMap(modelPriceMap, jsonStr)
 }
 
 // GetModelPrice 返回模型的价格，如果模型不存在则返回-1，false
@@ -395,7 +397,10 @@ func GetModelPrice(name string, printErr bool) (float64, bool) {
 }
 
 func UpdateModelRatioByJSONString(jsonStr string) error {
-	return types.LoadFromJsonStringWithCallback(modelRatioMap, jsonStr, InvalidateExposedDataCache)
+	return loadPricingMapWithOptions(modelRatioMap, jsonStr, pricingMapValidationOptions{
+		name:         "model ratio configuration",
+		normalizeKey: FormatMatchingModelName,
+	})
 }
 
 // 处理带有思考预算的模型名称，方便统一定价
@@ -443,7 +448,10 @@ func CompletionRatio2JSONString() string {
 }
 
 func UpdateCompletionRatioByJSONString(jsonStr string) error {
-	return types.LoadFromJsonStringWithCallback(completionRatioMap, jsonStr, InvalidateExposedDataCache)
+	return loadPricingMapWithOptions(completionRatioMap, jsonStr, pricingMapValidationOptions{
+		name:         "completion ratio configuration",
+		normalizeKey: FormatMatchingModelName,
+	})
 }
 
 func GetCompletionRatio(name string) float64 {
@@ -676,7 +684,7 @@ func ImageRatio2JSONString() string {
 }
 
 func UpdateImageRatioByJSONString(jsonStr string) error {
-	return types.LoadFromJsonString(imageRatioMap, jsonStr)
+	return loadPricingMap(imageRatioMap, jsonStr)
 }
 
 func GetImageRatio(name string) (float64, bool) {
@@ -692,7 +700,7 @@ func AudioRatio2JSONString() string {
 }
 
 func UpdateAudioRatioByJSONString(jsonStr string) error {
-	return types.LoadFromJsonStringWithCallback(audioRatioMap, jsonStr, InvalidateExposedDataCache)
+	return loadPricingMap(audioRatioMap, jsonStr)
 }
 
 func AudioCompletionRatio2JSONString() string {
@@ -700,7 +708,7 @@ func AudioCompletionRatio2JSONString() string {
 }
 
 func UpdateAudioCompletionRatioByJSONString(jsonStr string) error {
-	return types.LoadFromJsonStringWithCallback(audioCompletionRatioMap, jsonStr, InvalidateExposedDataCache)
+	return loadPricingMap(audioCompletionRatioMap, jsonStr)
 }
 
 func GetModelRatioCopy() map[string]float64 {

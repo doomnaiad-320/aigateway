@@ -1,6 +1,8 @@
 package common
 
 import (
+	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,9 +27,40 @@ type SystemStatus struct {
 	CPUUsage    float64
 	MemoryUsage float64
 	DiskUsage   float64
+	CPUValid    bool
+	MemoryValid bool
+	DiskValid   bool
+	ObservedAt  time.Time
 }
 
 var latestSystemStatus atomic.Value
+var systemStatusClock = time.Now
+var systemCPUUsageProbe = func() (float64, bool) {
+	percents, err := cpu.Percent(0, false)
+	if err != nil || len(percents) == 0 {
+		return 0, false
+	}
+	return percents[0], true
+}
+var systemMemoryUsageProbe = func() (float64, bool) {
+	memInfo, err := mem.VirtualMemory()
+	if err != nil {
+		return 0, false
+	}
+	return memInfo.UsedPercent, true
+}
+var systemDiskUsageProbe = func() (float64, bool) {
+	diskInfo := GetDiskSpaceInfo()
+	if diskInfo.Total == 0 {
+		return 0, false
+	}
+	return diskInfo.UsedPercent, true
+}
+var systemMonitorState struct {
+	sync.Mutex
+	cancel context.CancelFunc
+	done   chan struct{}
+}
 
 func init() {
 	latestSystemStatus.Store(SystemStatus{})
@@ -35,41 +68,90 @@ func init() {
 
 // StartSystemMonitor 启动系统监控
 func StartSystemMonitor() {
+	systemMonitorState.Lock()
+	defer systemMonitorState.Unlock()
+	if systemMonitorState.cancel != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	systemMonitorState.cancel = cancel
+	systemMonitorState.done = done
 	go func() {
-		for {
-			config := GetPerformanceMonitorConfig()
-			if !config.Enabled {
-				time.Sleep(30 * time.Second)
-				continue
-			}
-
-			updateSystemStatus()
-			time.Sleep(5 * time.Second)
-		}
+		defer close(done)
+		runSystemMonitor(ctx)
 	}()
 }
 
+func runSystemMonitor(ctx context.Context) {
+	for {
+		interval := 30 * time.Second
+		config := GetPerformanceMonitorConfig()
+		if config.Enabled {
+			updateSystemStatus()
+			interval = 5 * time.Second
+		}
+
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func StopSystemMonitor(ctx context.Context) error {
+	systemMonitorState.Lock()
+	cancel := systemMonitorState.cancel
+	done := systemMonitorState.done
+	systemMonitorState.Unlock()
+	if cancel == nil || done == nil {
+		return nil
+	}
+
+	cancel()
+	select {
+	case <-done:
+		systemMonitorState.Lock()
+		if systemMonitorState.done == done {
+			systemMonitorState.cancel = nil
+			systemMonitorState.done = nil
+		}
+		systemMonitorState.Unlock()
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func updateSystemStatus() {
-	var status SystemStatus
+	status := SystemStatus{ObservedAt: systemStatusClock()}
 
 	// CPU
 	// 注意：cpu.Percent(0, false) 返回自上次调用以来的 CPU 使用率
 	// 如果是第一次调用，可能会返回错误或不准确的值，但在循环中会逐渐正常
-	percents, err := cpu.Percent(0, false)
-	if err == nil && len(percents) > 0 {
-		status.CPUUsage = percents[0]
+	if usage, valid := systemCPUUsageProbe(); valid {
+		status.CPUUsage = usage
+		status.CPUValid = true
 	}
 
 	// Memory
-	memInfo, err := mem.VirtualMemory()
-	if err == nil {
-		status.MemoryUsage = memInfo.UsedPercent
+	if usage, valid := systemMemoryUsageProbe(); valid {
+		status.MemoryUsage = usage
+		status.MemoryValid = true
 	}
 
 	// Disk
-	diskInfo := GetDiskSpaceInfo()
-	if diskInfo.Total > 0 {
-		status.DiskUsage = diskInfo.UsedPercent
+	if usage, valid := systemDiskUsageProbe(); valid {
+		status.DiskUsage = usage
+		status.DiskValid = true
 	}
 
 	latestSystemStatus.Store(status)

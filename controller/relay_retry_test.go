@@ -8,12 +8,30 @@ import (
 
 	"github.com/MAX-API-Next/MAX-API/common"
 	"github.com/MAX-API-Next/MAX-API/dto"
+	relaycommon "github.com/MAX-API-Next/MAX-API/relay/common"
 	"github.com/MAX-API-Next/MAX-API/setting/operation_setting"
 	"github.com/MAX-API-Next/MAX-API/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRelayTaskSubmitAttemptAdvancesToolUsageRetryIndex(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set("platform", "invalid-test-platform")
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "task-test",
+		RetryIndex:      0,
+		ToolUsage:       relaycommon.NewToolUsageLedger("task-test"),
+	}
+	info.ToolUsage.BeginAttempt(0)
+
+	_, taskErr := relayTaskSubmitAttempt(c, info, 1)
+	require.NotNil(t, taskErr)
+	require.Equal(t, 1, info.RetryIndex)
+	require.Equal(t, 1, info.ToolUsageSnapshot().Attempt)
+}
 
 func TestShouldRetryEmptyResponseRequiresFeatureFlag(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -94,5 +112,25 @@ func TestShouldRetryTaskRelaySkipsLocalServerError(t *testing.T) {
 	require.False(t, shouldRetryTaskRelay(c, 1, &dto.TaskError{
 		StatusCode: http.StatusInternalServerError,
 		LocalError: true,
+	}, 1))
+}
+
+func TestShouldRetryTaskRelayDoesNotEnableRetryThroughStatusMapping(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	require.False(t, shouldRetryTaskRelay(c, 1, &dto.TaskError{
+		StatusCode:         http.StatusServiceUnavailable,
+		UpstreamStatusCode: http.StatusBadRequest,
+	}, 1))
+}
+
+func TestShouldRetryTaskRelayAllowsStatusMappingToSuppressRetry(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	require.False(t, shouldRetryTaskRelay(c, 1, &dto.TaskError{
+		StatusCode:         http.StatusBadRequest,
+		UpstreamStatusCode: http.StatusServiceUnavailable,
 	}, 1))
 }

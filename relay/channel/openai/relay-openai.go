@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/MAX-API-Next/MAX-API/common"
 	"github.com/MAX-API-Next/MAX-API/constant"
@@ -12,6 +13,7 @@ import (
 	"github.com/MAX-API-Next/MAX-API/logger"
 	"github.com/MAX-API-Next/MAX-API/relay/channel/openrouter"
 	relaycommon "github.com/MAX-API-Next/MAX-API/relay/common"
+	relayconstant "github.com/MAX-API-Next/MAX-API/relay/constant"
 	"github.com/MAX-API-Next/MAX-API/relay/helper"
 	"github.com/MAX-API-Next/MAX-API/service"
 
@@ -110,6 +112,9 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	}
 
 	defer service.CloseResponseBodyGracefully(resp)
+	if info.RelayMode == relayconstant.RelayModeChatCompletions && info.RelayFormat == types.RelayFormatOpenAI {
+		return oaiChatStreamHandler(c, info, resp)
+	}
 
 	model := info.UpstreamModelName
 	var responseId string
@@ -121,6 +126,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var usage = &dto.Usage{}
 	var lastStreamData string
 	var secondLastStreamData string // 存储倒数第二个stream data，用于音频模型
+	toolCallObserver := newOpenAIStreamToolCallObserver(info)
 
 	// 检查是否为音频模型
 	isAudioModel := strings.Contains(strings.ToLower(model), "audio")
@@ -139,14 +145,24 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			}
 
 			lastStreamData = data
+			observeOpenAIStreamToolCalls(toolCallObserver, data)
 			if err := processTokenData(info.RelayMode, data, &responseTextBuilder, &toolCount); err != nil {
 				logger.LogError(c, "error processing stream token data: "+err.Error())
 				sr.Error(err)
+			} else {
+				// This handler retains the latest event so the terminal usage frame
+				// can be handled separately. Treat the accepted first event as the
+				// first result so the scanner does not wait for a second frame.
+				sr.MarkDelivered()
 			}
 		}
 	})
 
 	// 对音频模型，从倒数第二个stream data中提取usage信息
+	if apiErr := helper.FirstResultTimeoutError(c, info); apiErr != nil {
+		return nil, apiErr
+	}
+
 	if isAudioModel && secondLastStreamData != "" {
 		var streamResp struct {
 			Usage *dto.Usage `json:"usage"`
@@ -227,6 +243,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	if service.ResponseAuditEnabled() {
 		service.SetRelayResponseAuditContent(info, service.BuildTextResponseAuditContent(&simpleResponse))
 	}
+	observeOpenAITextToolCalls(info, simpleResponse.Choices)
 
 	for _, choice := range simpleResponse.Choices {
 		if choice.FinishReason == constant.FinishReasonContentFilter {
@@ -299,6 +316,164 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	return &simpleResponse.Usage, nil
 }
 
+func observeOpenAITextToolCalls(info *relaycommon.RelayInfo, choices []dto.OpenAITextResponseChoice) {
+	if info == nil {
+		return
+	}
+	for _, choice := range choices {
+		if choice.FinishReason != constant.FinishReasonToolCalls {
+			continue
+		}
+		for toolIndex, toolCall := range choice.Message.ParseToolCalls() {
+			info.ObserveCustomToolCall(toolCall.Function.Name, relaycommon.ToolCallIdentity{
+				Scope:    "openai-chat",
+				CallID:   toolCall.ID,
+				Position: fmt.Sprintf("choice:%d:tool:%d", choice.Index, toolIndex),
+			})
+		}
+	}
+}
+
+type openAIStreamToolCallKey struct {
+	choiceIndex int
+	toolIndex   int
+}
+
+type openAIStreamToolCallIdentity struct {
+	name   string
+	callID string
+}
+
+type openAIStreamToolCallObserver struct {
+	info      *relaycommon.RelayInfo
+	pending   map[openAIStreamToolCallKey]openAIStreamToolCallIdentity
+	ambiguous map[openAIStreamToolCallKey]struct{}
+}
+
+func newOpenAIStreamToolCallObserver(info *relaycommon.RelayInfo) *openAIStreamToolCallObserver {
+	return &openAIStreamToolCallObserver{info: info}
+}
+
+func observeOpenAIStreamToolCalls(observer *openAIStreamToolCallObserver, data string) {
+	if observer == nil || data == "" || !openAIStreamChunkMayAffectToolBilling(data) {
+		return
+	}
+	var streamResponse dto.ChatCompletionsStreamResponse
+	if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
+		return
+	}
+	observer.Observe(&streamResponse)
+}
+
+func openAIStreamChunkMayAffectToolBilling(data string) bool {
+	if strings.Contains(data, `"tool_calls"`) {
+		return true
+	}
+	const finishReasonKey = `"finish_reason"`
+	for searchFrom := 0; searchFrom < len(data); {
+		keyOffset := strings.Index(data[searchFrom:], finishReasonKey)
+		if keyOffset < 0 {
+			return false
+		}
+		valueOffset := searchFrom + keyOffset + len(finishReasonKey)
+		for valueOffset < len(data) && (data[valueOffset] == ' ' || data[valueOffset] == '\t' || data[valueOffset] == '\r' || data[valueOffset] == '\n' || data[valueOffset] == ':') {
+			valueOffset++
+		}
+		if valueOffset < len(data) && !strings.HasPrefix(data[valueOffset:], "null") {
+			return true
+		}
+		searchFrom = valueOffset + len("null")
+	}
+	return false
+}
+
+func (o *openAIStreamToolCallObserver) Observe(streamResponse *dto.ChatCompletionsStreamResponse) {
+	if o == nil || o.info == nil || streamResponse == nil {
+		return
+	}
+	for _, choice := range streamResponse.Choices {
+		for position, toolCall := range choice.Delta.ToolCalls {
+			toolIndex := position
+			if toolCall.Index != nil {
+				toolIndex = *toolCall.Index
+			}
+			o.remember(openAIStreamToolCallKey{choiceIndex: choice.Index, toolIndex: toolIndex}, openAIStreamToolCallIdentity{
+				name:   strings.TrimSpace(toolCall.Function.Name),
+				callID: strings.TrimSpace(toolCall.ID),
+			})
+		}
+		if choice.FinishReason != nil && strings.TrimSpace(*choice.FinishReason) != "" {
+			o.finishChoice(choice.Index, strings.TrimSpace(*choice.FinishReason))
+		}
+	}
+}
+
+func (o *openAIStreamToolCallObserver) remember(key openAIStreamToolCallKey, identity openAIStreamToolCallIdentity) {
+	if _, blocked := o.ambiguous[key]; blocked {
+		return
+	}
+	if o.pending == nil {
+		o.pending = make(map[openAIStreamToolCallKey]openAIStreamToolCallIdentity)
+	}
+	if pending, ok := o.pending[key]; ok {
+		merged, compatible := mergeOpenAIStreamToolCallIdentity(pending, identity)
+		if !compatible {
+			delete(o.pending, key)
+			if o.ambiguous == nil {
+				o.ambiguous = make(map[openAIStreamToolCallKey]struct{})
+			}
+			o.ambiguous[key] = struct{}{}
+			return
+		}
+		o.pending[key] = merged
+		return
+	}
+	if identity.name != "" || identity.callID != "" {
+		o.pending[key] = identity
+	}
+}
+
+func (o *openAIStreamToolCallObserver) finishChoice(choiceIndex int, finishReason string) {
+	completed := finishReason == constant.FinishReasonToolCalls
+	for key, identity := range o.pending {
+		if key.choiceIndex != choiceIndex {
+			continue
+		}
+		delete(o.pending, key)
+		_, blocked := o.ambiguous[key]
+		delete(o.ambiguous, key)
+		if !completed || blocked || identity.name == "" {
+			continue
+		}
+		o.info.ObserveCustomToolCall(identity.name, relaycommon.ToolCallIdentity{
+			Scope:    "openai-chat",
+			CallID:   identity.callID,
+			Position: fmt.Sprintf("choice:%d:tool:%d", key.choiceIndex, key.toolIndex),
+		})
+	}
+	for key := range o.ambiguous {
+		if key.choiceIndex == choiceIndex {
+			delete(o.ambiguous, key)
+		}
+	}
+}
+
+func mergeOpenAIStreamToolCallIdentity(first, second openAIStreamToolCallIdentity) (openAIStreamToolCallIdentity, bool) {
+	if first.name != "" && second.name != "" && first.name != second.name {
+		return openAIStreamToolCallIdentity{}, false
+	}
+	if first.callID != "" && second.callID != "" && first.callID != second.callID {
+		return openAIStreamToolCallIdentity{}, false
+	}
+	if first.name == "" {
+		first.name = second.name
+	}
+	if first.callID == "" {
+		first.callID = second.callID
+	}
+	return first, true
+}
+
 func streamTTSResponse(c *gin.Context, resp *http.Response) {
 	c.Writer.WriteHeaderNow()
 
@@ -340,18 +515,27 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	info.IsStream = true
 	clientConn := info.ClientWs
 	targetConn := info.TargetWs
+	if err := configureRealtimeConnection(clientConn, realtimePongWait); err != nil {
+		return types.NewError(fmt.Errorf("configure client websocket: %w", err), types.ErrorCodeBadResponse), nil
+	}
+	if err := configureRealtimeConnection(targetConn, realtimePongWait); err != nil {
+		return types.NewError(fmt.Errorf("configure target websocket: %w", err), types.ErrorCodeBadResponse), nil
+	}
 
 	clientClosed := make(chan struct{})
 	targetClosed := make(chan struct{})
-	sendChan := make(chan []byte, 100)
-	receiveChan := make(chan []byte, 100)
-	errChan := make(chan error, 2)
+	errChan := make(chan error, 4)
+	done := make(chan struct{})
+	var workers sync.WaitGroup
+	var stateMu sync.Mutex
 
 	usage := &dto.RealtimeUsage{}
 	localUsage := &dto.RealtimeUsage{}
 	sumUsage := &dto.RealtimeUsage{}
 
+	workers.Add(4)
 	gopool.Go(func() {
+		defer workers.Done()
 		defer func() {
 			if r := recover(); r != nil {
 				errChan <- fmt.Errorf("panic in client reader: %v", r)
@@ -378,6 +562,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					return
 				}
 
+				stateMu.Lock()
 				if realtimeEvent.Type == dto.RealtimeEventTypeSessionUpdate {
 					if realtimeEvent.Session != nil {
 						if realtimeEvent.Session.Tools != nil {
@@ -388,6 +573,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 
 				textToken, audioToken, err := service.CountTokenRealtime(info, *realtimeEvent, info.UpstreamModelName)
 				if err != nil {
+					stateMu.Unlock()
 					errChan <- fmt.Errorf("error counting text token: %v", err)
 					return
 				}
@@ -396,6 +582,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 				localUsage.InputTokens += textToken + audioToken
 				localUsage.InputTokenDetails.TextTokens += textToken
 				localUsage.InputTokenDetails.AudioTokens += audioToken
+				stateMu.Unlock()
 
 				err = helper.WssString(c, targetConn, string(message))
 				if err != nil {
@@ -403,15 +590,12 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					return
 				}
 
-				select {
-				case sendChan <- message:
-				default:
-				}
 			}
 		}
 	})
 
 	gopool.Go(func() {
+		defer workers.Done()
 		defer func() {
 			if r := recover(); r != nil {
 				errChan <- fmt.Errorf("panic in target reader: %v", r)
@@ -430,7 +614,6 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					close(targetClosed)
 					return
 				}
-				info.SetFirstResponseTime()
 				realtimeEvent := &dto.RealtimeEvent{}
 				err = common.Unmarshal(message, realtimeEvent)
 				if err != nil {
@@ -438,6 +621,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					return
 				}
 
+				stateMu.Lock()
 				if realtimeEvent.Type == dto.RealtimeEventTypeResponseDone {
 					realtimeUsage := realtimeEvent.Response.Usage
 					if realtimeUsage != nil {
@@ -451,6 +635,9 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 						usage.OutputTokenDetails.TextTokens += realtimeUsage.OutputTokenDetails.TextTokens
 						err := preConsumeUsage(c, info, usage, sumUsage)
 						if err != nil {
+							usage = &dto.RealtimeUsage{}
+							localUsage = &dto.RealtimeUsage{}
+							stateMu.Unlock()
 							errChan <- fmt.Errorf("error consume usage: %v", err)
 							return
 						}
@@ -461,6 +648,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					} else {
 						textToken, audioToken, err := service.CountTokenRealtime(info, *realtimeEvent, info.UpstreamModelName)
 						if err != nil {
+							stateMu.Unlock()
 							errChan <- fmt.Errorf("error counting text token: %v", err)
 							return
 						}
@@ -472,6 +660,8 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 						localUsage.InputTokenDetails.AudioTokens += audioToken
 						err = preConsumeUsage(c, info, localUsage, sumUsage)
 						if err != nil {
+							localUsage = &dto.RealtimeUsage{}
+							stateMu.Unlock()
 							errChan <- fmt.Errorf("error consume usage: %v", err)
 							return
 						}
@@ -493,6 +683,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 				} else {
 					textToken, audioToken, err := service.CountTokenRealtime(info, *realtimeEvent, info.UpstreamModelName)
 					if err != nil {
+						stateMu.Unlock()
 						errChan <- fmt.Errorf("error counting text token: %v", err)
 						return
 					}
@@ -502,19 +693,32 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					localUsage.OutputTokenDetails.TextTokens += textToken
 					localUsage.OutputTokenDetails.AudioTokens += audioToken
 				}
+				stateMu.Unlock()
 
 				err = helper.WssString(c, clientConn, string(message))
 				if err != nil {
 					errChan <- fmt.Errorf("error writing to client: %v", err)
 					return
 				}
+				info.SetFirstResponseTime()
 
-				select {
-				case receiveChan <- message:
-				default:
-				}
 			}
 		}
+	})
+
+	reportPingError := func(err error) {
+		select {
+		case errChan <- err:
+		default:
+		}
+	}
+	gopool.Go(func() {
+		defer workers.Done()
+		runRealtimePingLoop(clientConn, done, realtimePingPeriod, realtimeWriteWait, reportPingError)
+	})
+	gopool.Go(func() {
+		defer workers.Done()
+		runRealtimePingLoop(targetConn, done, realtimePingPeriod, realtimeWriteWait, reportPingError)
 	})
 
 	select {
@@ -525,7 +729,13 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 		logger.LogError(c, "realtime error: "+err.Error())
 	case <-c.Done():
 	}
+	close(done)
+	_ = clientConn.Close()
+	_ = targetConn.Close()
+	workers.Wait()
 
+	stateMu.Lock()
+	defer stateMu.Unlock()
 	if usage.TotalTokens != 0 {
 		_ = preConsumeUsage(c, info, usage, sumUsage)
 	}
@@ -544,17 +754,17 @@ func preConsumeUsage(ctx *gin.Context, info *relaycommon.RelayInfo, usage *dto.R
 		return fmt.Errorf("invalid usage pointer")
 	}
 
-	totalUsage.TotalTokens += usage.TotalTokens
-	totalUsage.InputTokens += usage.InputTokens
-	totalUsage.OutputTokens += usage.OutputTokens
-	totalUsage.InputTokenDetails.CachedTokens += usage.InputTokenDetails.CachedTokens
-	totalUsage.InputTokenDetails.TextTokens += usage.InputTokenDetails.TextTokens
-	totalUsage.InputTokenDetails.AudioTokens += usage.InputTokenDetails.AudioTokens
-	totalUsage.OutputTokenDetails.TextTokens += usage.OutputTokenDetails.TextTokens
-	totalUsage.OutputTokenDetails.AudioTokens += usage.OutputTokenDetails.AudioTokens
-	// clear usage
-	err := service.PreWssConsumeQuota(ctx, info, usage)
-	return err
+	nextUsage := *totalUsage
+	nextUsage.TotalTokens += usage.TotalTokens
+	nextUsage.InputTokens += usage.InputTokens
+	nextUsage.OutputTokens += usage.OutputTokens
+	nextUsage.InputTokenDetails.CachedTokens += usage.InputTokenDetails.CachedTokens
+	nextUsage.InputTokenDetails.TextTokens += usage.InputTokenDetails.TextTokens
+	nextUsage.InputTokenDetails.AudioTokens += usage.InputTokenDetails.AudioTokens
+	nextUsage.OutputTokenDetails.TextTokens += usage.OutputTokenDetails.TextTokens
+	nextUsage.OutputTokenDetails.AudioTokens += usage.OutputTokenDetails.AudioTokens
+	*totalUsage = nextUsage
+	return service.PreWssConsumeQuota(ctx, info, totalUsage)
 }
 
 func OpenaiHandlerWithUsage(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.MaxAPIError) {

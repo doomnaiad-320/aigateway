@@ -74,10 +74,13 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (maxAPIError *types
 	if info.RelayMode == relayconstant.RelayModeChatCompletions &&
 		!passThroughGlobal &&
 		!info.ChannelSetting.PassThroughBodyEnabled &&
-		service.ShouldChatCompletionsUseResponsesGlobal(info.ChannelId, info.ChannelType, info.OriginModelName) {
+		shouldUseGlobalResponsesBridge(c, info) {
 		applySystemPromptIfNeeded(c, info, request)
 		usage, maxApiErr := chatCompletionsViaResponses(c, info, adaptor, request)
 		if maxApiErr != nil {
+			if usage != nil && info.IsStream && info.RelayFormat == types.RelayFormatOpenAI && types.IsSkipRetryError(maxApiErr) {
+				service.PostPartialConsumeQuota(c, info, usage)
+			}
 			return maxApiErr
 		}
 
@@ -104,10 +107,25 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (maxAPIError *types
 				logger.LogDebug(c, "requestBody: %s", debugBytes)
 			}
 		}
-		requestBody = common.ReaderOnly(storage)
+		body, size, closer, err := relaycommon.PreparePassThroughJSONBody(storage, info.ChannelOtherSettings)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		}
+		if closer != nil {
+			defer closer.Close()
+		}
+		info.UpstreamRequestBodySize = size
+		requestBody = body
 	} else {
+		messageTools, err := relaycommon.CaptureMessageTools(request)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		}
 		convertedRequest, err := adaptor.ConvertOpenAIRequest(c, info, request)
 		if err != nil {
+			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		}
+		if err := relaycommon.ValidateMessageToolsConversion(messageTools, convertedRequest); err != nil {
 			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 		}
 		relaycommon.AppendRequestConversionFromRequest(info, convertedRequest)
@@ -154,6 +172,10 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (maxAPIError *types
 			}
 		}
 
+		convertedRequest, err = filterResponsesRequestFields(convertedRequest, info, adaptor)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		}
 		jsonData, err := common.Marshal(convertedRequest)
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeJsonMarshalFailed, types.ErrOptionWithSkipRetry())
@@ -206,9 +228,19 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (maxAPIError *types
 
 	usage, maxApiErr := adaptor.DoResponse(c, httpResp, info)
 	if maxApiErr != nil {
+		// A native Chat stream can fail after delivering billable output.
+		// Its handler returns partial usage only with SkipRetry: preserve the
+		// existing settlement path rather than refunding a consumed response.
+		if partial, ok := usage.(*dto.Usage); ok && partial != nil && types.IsSkipRetryError(maxApiErr) &&
+			info.IsStream && info.RelayMode == relayconstant.RelayModeChatCompletions && info.RelayFormat == types.RelayFormatOpenAI {
+			service.PostPartialConsumeQuota(c, info, partial)
+		}
 		// reset status code 重置状态码
 		service.ResetStatusCode(maxApiErr, statusCodeMappingStr)
 		return maxApiErr
+	}
+	if !info.IsStream {
+		info.SetFirstResponseTime()
 	}
 
 	var containAudioTokens = usage.(*dto.Usage).CompletionTokenDetails.AudioTokens > 0 || usage.(*dto.Usage).PromptTokensDetails.AudioTokens > 0
@@ -220,4 +252,27 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (maxAPIError *types
 		service.PostTextConsumeQuota(c, info, usage.(*dto.Usage), nil)
 	}
 	return nil
+}
+
+func shouldUseGlobalResponsesBridge(c *gin.Context, info *relaycommon.RelayInfo) bool {
+	if info == nil || !service.SupportsOpenAIResponsesUpstreamForBaseURL(info.ChannelType, info.ChannelBaseUrl) ||
+		!service.ShouldChatCompletionsUseResponsesGlobal(info.ChannelId, info.ChannelType, info.OriginModelName) {
+		return false
+	}
+	if info.ChannelType != constant.ChannelTypeAdvancedCustom {
+		return true
+	}
+	// Explicit converters already select their upstream protocol and matching
+	// reply handler. A global override must not replace that selection.
+	config := info.ChannelOtherSettings.AdvancedCustom
+	if config == nil {
+		return false
+	}
+	path := strings.Split(info.RequestURLPath, "?")[0]
+	if c != nil && c.Request != nil && c.Request.URL != nil {
+		path = c.Request.URL.Path
+	}
+	route, ok := config.MatchPath(path)
+	converter := strings.TrimSpace(route.Converter)
+	return ok && (converter == "" || converter == dto.AdvancedCustomConverterNone)
 }

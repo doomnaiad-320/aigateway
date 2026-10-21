@@ -1,15 +1,21 @@
 package relay
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/MAX-API-Next/MAX-API/common"
 	"github.com/MAX-API-Next/MAX-API/constant"
+	"github.com/MAX-API-Next/MAX-API/dto"
+	"github.com/MAX-API-Next/MAX-API/model"
+	"github.com/MAX-API-Next/MAX-API/relay/channel"
 	"github.com/MAX-API-Next/MAX-API/relay/channel/task/doubao"
+	"github.com/MAX-API-Next/MAX-API/relay/channel/task/hailuo"
 	relaycommon "github.com/MAX-API-Next/MAX-API/relay/common"
 	"github.com/MAX-API-Next/MAX-API/setting/config"
 	"github.com/MAX-API-Next/MAX-API/setting/task_billing_setting"
@@ -18,6 +24,191 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type recordingTaskReservationBilling struct {
+	preConsumed int
+	reserveTo   []int
+	settleTo    []int
+}
+
+func TestTaskBillingPlanCapabilityFollowsSelectedAdaptor(t *testing.T) {
+	unsupported := GetTaskAdaptor(constant.TaskPlatform(strconv.Itoa(constant.ChannelTypeDoubaoVideo)))
+	require.NotNil(t, unsupported)
+	_, ok := unsupported.(channel.TaskBillingPlanProvider)
+	require.False(t, ok)
+
+	supported := GetTaskAdaptor(constant.TaskPlatform(strconv.Itoa(constant.ChannelTypeMiniMax)))
+	require.NotNil(t, supported)
+	_, ok = supported.(channel.TaskBillingPlanProvider)
+	require.True(t, ok)
+}
+
+func TestPopulateTaskBillingMetadataPersistsH3PlanSnapshot(t *testing.T) {
+	plan := &types.TaskBillingPlan{
+		Source:        "minimax_hailuo",
+		RuleKey:       "minimax_h3_v2",
+		SchemaVersion: 1,
+		Mode:          types.TaskBillingPlanModeBoundedActual,
+		ConfigHash:    "sha256:test",
+		Currency:      "USD",
+		GroupRatio:    1,
+		QuotaPerUnit:  1000,
+		Resolution:    "768P",
+		ReserveQuota:  800,
+	}
+	info := &relaycommon.RelayInfo{
+		RequestId:       "h3-plan-snapshot",
+		OriginModelName: "MiniMax-H3",
+		TaskBillingPlan: plan,
+		TaskRelayInfo:   &relaycommon.TaskRelayInfo{},
+	}
+	task := &model.Task{}
+	populateTaskBillingMetadata(task, info)
+	require.Equal(t, plan, task.PrivateData.BillingContext.TaskBillingPlan)
+	require.NotSame(t, plan, task.PrivateData.BillingContext.TaskBillingPlan)
+	plan.ReserveQuota = 999
+	require.EqualValues(t, 800, task.PrivateData.BillingContext.TaskBillingPlan.ReserveQuota)
+	plan.ReserveQuota = 800
+
+	data, err := common.Marshal(task.PrivateData)
+	require.NoError(t, err)
+	var restored model.TaskPrivateData
+	require.NoError(t, common.Unmarshal(data, &restored))
+	require.Equal(t, plan, restored.BillingContext.TaskBillingPlan)
+}
+
+func TestPopulateTaskBillingMetadataDoesNotMarkStructuredPlanAsPerCall(t *testing.T) {
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "MiniMax-H3",
+		TaskRelayInfo:   &relaycommon.TaskRelayInfo{},
+		TaskBillingPlan: &types.TaskBillingPlan{RuleKey: "minimax_h3"},
+		PriceData:       types.PriceData{UsePrice: true},
+		TaskBilling:     &types.TaskBillingResult{RuleKey: "legacy-card"},
+	}
+	task := &model.Task{}
+
+	populateTaskBillingMetadata(task, info)
+
+	require.NotNil(t, task.PrivateData.BillingContext)
+	assert.False(t, task.PrivateData.BillingContext.PerCallBilling)
+}
+
+func (b *recordingTaskReservationBilling) Settle(actualQuota int) error {
+	b.settleTo = append(b.settleTo, actualQuota)
+	b.preConsumed = actualQuota
+	return nil
+}
+func (b *recordingTaskReservationBilling) Refund(*gin.Context)      {}
+func (b *recordingTaskReservationBilling) NeedsRefund() bool        { return true }
+func (b *recordingTaskReservationBilling) GetPreConsumedQuota() int { return b.preConsumed }
+func (b *recordingTaskReservationBilling) Reserve(targetQuota int) error {
+	b.reserveTo = append(b.reserveTo, targetQuota)
+	if targetQuota > b.preConsumed {
+		b.preConsumed = targetQuota
+	}
+	return nil
+}
+
+func TestReserveTaskQuotaExtendsExistingReservationToActualTarget(t *testing.T) {
+	billing := &recordingTaskReservationBilling{preConsumed: 100}
+	info := &relaycommon.RelayInfo{
+		Billing: billing,
+		PriceData: types.PriceData{
+			FreeModel: false,
+		},
+	}
+
+	reserved, taskErr := reserveTaskQuota(nil, info, 250)
+
+	require.Nil(t, taskErr)
+	assert.Equal(t, 250, reserved)
+	assert.Equal(t, []int{250}, billing.reserveTo)
+}
+
+func TestReserveTaskQuotaPreservesPaidReservationUntilFreeRetrySettlement(t *testing.T) {
+	billing := &recordingTaskReservationBilling{preConsumed: 100}
+	info := &relaycommon.RelayInfo{
+		Billing: billing,
+		PriceData: types.PriceData{
+			FreeModel: true,
+		},
+	}
+
+	reserved, taskErr := reserveTaskQuota(nil, info, 0)
+
+	require.Nil(t, taskErr)
+	assert.Equal(t, 100, reserved)
+	assert.Same(t, billing, info.Billing)
+	assert.Empty(t, billing.reserveTo)
+
+	require.NoError(t, info.Billing.Settle(0))
+	assert.Equal(t, []int{0}, billing.settleTo)
+	assert.Zero(t, info.Billing.GetPreConsumedQuota())
+}
+
+func TestReserveTaskQuotaReturnsZeroForUnreservedFreeTask(t *testing.T) {
+	info := &relaycommon.RelayInfo{
+		PriceData: types.PriceData{
+			FreeModel: true,
+		},
+	}
+
+	reserved, taskErr := reserveTaskQuota(nil, info, 250)
+
+	require.Nil(t, taskErr)
+	assert.Zero(t, reserved)
+	assert.Nil(t, info.Billing)
+}
+
+func TestResolveTaskBillingQuotasUsesH3ReserveAndAppliesFloorOnce(t *testing.T) {
+	originalFloor := common.PreConsumedQuota
+	common.PreConsumedQuota = 1700
+	t.Cleanup(func() { common.PreConsumedQuota = originalFloor })
+	withRelayTaskQuotaPerUnit(t, 1000)
+	plan, err := task_billing_setting.BuildH3BillingPlan(task_billing_setting.H3BillingInput{
+		Resolution: "768P", OutputDurationSeconds: 5, InputVideoCount: 1,
+	}, 1)
+	require.NoError(t, err)
+	info := &relaycommon.RelayInfo{
+		TaskBillingPlan: plan,
+		PriceData: types.PriceData{
+			Quota:          1,
+			FreeModel:      false,
+			GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1},
+		},
+	}
+
+	estimate, reserve, usesPlan, err := resolveTaskBillingQuotas(info)
+
+	require.NoError(t, err)
+	require.True(t, usesPlan)
+	require.Equal(t, plan.EstimateQuota, estimate)
+	require.Equal(t, 1700, reserve)
+}
+
+func TestResolveTaskBillingQuotasRejectsTamperedH3SnapshotBeforeReadingTotals(t *testing.T) {
+	withRelayTaskQuotaPerUnit(t, 1000)
+	plan, err := task_billing_setting.BuildH3BillingPlan(task_billing_setting.H3BillingInput{
+		Resolution: "768P", OutputDurationSeconds: 5,
+	}, 1)
+	require.NoError(t, err)
+	plan.EstimateQuota++
+	info := &relaycommon.RelayInfo{
+		TaskBillingPlan: plan,
+		PriceData: types.PriceData{
+			FreeModel:      false,
+			GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1},
+		},
+	}
+
+	estimate, reserve, usesPlan, err := resolveTaskBillingQuotas(info)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "frozen totals do not match")
+	require.True(t, usesPlan)
+	require.Zero(t, estimate)
+	require.Zero(t, reserve)
+}
 
 func withRelayTaskRateCards(t *testing.T, cards map[string]task_billing_setting.RateCard) {
 	t.Helper()
@@ -88,6 +279,136 @@ func TestPrepareTaskSubmitRequestBodyMakesParamOverrideVisibleToBilling(t *testi
 	ratios := (&doubao.TaskAdaptor{}).EstimateBilling(c, info)
 	require.NotNil(t, ratios)
 	assert.InDelta(t, 51.0/46.0, ratios["video_input"], 1e-9)
+}
+
+func TestPrepareTaskSubmitRequestBodyMakesH3PlanUseFinalRequestFacts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{
+		"model":"MiniMax-H3",
+		"prompt":"test",
+		"duration":5,
+		"resolution":"768P",
+		"content":[{"type":"text","text":"test"}]
+	}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "MiniMax-H3",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: "MiniMax-H3",
+			ParamOverride: map[string]interface{}{
+				"operations": []interface{}{
+					map[string]interface{}{"path": "duration", "mode": "set", "value": 10},
+					map[string]interface{}{"path": "resolution", "mode": "set", "value": "2K"},
+				},
+			},
+		},
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{Action: constant.TaskActionGenerate},
+		PriceData:     types.PriceData{GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}},
+	}
+	relaycommon.StoreTaskRequest(c, info, constant.TaskActionGenerate, relaycommon.TaskSubmitReq{
+		Model:      "MiniMax-H3",
+		Prompt:     "test",
+		Duration:   common.GetPointer(5),
+		Resolution: "768P",
+		Content:    []map[string]any{{"type": "text", "text": "test"}},
+	})
+
+	_, taskErr := prepareTaskSubmitRequestBody(c, info, &hailuo.TaskAdaptor{})
+	require.Nil(t, taskErr)
+
+	plan, err := (&hailuo.TaskAdaptor{}).BuildTaskBillingPlan(c, info)
+	require.NoError(t, err)
+	require.EqualValues(t, 10, plan.RequestedOutputDurationSeconds)
+	require.Equal(t, "2K", plan.Resolution)
+}
+
+func TestCaptureTaskBillingPlanFailureBlocksUnsafeFallback(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	previous := &types.TaskBillingPlan{RuleKey: "stale"}
+	info := &relaycommon.RelayInfo{
+		OriginModelName: hailuo.H3Model,
+		TaskBillingPlan: previous,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: hailuo.H3Model,
+		},
+	}
+
+	err := captureTaskBillingPlan(c, info, &hailuo.TaskAdaptor{})
+
+	require.Error(t, err)
+	require.Nil(t, info.TaskBillingPlan)
+}
+
+func TestRelayTaskSubmitMapsModelBeforeContentOnlyValidation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{
+		"model":"MiniMax-H3",
+		"content":[{"type":"text","text":"Create a short film"}]
+	}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("channel_type", constant.ChannelTypeMiniMax)
+	c.Set("model_mapping", `{"MiniMax-H3":"MiniMax-Hailuo-2.3"}`)
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "MiniMax-H3",
+		TaskRelayInfo:   &relaycommon.TaskRelayInfo{},
+	}
+
+	_, taskErr := RelayTaskSubmit(c, info)
+
+	require.NotNil(t, taskErr)
+	require.Contains(t, taskErr.Message, "prompt is required")
+}
+
+func TestCaptureTaskBillingPlanSuccessKeepsSnapshot(t *testing.T) {
+	duration := 5
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set("task_request", relaycommon.TaskSubmitReq{
+		Model:    hailuo.H3Model,
+		Prompt:   "test",
+		Duration: &duration,
+		Content:  []map[string]any{{"type": "text", "text": "test"}},
+	})
+	info := &relaycommon.RelayInfo{
+		OriginModelName: hailuo.H3Model,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: hailuo.H3Model,
+		},
+		PriceData: types.PriceData{
+			TaskBillingPlanRequired: true,
+			GroupRatioInfo:          types.GroupRatioInfo{GroupRatio: 1},
+		},
+	}
+
+	require.NoError(t, captureTaskBillingPlan(c, info, &hailuo.TaskAdaptor{}))
+
+	require.NotNil(t, info.TaskBillingPlan)
+	require.EqualValues(t, 5, info.TaskBillingPlan.RequestedOutputDurationSeconds)
+}
+
+func TestCaptureTaskBillingPlanRejectsMissingRequiredPlan(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	info := &relaycommon.RelayInfo{
+		OriginModelName: hailuo.H3Model,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: "MiniMax-Hailuo-2.3",
+		},
+		PriceData: types.PriceData{
+			TaskBillingPlanRequired: true,
+			GroupRatioInfo:          types.GroupRatioInfo{GroupRatio: 1},
+		},
+	}
+
+	err := captureTaskBillingPlan(c, info, &hailuo.TaskAdaptor{})
+
+	require.ErrorContains(t, err, "required task billing plan was not produced")
+	require.Nil(t, info.TaskBillingPlan)
+
+	info.PriceData.TaskBillingPlanRequired = false
+	require.NoError(t, captureTaskBillingPlan(c, info, &hailuo.TaskAdaptor{}))
+	require.Nil(t, info.TaskBillingPlan)
 }
 
 func TestPrepareTaskSubmitRequestBodyMakesMultipartParamOverrideVisibleToBilling(t *testing.T) {
@@ -189,6 +510,71 @@ func TestEstimateTaskBillingFallsBackToGenericRateCard(t *testing.T) {
 	assert.Equal(t, 3000, got.Quota)
 }
 
+func TestEstimateTaskBillingDoesNotMixLegacyRateCardWithStructuredPlan(t *testing.T) {
+	withRelayTaskQuotaPerUnit(t, 1000)
+	withRelayTaskRateCards(t, map[string]task_billing_setting.RateCard{
+		"MiniMax-H3": {
+			Vendor:          "legacy",
+			Unit:            "call",
+			DefaultQuantity: 1,
+			Rows: []task_billing_setting.RateCardRow{{
+				ID:        "legacy-call",
+				UnitPrice: 1,
+			}},
+		},
+	})
+
+	plan, err := task_billing_setting.BuildH3BillingPlan(task_billing_setting.H3BillingInput{
+		Resolution: "768P", OutputDurationSeconds: 5,
+	}, 1)
+	require.NoError(t, err)
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	duration := 5
+	info := &relaycommon.RelayInfo{
+		OriginModelName: hailuo.H3Model,
+		ChannelMeta:     &relaycommon.ChannelMeta{UpstreamModelName: hailuo.H3Model},
+		TaskRelayInfo:   &relaycommon.TaskRelayInfo{Action: constant.TaskActionGenerate},
+		TaskBillingPlan: plan,
+		TaskBilling:     &types.TaskBillingResult{RuleKey: "legacy-call"},
+	}
+	relaycommon.StoreTaskRequest(c, info, constant.TaskActionGenerate, relaycommon.TaskSubmitReq{
+		Model:    hailuo.H3Model,
+		Duration: &duration,
+	})
+
+	got, err := estimateTaskBilling(c, info, &hailuo.TaskAdaptor{}, constant.TaskPlatform("minimax"))
+
+	require.NoError(t, err)
+	assert.Nil(t, got)
+	assert.Nil(t, info.TaskBilling)
+}
+
+func TestRecalcQuotaFromRatiosUsesRawEstimateBeforePreConsumeFloor(t *testing.T) {
+	const estimatedQuota = 200
+	info := &relaycommon.RelayInfo{
+		PriceData: types.PriceData{
+			Quota:             estimatedQuota,
+			QuotaToPreConsume: 500,
+			OtherRatios:       map[string]float64{"duration": 2},
+		},
+	}
+
+	for _, tc := range []struct {
+		name     string
+		ratio    float64
+		expected int
+	}{
+		{name: "adjusted below estimate and floor", ratio: 1, expected: 100},
+		{name: "adjusted above reservation", ratio: 6, expected: 600},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := recalcQuotaFromRatios(info, estimatedQuota, map[string]float64{"duration": tc.ratio})
+			assert.Equal(t, tc.expected, got)
+		})
+	}
+}
+
 func TestPrepareTaskSubmitRequestBodyParamOverrideReturnErrorIsLocal(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -229,4 +615,94 @@ func TestPrepareTaskSubmitRequestBodyParamOverrideReturnErrorIsLocal(t *testing.
 	assert.Equal(t, http.StatusUnprocessableEntity, taskErr.StatusCode)
 	assert.Equal(t, "forced_bad_request", taskErr.Code)
 	assert.Equal(t, "forced bad request by param override", taskErr.Message)
+}
+
+func TestMapUpstreamTaskErrorAppliesMappingWithoutChangingLocalClassification(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set("status_code_mapping", `{"400":"503"}`)
+	taskErr := &dto.TaskError{
+		StatusCode: http.StatusBadRequest,
+		LocalError: true,
+	}
+
+	got := mapUpstreamTaskError(c, taskErr)
+
+	require.Same(t, taskErr, got)
+	assert.Equal(t, http.StatusServiceUnavailable, got.StatusCode)
+	assert.Equal(t, http.StatusBadRequest, got.UpstreamStatusCode)
+	assert.True(t, got.LocalError)
+}
+
+func TestTaskResponseBufferDefersHeadersStatusAndBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	originalWriter := c.Writer
+	bufferedWriter := newTaskResponseBuffer(originalWriter)
+	c.Writer = bufferedWriter
+
+	c.Header("X-Task-Result", "buffered")
+	c.Status(http.StatusAccepted)
+	_, err := c.Writer.WriteString(`{"id":"task_public"}`)
+	require.NoError(t, err)
+
+	require.False(t, originalWriter.Written())
+	require.Empty(t, recorder.Body.String())
+	require.Empty(t, recorder.Header().Get("X-Task-Result"))
+
+	snapshot := bufferedWriter.snapshot()
+	c.Writer = originalWriter
+	require.NoError(t, snapshot.writeTo(c))
+	require.Equal(t, http.StatusAccepted, recorder.Code)
+	require.Equal(t, "buffered", recorder.Header().Get("X-Task-Result"))
+	require.JSONEq(t, `{"id":"task_public"}`, recorder.Body.String())
+}
+
+func TestTaskResponseSnapshotClearsHeadersRemovedFromBuffer(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Header("X-Stale", "stale")
+	originalWriter := c.Writer
+	bufferedWriter := newTaskResponseBuffer(originalWriter)
+	c.Writer = bufferedWriter
+
+	bufferedWriter.Header().Del("X-Stale")
+	bufferedWriter.Header().Set("X-Fresh", "fresh")
+	_, err := c.Writer.WriteString(`{"ok":true}`)
+	require.NoError(t, err)
+
+	snapshot := bufferedWriter.snapshot()
+	c.Writer = originalWriter
+	require.NoError(t, snapshot.writeTo(c))
+	require.Empty(t, recorder.Header().Get("X-Stale"))
+	require.Equal(t, "fresh", recorder.Header().Get("X-Fresh"))
+}
+
+func TestSetTaskOtherRatioHeadersUsesFinalRatios(t *testing.T) {
+	header := http.Header{}
+
+	setTaskOtherRatioHeaders(header, map[string]float64{"duration": 1.25})
+	setTaskOtherRatioHeaders(header, map[string]float64{"duration": 2})
+
+	require.JSONEq(t, `{"duration":2}`, header.Get("X-Max-Api-Other-Ratios"))
+	require.JSONEq(t, `{"duration":2}`, header.Get("X-New-Api-Other-Ratios"))
+}
+
+func TestTaskPersistenceErrorReturnsSafeClientMessage(t *testing.T) {
+	taskErr := TaskPersistenceError(errors.New("sql: failed near secret_table"), "persist_task_failed", "failed to persist task")
+
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "persist_task_failed", taskErr.Code)
+	assert.Equal(t, "failed to persist task", taskErr.Message)
+	assert.NotContains(t, taskErr.Message, "secret_table")
+	assert.NotContains(t, taskErr.Error.Error(), "secret_table")
+}
+
+func TestTerminalTaskStatusClassification(t *testing.T) {
+	require.True(t, isTerminalTaskStatus(model.TaskStatusSuccess))
+	require.True(t, isTerminalTaskStatus(model.TaskStatusFailure))
+	require.False(t, isTerminalTaskStatus(model.TaskStatusInProgress))
+	require.False(t, isTerminalTaskStatus(model.TaskStatusNotStart))
 }

@@ -1998,7 +1998,7 @@ func TestGetEffectiveHeaderOverrideUsesRuntimeOverrideAsFinalResult(t *testing.T
 	}
 }
 
-func TestRemoveDisabledFieldsSkipWhenChannelPassThroughEnabled(t *testing.T) {
+func TestRemoveDisabledFieldsFiltersWhenChannelPassThroughEnabled(t *testing.T) {
 	input := `{
 		"service_tier":"flex",
 		"safety_identifier":"user-123",
@@ -2011,10 +2011,10 @@ func TestRemoveDisabledFieldsSkipWhenChannelPassThroughEnabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RemoveDisabledFields returned error: %v", err)
 	}
-	assertJSONEqual(t, input, string(out))
+	assertJSONEqual(t, `{"store":true}`, string(out))
 }
 
-func TestRemoveDisabledFieldsSkipWhenGlobalPassThroughEnabled(t *testing.T) {
+func TestRemoveDisabledFieldsFiltersWhenGlobalPassThroughEnabled(t *testing.T) {
 	original := model_setting.GetGlobalSettings().PassThroughRequestEnabled
 	model_setting.GetGlobalSettings().PassThroughRequestEnabled = true
 	t.Cleanup(func() {
@@ -2032,7 +2032,21 @@ func TestRemoveDisabledFieldsSkipWhenGlobalPassThroughEnabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RemoveDisabledFields returned error: %v", err)
 	}
-	assertJSONEqual(t, input, string(out))
+	assertJSONEqual(t, `{}`, string(out))
+}
+
+func TestRemoveDisabledFieldsPassThroughHonorsExplicitCostFieldOptIn(t *testing.T) {
+	input := `{"service_tier":"flex","speed":"fast","inference_geo":"eu"}`
+	settings := dto.ChannelOtherSettings{
+		AllowServiceTier: true,
+		AllowSpeed:       true,
+	}
+
+	out, err := RemoveDisabledFields([]byte(input), settings, true)
+	if err != nil {
+		t.Fatalf("RemoveDisabledFields returned error: %v", err)
+	}
+	assertJSONEqual(t, `{"service_tier":"flex","speed":"fast"}`, string(out))
 }
 
 func TestRemoveDisabledFieldsDefaultFiltering(t *testing.T) {
@@ -2193,6 +2207,29 @@ func TestApplyParamOverrideWithRelayInfoRecordsOnlyKeyOperationsWhenDebugDisable
 	}
 	if !reflect.DeepEqual(info.ParamOverrideAudit, expected) {
 		t.Fatalf("unexpected param override audit, got %#v", info.ParamOverrideAudit)
+	}
+}
+
+func TestApplyParamOverrideWithRelayInfoSynchronizesReasoningEffort(t *testing.T) {
+	tests := []struct {
+		name       string
+		format     types.RelayFormat
+		before     string
+		override   map[string]interface{}
+		wantEffort string
+	}{
+		{name: "chat set none", format: types.RelayFormatOpenAI, before: `{"model":"gpt"}`, override: map[string]interface{}{"reasoning_effort": "none"}, wantEffort: "none"},
+		{name: "chat change", format: types.RelayFormatOpenAI, before: `{"model":"gpt","reasoning_effort":"low"}`, override: map[string]interface{}{"reasoning_effort": "high"}, wantEffort: "high"},
+		{name: "chat delete", format: types.RelayFormatOpenAI, before: `{"model":"gpt","reasoning_effort":"low"}`, override: map[string]interface{}{"operations": []interface{}{map[string]interface{}{"path": "reasoning_effort", "mode": "delete"}}}, wantEffort: ""},
+		{name: "responses change", format: types.RelayFormatOpenAIResponses, before: `{"model":"gpt","reasoning":{"effort":"medium"}}`, override: map[string]interface{}{"operations": []interface{}{map[string]interface{}{"path": "reasoning.effort", "mode": "set", "value": "max"}}}, wantEffort: "max"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &RelayInfo{RelayFormat: tc.format, ReasoningEffort: "stale", ChannelMeta: &ChannelMeta{ParamOverride: tc.override}}
+			_, err := ApplyParamOverrideWithRelayInfo([]byte(tc.before), info)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantEffort, info.ReasoningEffort)
+		})
 	}
 }
 

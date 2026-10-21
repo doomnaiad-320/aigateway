@@ -1,6 +1,7 @@
 package dto
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/MAX-API-Next/MAX-API/common"
@@ -50,13 +51,108 @@ func TestGeneralOpenAIRequestPreserveExplicitZeroValues(t *testing.T) {
 	require.True(t, gjson.GetBytes(encoded, "return_related_questions").Exists())
 }
 
+func TestGeneralOpenAIRequestPreserveQwenThinkingBudget(t *testing.T) {
+	raw := []byte(`{
+		"model":"qwen-plus",
+		"thinking_budget":0
+	}`)
+
+	var req GeneralOpenAIRequest
+	err := common.Unmarshal(raw, &req)
+	require.NoError(t, err)
+
+	encoded, err := common.Marshal(req)
+	require.NoError(t, err)
+
+	value := gjson.GetBytes(encoded, "thinking_budget")
+	require.True(t, value.Exists())
+	require.Equal(t, int64(0), value.Int())
+}
+
+func TestGeneralOpenAIRequestDropsThinkingBudgetForNonQwenModel(t *testing.T) {
+	req := GeneralOpenAIRequest{
+		Model:          "gpt-4.1",
+		ThinkingBudget: json.RawMessage(`128`),
+	}
+
+	encoded, err := common.Marshal(req)
+	require.NoError(t, err)
+
+	require.False(t, gjson.GetBytes(encoded, "thinking_budget").Exists())
+}
+
+func TestIsQwenThinkingBudgetModel(t *testing.T) {
+	tests := []struct {
+		model string
+		want  bool
+	}{
+		{model: "qwen-plus", want: true},
+		{model: "QWQ-32B", want: true},
+		{model: "accounts/fireworks/models/qwen3-235b-a22b", want: true},
+		{model: "deepseek-r1", want: false},
+		{model: "gpt-4.1", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			require.Equal(t, tt.want, IsQwenThinkingBudgetModel(tt.model))
+		})
+	}
+}
+
+func TestResolveMaxTokens(t *testing.T) {
+	legacy := uint(64)
+	completion := uint(128)
+	zero := uint(0)
+	tests := []struct {
+		name                string
+		maxTokens           *uint
+		maxCompletionTokens *uint
+		want                *uint
+	}{
+		{
+			name:                "prefers non-zero max completion tokens",
+			maxTokens:           &legacy,
+			maxCompletionTokens: &completion,
+			want:                &completion,
+		},
+		{
+			name:                "keeps legacy max tokens when completion is zero",
+			maxTokens:           &legacy,
+			maxCompletionTokens: &zero,
+			want:                &legacy,
+		},
+		{
+			name:                "preserves zero max completion tokens without legacy value",
+			maxCompletionTokens: &zero,
+			want:                &zero,
+		},
+		{
+			name:      "keeps legacy max tokens",
+			maxTokens: &legacy,
+			want:      &legacy,
+		},
+		{
+			name: "returns nil when both values are absent",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Same(t, tt.want, ResolveMaxTokens(tt.maxTokens, tt.maxCompletionTokens))
+		})
+	}
+}
+
 func TestOpenAIResponsesRequestPreserveExplicitZeroValues(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-4.1",
 		"max_output_tokens":0,
 		"max_tool_calls":0,
 		"stream":false,
-		"top_p":0
+		"top_p":0,
+		"frequency_penalty":0,
+		"presence_penalty":0
 	}`)
 
 	var req OpenAIResponsesRequest
@@ -70,6 +166,44 @@ func TestOpenAIResponsesRequestPreserveExplicitZeroValues(t *testing.T) {
 	require.True(t, gjson.GetBytes(encoded, "max_tool_calls").Exists())
 	require.True(t, gjson.GetBytes(encoded, "stream").Exists())
 	require.True(t, gjson.GetBytes(encoded, "top_p").Exists())
+	require.True(t, gjson.GetBytes(encoded, "frequency_penalty").Exists())
+	require.True(t, gjson.GetBytes(encoded, "presence_penalty").Exists())
+}
+
+func TestOpenAIResponsesRequestRejectsNonNumericPenalties(t *testing.T) {
+	for _, raw := range []string{
+		`{"model":"gpt-4.1","frequency_penalty":{}}`,
+		`{"model":"gpt-4.1","presence_penalty":"high"}`,
+	} {
+		var req OpenAIResponsesRequest
+		require.Error(t, common.Unmarshal([]byte(raw), &req))
+	}
+}
+
+func TestOpenAIResponsesRequestPreserveQwenThinkingBudget(t *testing.T) {
+	req := OpenAIResponsesRequest{
+		Model:          "qwen-plus",
+		ThinkingBudget: json.RawMessage(`0`),
+	}
+
+	encoded, err := common.Marshal(req)
+	require.NoError(t, err)
+
+	value := gjson.GetBytes(encoded, "thinking_budget")
+	require.True(t, value.Exists())
+	require.Equal(t, int64(0), value.Int())
+}
+
+func TestOpenAIResponsesRequestDropsThinkingBudgetForNonQwenModel(t *testing.T) {
+	req := OpenAIResponsesRequest{
+		Model:          "gpt-4.1",
+		ThinkingBudget: json.RawMessage(`128`),
+	}
+
+	encoded, err := common.Marshal(req)
+	require.NoError(t, err)
+
+	require.False(t, gjson.GetBytes(encoded, "thinking_budget").Exists())
 }
 
 func TestGeneralOpenAIRequestGetSystemRoleName(t *testing.T) {
@@ -84,6 +218,11 @@ func TestGeneralOpenAIRequestGetSystemRoleName(t *testing.T) {
 		{name: "o1 mini stays system", model: "o1-mini", want: "system"},
 		{name: "o1 preview stays system", model: "o1-preview", want: "system"},
 		{name: "gpt 5 uses developer", model: "gpt-5", want: "developer"},
+		{name: "astra uses developer", model: "gpt-6-astra", want: "developer"},
+		{name: "astra snapshot uses developer", model: "gpt-6-astra-2026-09-03", want: "developer"},
+		{name: "unknown astra variant stays system", model: "gpt-6-astra-pro", want: "system"},
+		{name: "invalid astra date stays system", model: "gpt-6-astra-2026-02-30", want: "system"},
+		{name: "other gpt 6 stays system", model: "gpt-6-other", want: "system"},
 		{name: "omni is not o series", model: "omni-moderation-latest", want: "system"},
 	}
 

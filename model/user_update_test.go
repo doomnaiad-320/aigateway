@@ -16,6 +16,7 @@ import (
 
 	"github.com/MAX-API-Next/MAX-API/common"
 	"github.com/MAX-API-Next/MAX-API/dto"
+	"github.com/MAX-API-Next/MAX-API/setting/operation_setting"
 	miniredis "github.com/alicebob/miniredis/v2"
 	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
@@ -95,24 +96,6 @@ func TestUnlimitedTokenQuotaDeductionRemainsUnbounded(t *testing.T) {
 	assert.EqualValues(t, 7, got.UsedQuota)
 }
 
-func TestAtomicTokenAndUserPreConsumeRollsBackTokenOnUserFailure(t *testing.T) {
-	setupUserUpdateTestState(t)
-	user := User{Id: 38, Username: "atomic-preconsume-user", Quota: 5, Status: common.UserStatusEnabled}
-	token := Token{Id: 39, UserId: user.Id, Key: "atomic-preconsume-token", RemainQuota: 10}
-	require.NoError(t, DB.Create(&user).Error)
-	require.NoError(t, DB.Create(&token).Error)
-
-	require.ErrorIs(t, DecreaseTokenAndUserQuota(token.Id, user.Id, token.Key, 7), ErrUserQuotaInsufficient)
-
-	var storedToken Token
-	require.NoError(t, DB.First(&storedToken, token.Id).Error)
-	assert.EqualValues(t, 10, storedToken.RemainQuota)
-	assert.Zero(t, storedToken.UsedQuota)
-	var storedUser User
-	require.NoError(t, DB.First(&storedUser, user.Id).Error)
-	assert.EqualValues(t, 5, storedUser.Quota)
-}
-
 func TestQuotaMutationDoesNotTouchCacheAfterDatabaseFailure(t *testing.T) {
 	setupUserUpdateTestState(t)
 
@@ -161,6 +144,75 @@ func TestInviteUserUpdatesOnlyAffiliateCounters(t *testing.T) {
 	assert.EqualValues(t, 20+common.QuotaForInviter, got.AffHistoryQuota)
 	assert.EqualValues(t, 100, got.Quota)
 	assert.Equal(t, common.UserStatusEnabled, got.Status)
+}
+
+func TestUserInsertAppliesInvitationRewardsAtomically(t *testing.T) {
+	setupUserUpdateTestState(t)
+	oldNewUserQuota := common.QuotaForNewUser
+	oldInviteeQuota := common.QuotaForInvitee
+	oldInviterQuota := common.QuotaForInviter
+	oldPaymentSetting := *operation_setting.GetPaymentSetting()
+	common.QuotaForNewUser = 100
+	common.QuotaForInvitee = 20
+	common.QuotaForInviter = 30
+	paymentSetting := operation_setting.GetPaymentSetting()
+	paymentSetting.ComplianceConfirmed = true
+	paymentSetting.ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
+	t.Cleanup(func() {
+		common.QuotaForNewUser = oldNewUserQuota
+		common.QuotaForInvitee = oldInviteeQuota
+		common.QuotaForInviter = oldInviterQuota
+		*operation_setting.GetPaymentSetting() = oldPaymentSetting
+	})
+
+	inviter := User{Id: 410, Username: "atomic-inviter", AffCode: "atomic-inviter", Status: common.UserStatusEnabled}
+	require.NoError(t, DB.Create(&inviter).Error)
+	invitee := User{Username: "atomic-invitee", AffCode: "", Status: common.UserStatusEnabled}
+	require.NoError(t, invitee.Insert(inviter.Id))
+
+	var storedInvitee User
+	require.NoError(t, DB.First(&storedInvitee, invitee.Id).Error)
+	assert.EqualValues(t, 120, storedInvitee.Quota)
+	var storedInviter User
+	require.NoError(t, DB.First(&storedInviter, inviter.Id).Error)
+	assert.Equal(t, 1, storedInviter.AffCount)
+	assert.EqualValues(t, 30, storedInviter.AffQuota)
+	assert.EqualValues(t, 30, storedInviter.AffHistoryQuota)
+}
+
+func TestUserInsertRollsBackWhenInvitationRewardOutboxCannotPersist(t *testing.T) {
+	setupUserUpdateTestState(t)
+	oldInviteeQuota := common.QuotaForInvitee
+	oldInviterQuota := common.QuotaForInviter
+	oldPaymentSetting := *operation_setting.GetPaymentSetting()
+	common.QuotaForInvitee = 20
+	common.QuotaForInviter = 30
+	paymentSetting := operation_setting.GetPaymentSetting()
+	paymentSetting.ComplianceConfirmed = true
+	paymentSetting.ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
+	t.Cleanup(func() {
+		common.QuotaForInvitee = oldInviteeQuota
+		common.QuotaForInviter = oldInviterQuota
+		*operation_setting.GetPaymentSetting() = oldPaymentSetting
+	})
+
+	inviter := User{Id: 411, Username: "rollback-inviter", AffCode: "rollback-inviter", Status: common.UserStatusEnabled}
+	require.NoError(t, DB.Create(&inviter).Error)
+	useFailingUserUpdateRedis(t)
+	failCacheOutboxInserts(t)
+
+	invitee := User{Username: "rollback-invitee", Status: common.UserStatusEnabled}
+	err := invitee.Insert(inviter.Id)
+	require.Error(t, err)
+
+	var inviteeCount int64
+	require.NoError(t, DB.Model(&User{}).Where("username = ?", invitee.Username).Count(&inviteeCount).Error)
+	assert.Zero(t, inviteeCount)
+	var storedInviter User
+	require.NoError(t, DB.First(&storedInviter, inviter.Id).Error)
+	assert.Zero(t, storedInviter.AffCount)
+	assert.Zero(t, storedInviter.AffQuota)
+	assert.Zero(t, storedInviter.AffHistoryQuota)
 }
 
 func TestFillUserMethodsReturnDatabaseErrors(t *testing.T) {
@@ -230,6 +282,26 @@ func TestIsOidcIdAlreadyTakenHandlesDuplicateLegacyRows(t *testing.T) {
 	require.True(t, taken)
 }
 
+func TestIsOAuthIdentityTakenWithTxExcludesCurrentUser(t *testing.T) {
+	setupUserUpdateTestState(t)
+	primary := User{Id: 136, Username: "oauth-tx-primary", GitHubId: "github-tx-id", AffCode: "oauth-tx-primary-aff", Status: common.UserStatusEnabled}
+	other := User{Id: 137, Username: "oauth-tx-other", GitHubId: "github-other-id", AffCode: "oauth-tx-other-aff", Status: common.UserStatusEnabled}
+	require.NoError(t, DB.Create(&primary).Error)
+	require.NoError(t, DB.Create(&other).Error)
+
+	taken, err := IsOAuthIdentityTakenWithTx(DB, UserUpdateFieldGitHubId, primary.GitHubId, 0)
+	require.NoError(t, err)
+	assert.True(t, taken)
+	taken, err = IsOAuthIdentityTakenWithTx(DB, UserUpdateFieldGitHubId, primary.GitHubId, primary.Id)
+	require.NoError(t, err)
+	assert.False(t, taken)
+	taken, err = IsOAuthIdentityTakenWithTx(DB, UserUpdateFieldGitHubId, other.GitHubId, primary.Id)
+	require.NoError(t, err)
+	assert.True(t, taken)
+	_, err = IsOAuthIdentityTakenWithTx(DB, UserUpdateFieldUsername, "not-an-oauth-field", primary.Id)
+	require.Error(t, err)
+}
+
 func TestOAuthIDTakenChecksReturnDatabaseErrors(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
@@ -265,6 +337,13 @@ type blockingCacheFillHook struct {
 	finished   chan struct{}
 	beforeOnce sync.Once
 	afterOnce  sync.Once
+}
+
+type blockingCacheInvalidationHook struct {
+	started     chan struct{}
+	release     chan struct{}
+	releaseOnce sync.Once
+	seen        atomic.Int32
 }
 
 type failCacheMutationHook struct {
@@ -316,6 +395,43 @@ func (*overlappingCacheMutationHook) BeforeProcessPipeline(ctx context.Context, 
 
 func (*overlappingCacheMutationHook) AfterProcessPipeline(context.Context, []redis.Cmder) error {
 	return nil
+}
+
+func newBlockingCacheInvalidationHook() *blockingCacheInvalidationHook {
+	return &blockingCacheInvalidationHook{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (h *blockingCacheInvalidationHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
+	name := strings.ToLower(cmd.Name())
+	if name != "eval" && name != "evalsha" {
+		return ctx, nil
+	}
+	if h.seen.Add(1) == 1 {
+		close(h.started)
+		<-h.release
+	}
+	return ctx, nil
+}
+
+func (*blockingCacheInvalidationHook) AfterProcess(context.Context, redis.Cmder) error {
+	return nil
+}
+
+func (*blockingCacheInvalidationHook) BeforeProcessPipeline(ctx context.Context, _ []redis.Cmder) (context.Context, error) {
+	return ctx, nil
+}
+
+func (*blockingCacheInvalidationHook) AfterProcessPipeline(context.Context, []redis.Cmder) error {
+	return nil
+}
+
+func (h *blockingCacheInvalidationHook) unblock() {
+	h.releaseOnce.Do(func() {
+		close(h.release)
+	})
 }
 
 func (h *recoverableCacheMutationHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
@@ -431,24 +547,138 @@ func TestUserQuotaMutationsRetryCacheInvalidation(t *testing.T) {
 			cacheUserForRetryTest(t, client, user)
 
 			require.NoError(t, tt.mutate(user.Id))
+			processCacheInvalidationTasks()
 			requireCacheKeyDeletedEventually(t, client, getUserCacheKey(user.Id))
 		})
 	}
 }
 
-func TestAtomicPreConsumeRetriesBothCacheInvalidations(t *testing.T) {
+func TestOverrideUserQuotaRollsBackWhenCacheOutboxCannotPersist(t *testing.T) {
 	setupUserUpdateTestState(t)
-	user := User{Id: 83, Username: "atomic-cache-retry-user", Quota: 10, Status: common.UserStatusEnabled}
-	token := Token{Id: 84, UserId: user.Id, Key: "atomic-cache-retry-token", RemainQuota: 10, Status: common.TokenStatusEnabled}
+	user := User{Id: 399, Username: "quota-override-outbox-rollback", Quota: 100, Status: common.UserStatusEnabled}
 	require.NoError(t, DB.Create(&user).Error)
-	require.NoError(t, DB.Create(&token).Error)
-	client, _ := useFailingCacheMutationRedis(t, 2)
-	cacheUserForRetryTest(t, client, user)
-	cacheTokenForRetryTest(t, client, token)
+	useFailingUserUpdateRedis(t)
+	failCacheOutboxInserts(t)
 
-	require.NoError(t, DecreaseTokenAndUserQuota(token.Id, user.Id, token.Key, 1))
-	requireCacheKeyDeletedEventually(t, client, getTokenCacheKey(token.Key))
+	err := OverrideUserQuota(user.Id, 25)
+
+	require.Error(t, err)
+	var stored User
+	require.NoError(t, DB.First(&stored, user.Id).Error)
+	assert.EqualValues(t, 100, stored.Quota)
+}
+
+func TestUserAuthFieldMutationsRetryCacheInvalidation(t *testing.T) {
+	setupUserUpdateTestState(t)
+	user := User{Id: 82, Username: "auth-cache-retry-user", Quota: 10, Status: common.UserStatusEnabled, Role: common.RoleCommonUser}
+	require.NoError(t, DB.Create(&user).Error)
+	client, _ := useFailingCacheMutationRedis(t, 1)
+	cacheUserForRetryTest(t, client, user)
+
+	user.Status = common.UserStatusDisabled
+	require.NoError(t, user.UpdateFields(false, UserUpdateFieldStatus))
+	processCacheInvalidationTasks()
 	requireCacheKeyDeletedEventually(t, client, getUserCacheKey(user.Id))
+}
+
+func TestUserMutationRollsBackWhenCacheOutboxCannotPersist(t *testing.T) {
+	setupUserUpdateTestState(t)
+	user := User{Id: 93, Username: "cache-outbox-user", Quota: 10, Status: common.UserStatusEnabled}
+	require.NoError(t, DB.Create(&user).Error)
+	useFailingUserUpdateRedis(t)
+	failCacheOutboxInserts(t)
+
+	user.Status = common.UserStatusDisabled
+	err := user.UpdateFields(false, UserUpdateFieldStatus)
+
+	require.Error(t, err)
+	var stored User
+	require.NoError(t, DB.First(&stored, user.Id).Error)
+	assert.Equal(t, common.UserStatusEnabled, stored.Status)
+}
+
+func TestDirectUserMutationsRollBackWhenCacheOutboxCannotPersist(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*User) error
+		check  func(*testing.T, User)
+	}{
+		{
+			name: "edit",
+			mutate: func(user *User) error {
+				user.DisplayName = "after"
+				return user.Edit(false)
+			},
+			check: func(t *testing.T, stored User) { assert.Equal(t, "before", stored.DisplayName) },
+		},
+		{
+			name: "clear binding",
+			mutate: func(user *User) error {
+				return user.ClearBinding("github")
+			},
+			check: func(t *testing.T, stored User) { assert.Equal(t, "github-before", stored.GitHubId) },
+		},
+		{
+			name: "bind email",
+			mutate: func(user *User) error {
+				return BindEmailToUser(user, "after@example.com")
+			},
+			check: func(t *testing.T, stored User) { assert.Equal(t, "before@example.com", stored.Email) },
+		},
+		{
+			name: "github migration",
+			mutate: func(user *User) error {
+				return user.UpdateGitHubId("github-after")
+			},
+			check: func(t *testing.T, stored User) { assert.Equal(t, "github-before", stored.GitHubId) },
+		},
+		{
+			name: "setting",
+			mutate: func(user *User) error {
+				return UpdateUserSetting(user.Id, dto.UserSetting{Language: "zh"})
+			},
+			check: func(t *testing.T, stored User) { assert.Equal(t, `{"language":"en"}`, stored.Setting) },
+		},
+	}
+
+	for index, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setupUserUpdateTestState(t)
+			user := User{
+				Id:          320 + index,
+				Username:    "direct-outbox-" + tt.name,
+				DisplayName: "before",
+				Email:       "before@example.com",
+				GitHubId:    "github-before",
+				Setting:     `{"language":"en"}`,
+				Status:      common.UserStatusEnabled,
+			}
+			require.NoError(t, DB.Create(&user).Error)
+			useFailingUserUpdateRedis(t)
+			failCacheOutboxInserts(t)
+
+			require.Error(t, tt.mutate(&user))
+			var stored User
+			require.NoError(t, DB.First(&stored, user.Id).Error)
+			tt.check(t, stored)
+		})
+	}
+}
+
+func TestTokenMutationRollsBackWhenCacheOutboxCannotPersist(t *testing.T) {
+	setupUserUpdateTestState(t)
+	token := Token{Id: 94, UserId: 95, Key: "cache-outbox-token", Status: common.TokenStatusEnabled, RemainQuota: 10}
+	require.NoError(t, DB.Create(&token).Error)
+	useFailingUserUpdateRedis(t)
+	failCacheOutboxInserts(t)
+
+	token.Status = common.TokenStatusDisabled
+	err := token.Update()
+
+	require.Error(t, err)
+	var stored Token
+	require.NoError(t, DB.First(&stored, token.Id).Error)
+	assert.Equal(t, common.TokenStatusEnabled, stored.Status)
 }
 
 func TestTokenQuotaMutationRetriesCacheInvalidation(t *testing.T) {
@@ -470,6 +700,7 @@ func TestTokenDeleteRetriesCacheDeletion(t *testing.T) {
 	cacheTokenForRetryTest(t, client, token)
 
 	require.NoError(t, token.Delete())
+	processCacheInvalidationTasks()
 	requireCacheKeyDeletedEventually(t, client, getTokenCacheKey(token.Key))
 }
 
@@ -481,6 +712,7 @@ func TestUpdateUserSettingRetriesCacheInvalidation(t *testing.T) {
 	cacheUserForRetryTest(t, client, user)
 
 	require.NoError(t, UpdateUserSetting(user.Id, dto.UserSetting{Language: "zh"}))
+	processCacheInvalidationTasks()
 	requireCacheKeyDeletedEventually(t, client, getUserCacheKey(user.Id))
 }
 
@@ -489,19 +721,22 @@ func TestUserDeletesRetryCacheDeletionAfterDatabaseCommit(t *testing.T) {
 		name       string
 		userID     int
 		deleteUser func(*User) error
-		wantRows   int64
+		wantUsers  int64
+		wantTokens int64
 	}{
 		{
 			name:       "soft delete",
 			userID:     93,
 			deleteUser: (*User).Delete,
-			wantRows:   1,
+			wantUsers:  1,
+			wantTokens: 1,
 		},
 		{
 			name:       "hard delete",
 			userID:     94,
 			deleteUser: (*User).HardDelete,
-			wantRows:   0,
+			wantUsers:  0,
+			wantTokens: 0,
 		},
 	}
 
@@ -510,19 +745,39 @@ func TestUserDeletesRetryCacheDeletionAfterDatabaseCommit(t *testing.T) {
 			setupUserUpdateTestState(t)
 			user := User{Id: tt.userID, Username: "delete-cache-retry-user-" + tt.name, Status: common.UserStatusEnabled}
 			require.NoError(t, DB.Create(&user).Error)
+			token := Token{Id: tt.userID + 1000, UserId: user.Id, Key: "delete-cache-token-" + tt.name, Status: common.TokenStatusEnabled}
+			require.NoError(t, DB.Create(&token).Error)
 			client, _ := useFailingCacheMutationRedis(t, 1)
 			cacheUserForRetryTest(t, client, user)
+			cacheTokenForRetryTest(t, client, token)
 
 			require.NoError(t, tt.deleteUser(&user))
+			processCacheInvalidationTasks()
 			var count int64
 			require.NoError(t, DB.Unscoped().Model(&User{}).Where("id = ?", user.Id).Count(&count).Error)
-			assert.Equal(t, tt.wantRows, count)
+			assert.Equal(t, tt.wantUsers, count)
+			require.NoError(t, DB.Unscoped().Model(&Token{}).Where("id = ?", token.Id).Count(&count).Error)
+			assert.Equal(t, tt.wantTokens, count)
 			requireCacheKeyDeletedEventually(t, client, getUserCacheKey(user.Id))
+			requireCacheKeyDeletedEventually(t, client, getTokenCacheKey(token.Key))
 		})
 	}
 }
 
-func TestTokenDeleteRetriesUntilCacheRecovers(t *testing.T) {
+func TestUserDeleteRollsBackWhenCacheOutboxCannotPersist(t *testing.T) {
+	setupUserUpdateTestState(t)
+	user := User{Id: 395, Username: "delete-outbox-rollback", Status: common.UserStatusEnabled}
+	require.NoError(t, DB.Create(&user).Error)
+	useFailingUserUpdateRedis(t)
+	failCacheOutboxInserts(t)
+
+	require.Error(t, user.Delete())
+	var count int64
+	require.NoError(t, DB.Unscoped().Model(&User{}).Where("id = ?", user.Id).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+}
+
+func TestTokenDeletePersistsUntilCacheRecovers(t *testing.T) {
 	setupUserUpdateTestState(t)
 	token := Token{Id: 91, UserId: 92, Key: "token-delete-cache-recovery", RemainQuota: 10, Status: common.TokenStatusEnabled}
 	require.NoError(t, DB.Create(&token).Error)
@@ -544,12 +799,15 @@ func TestTokenDeleteRetriesUntilCacheRecovers(t *testing.T) {
 	cacheTokenForRetryTest(t, client, token)
 
 	require.NoError(t, token.Delete())
-	require.Eventually(t, func() bool { return hook.seen.Load() >= 4 }, 2*time.Second, 10*time.Millisecond)
 	exists, err := client.Exists(context.Background(), getTokenCacheKey(token.Key)).Result()
 	require.NoError(t, err)
 	require.EqualValues(t, 1, exists)
+	var pending int64
+	require.NoError(t, DB.Model(&CacheInvalidationTask{}).Count(&pending).Error)
+	require.EqualValues(t, 1, pending)
 
 	hook.available.Store(true)
+	processCacheInvalidationTasks()
 	requireCacheKeyDeletedEventually(t, client, getTokenCacheKey(token.Key))
 }
 
@@ -594,7 +852,24 @@ func TestBatchTokenDeleteRetriesCacheDeletion(t *testing.T) {
 	deleted, err := BatchDeleteTokens([]int{token.Id}, token.UserId)
 	require.NoError(t, err)
 	require.Equal(t, 1, deleted)
+	processCacheInvalidationTasks()
 	requireCacheKeyDeletedEventually(t, client, getTokenCacheKey(token.Key))
+}
+
+func TestBatchTokenDeleteRollsBackWhenCacheOutboxCannotPersist(t *testing.T) {
+	setupUserUpdateTestState(t)
+	token := Token{Id: 397, UserId: 398, Key: "batch-token-delete-outbox-rollback", RemainQuota: 10, Status: common.TokenStatusEnabled}
+	require.NoError(t, DB.Create(&token).Error)
+	useFailingUserUpdateRedis(t)
+	failCacheOutboxInserts(t)
+
+	deleted, err := BatchDeleteTokens([]int{token.Id}, token.UserId)
+
+	require.Error(t, err)
+	require.Zero(t, deleted)
+	var count int64
+	require.NoError(t, DB.Model(&Token{}).Where("id = ?", token.Id).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
 }
 
 func newBlockingCacheFillHook() *blockingCacheFillHook {
@@ -687,6 +962,30 @@ func TestUserQuotaInvalidationRejectsOlderAsyncRefill(t *testing.T) {
 	}, 3*time.Second, 10*time.Millisecond)
 }
 
+func TestUserQuotaMutationPendingInvalidationBypassesStaleCache(t *testing.T) {
+	setupUserUpdateTestState(t)
+	user := User{Id: 39, Username: "quota-pending-invalidation-user", Quota: 100, Status: common.UserStatusEnabled}
+	require.NoError(t, DB.Create(&user).Error)
+	client := useCacheMutationRedis(t)
+	cacheUserForRetryTest(t, client, user)
+	hook := newBlockingCacheInvalidationHook()
+	client.AddHook(hook)
+	done := make(chan error, 1)
+
+	go func() {
+		done <- IncreaseUserQuota(user.Id, 10, false)
+	}()
+	waitForCacheHook(t, hook.started, "invalidation start")
+	t.Cleanup(hook.unblock)
+
+	quota, err := GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	assert.EqualValues(t, 110, quota)
+
+	hook.unblock()
+	require.NoError(t, <-done)
+}
+
 func TestUserGroupInvalidationRejectsOlderNarrowRefill(t *testing.T) {
 	setupUserUpdateTestState(t)
 	hook, _ := useBlockingCacheFillRedis(t)
@@ -730,6 +1029,29 @@ func TestTokenQuotaInvalidationRejectsOlderAsyncRefill(t *testing.T) {
 		cached, err := client.HGet(context.Background(), getTokenCacheKey(token.Key), "RemainQuota").Int64()
 		return err == nil && cached == 90
 	}, 3*time.Second, 10*time.Millisecond)
+}
+
+func TestTokenPendingInvalidationBypassesStaleCache(t *testing.T) {
+	setupUserUpdateTestState(t)
+	client := useCacheMutationRedis(t)
+	token := Token{Id: 38, UserId: 36, Key: "token-pending-cache", RemainQuota: 90, Status: common.TokenStatusEnabled}
+	require.NoError(t, DB.Create(&token).Error)
+	staleToken := token
+	staleToken.RemainQuota = 100
+	cacheTokenForRetryTest(t, client, staleToken)
+	_, err := upsertCacheInvalidationTask(
+		DB,
+		cacheInvalidationKindToken,
+		getTokenCacheKey(token.Key),
+		getTokenCacheVersionKey(token.Key),
+		false,
+		nil,
+	)
+	require.NoError(t, err)
+
+	got, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	assert.EqualValues(t, 90, got.RemainQuota)
 }
 
 func setupUserUpdateTestState(t *testing.T) {
@@ -1057,6 +1379,62 @@ func TestUserFieldUpdateWaitsForOAuthIdentityMigrationLock(t *testing.T) {
 	assert.Equal(t, "existing", stored.GitHubId)
 }
 
+func TestAccessTokenUpdateDoesNotWaitForOAuthIdentityMigrationLock(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	useSQLiteUserMigrationTestDB(t, db)
+	require.NoError(t, db.AutoMigrate(&User{}))
+	oldRedisEnabled := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = oldRedisEnabled })
+
+	user := User{Id: 231, Username: "access-token-lock", AffCode: "atl", Status: common.UserStatusEnabled}
+	user.SetAccessToken("before-token")
+	require.NoError(t, DB.Create(&user).Error)
+	user.SetAccessToken("after-token")
+
+	userOAuthIdentityLockMu.Lock()
+	locked := true
+	t.Cleanup(func() {
+		if locked {
+			userOAuthIdentityLockMu.Unlock()
+		}
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- user.UpdateFields(false, UserUpdateFieldAccessToken)
+	}()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(200 * time.Millisecond):
+		userOAuthIdentityLockMu.Unlock()
+		locked = false
+		err := <-done
+		require.NoError(t, err)
+		t.Fatal("access token update waited for OAuth identity migration lock")
+	}
+
+	userOAuthIdentityLockMu.Unlock()
+	locked = false
+	var stored User
+	require.NoError(t, DB.First(&stored, user.Id).Error)
+	assert.Equal(t, "after-token", stored.GetAccessToken())
+}
+
+func TestPartialUserUpdateValuesDoNotWriteUnspecifiedAccessToken(t *testing.T) {
+	current := User{Id: 232, Username: "partial-token-current", DisplayName: "before", Status: common.UserStatusEnabled}
+	current.SetAccessToken("current-token")
+	newUser := User{Id: current.Id, DisplayName: "after"}
+
+	updates := buildUserUpdateValues(current, newUser, false, UserUpdateFieldDisplayName)
+
+	assert.Equal(t, "after", updates["display_name"])
+	assert.NotContains(t, updates, "access_token")
+}
+
 func TestUserUpdateDoesNotOverwriteAccountingFields(t *testing.T) {
 	setupUserUpdateTestState(t)
 
@@ -1070,6 +1448,7 @@ func TestUserUpdateDoesNotOverwriteAccountingFields(t *testing.T) {
 		UsedQuota:    20,
 		RequestCount: 3,
 	}
+	user.SetAccessToken("stale-token")
 	require.NoError(t, DB.Create(&user).Error)
 
 	staleUser, err := GetUserById(user.Id, true)
@@ -1079,6 +1458,7 @@ func TestUserUpdateDoesNotOverwriteAccountingFields(t *testing.T) {
 		"quota":         gorm.Expr("quota - ?", 400),
 		"used_quota":    gorm.Expr("used_quota + ?", 400),
 		"request_count": gorm.Expr("request_count + ?", 1),
+		"access_token":  "fresh-token",
 	}).Error)
 
 	staleUser.DisplayName = "after"
@@ -1090,6 +1470,7 @@ func TestUserUpdateDoesNotOverwriteAccountingFields(t *testing.T) {
 	assert.EqualValues(t, 600, got.Quota)
 	assert.EqualValues(t, 420, got.UsedQuota)
 	assert.Equal(t, 4, got.RequestCount)
+	assert.Equal(t, "fresh-token", got.GetAccessToken())
 }
 
 func TestUserUpdatePersistsZeroValueProfileFields(t *testing.T) {

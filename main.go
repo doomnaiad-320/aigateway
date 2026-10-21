@@ -30,6 +30,7 @@ import (
 	"github.com/MAX-API-Next/MAX-API/service"
 	_ "github.com/MAX-API-Next/MAX-API/setting/performance_setting"
 	"github.com/MAX-API-Next/MAX-API/setting/ratio_setting"
+	"github.com/MAX-API-Next/MAX-API/setting/system_setting"
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-contrib/sessions"
@@ -69,10 +70,16 @@ func main() {
 			common.FatalLog("failed to close database: " + err.Error())
 		}
 	}()
+	backgroundCtx, stopBackground := context.WithCancel(context.Background())
+	defer stopBackground()
+
+	// Recover durable balance settlements after process restarts or transient DB failures.
+	model.StartBillingSettlementTaskRunner()
 
 	if common.RedisEnabled {
 		// for compatibility with old versions
 		common.MemoryCacheEnabled = true
+		model.StartCacheInvalidationTaskRunner()
 	}
 	if common.MemoryCacheEnabled {
 		common.SysLog("memory cache enabled")
@@ -121,8 +128,12 @@ func main() {
 	// System instance heartbeat for multi-node operations visibility
 	service.StartSystemInstanceReporter()
 
+	// Proactively detect sustained system resource pressure and notify admins.
+	service.StartSmartOpsAlertMonitor()
+
 	// Persistent system maintenance task runner
 	service.StartSystemTaskRunner()
+	authFlowCleanupDone := service.StartAuthFlowCleanupWithContext(backgroundCtx)
 
 	// Wire task polling adaptor factory (breaks service -> relay import cycle)
 	service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor {
@@ -150,11 +161,17 @@ func main() {
 		model.InitBatchUpdater()
 	}
 
+	var cpuMonitorDone <-chan struct{}
 	if os.Getenv("ENABLE_PPROF") == "true" {
 		gopool.Go(func() {
 			log.Println(http.ListenAndServe("0.0.0.0:8005", nil))
 		})
-		go common.Monitor()
+		done := make(chan struct{})
+		cpuMonitorDone = done
+		go func() {
+			defer close(done)
+			common.MonitorContext(backgroundCtx)
+		}()
 		common.SysLog("pprof enabled")
 	}
 
@@ -184,14 +201,11 @@ func main() {
 	server.Use(middleware.I18n())
 	middleware.SetUpLogger(server)
 	// Initialize session store
+	if err := configureSessionCookieSecure(system_setting.ServerAddress); err != nil {
+		common.FatalLog(err.Error())
+	}
 	store := cookie.NewStore([]byte(common.SessionSecret))
-	store.Options(sessions.Options{
-		Path:     "/",
-		MaxAge:   2592000, // 30 days
-		HttpOnly: true,
-		Secure:   common.SessionCookieSecure,
-		SameSite: http.SameSiteStrictMode,
-	})
+	store.Options(sessionCookieOptions())
 	server.Use(sessions.Sessions("session", store))
 
 	InjectUmamiAnalytics()
@@ -233,7 +247,27 @@ func main() {
 	shutdownTimeout := time.Duration(common.GetEnvOrDefault("SHUTDOWN_TIMEOUT_SECONDS", 120)) * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
+	stopBackground()
 	shutdownHTTPServer(ctx, srv)
+	waitForBackgroundRunner(ctx, "auth flow cleanup", authFlowCleanupDone)
+	waitForBackgroundRunner(ctx, "CPU profile monitor", cpuMonitorDone)
+	if err := common.StopSystemMonitor(ctx); err != nil {
+		common.SysError(fmt.Sprintf("timed out stopping system monitor: %v", err))
+	}
+	if err := service.StopSmartOpsAlertMonitor(ctx); err != nil {
+		common.SysError(fmt.Sprintf("timed out stopping smart ops alert monitor: %v", err))
+	}
+	if err := middleware.StopInMemoryRateLimiter(ctx); err != nil {
+		common.SysError(fmt.Sprintf("timed out stopping in-memory rate limiter: %v", err))
+	}
+	if err := model.StopBillingSettlementTaskRunner(ctx); err != nil {
+		common.SysError(fmt.Sprintf("timed out stopping billing settlement runner: %v", err))
+	}
+	if common.RedisEnabled {
+		if err := model.StopCacheInvalidationTaskRunner(ctx); err != nil {
+			common.SysError(fmt.Sprintf("timed out stopping cache invalidation runner: %v", err))
+		}
+	}
 	if common.DataExportEnabled {
 		saveTimeout := time.Duration(common.GetEnvOrDefault("QUOTA_DATA_CACHE_SAVE_TIMEOUT_SECONDS", 30)) * time.Second
 		if !runWithTimeout(saveTimeout, model.WaitPendingLogQuotaData) {
@@ -253,12 +287,58 @@ func main() {
 	common.SysLog("server exited")
 }
 
+func sessionCookieOptions() sessions.Options {
+	return sessions.Options{
+		Path:     "/",
+		MaxAge:   2592000, // 30 days
+		HttpOnly: true,
+		Secure:   common.SessionCookieSecure,
+		// OAuth providers return through a cross-site top-level GET redirect.
+		SameSite: http.SameSiteLaxMode,
+	}
+}
+
+func configureSessionCookieSecure(serverAddress string) error {
+	value, explicitlyConfigured := os.LookupEnv("SESSION_COOKIE_SECURE")
+	value = strings.TrimSpace(value)
+	if explicitlyConfigured && value != "" {
+		secure, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("invalid SESSION_COOKIE_SECURE value %q: %w", value, err)
+		}
+		common.SessionCookieSecure = secure
+		return nil
+	}
+
+	common.SessionCookieSecure = common.SessionCookieSecureForServerAddress(serverAddress)
+	if !common.SessionCookieSecure {
+		common.SysLog("SESSION_COOKIE_SECURE is not set and ServerAddress is not HTTPS; session cookies may traverse plain HTTP. Set SESSION_COOKIE_SECURE=true for HTTPS deployments")
+	}
+	return nil
+}
+
 func shutdownHTTPServer(ctx context.Context, srv *http.Server) {
 	if err := srv.Shutdown(ctx); err != nil {
 		common.SysError(fmt.Sprintf("server forced to shutdown: %v", err))
 		if closeErr := srv.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
 			common.SysError(fmt.Sprintf("server close after forced shutdown failed: %v", closeErr))
 		}
+	}
+}
+
+func waitForBackgroundRunner(ctx context.Context, name string, done <-chan struct{}) {
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+		return
+	default:
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		common.SysError(fmt.Sprintf("timed out stopping %s: %v", name, ctx.Err()))
 	}
 }
 

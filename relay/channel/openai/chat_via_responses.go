@@ -56,9 +56,13 @@ func OaiResponsesToChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 
+	if terminalErr := responsesTerminalError(&responsesResp, resp.StatusCode, false); terminalErr != nil {
+		return nil, terminalErr
+	}
 	if oaiError := responsesResp.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
+	observeResponsesOutputs(info, responsesResp.Output)
 
 	chatId := helper.GetResponseID(c)
 	chatResp, usage, err := service.ResponsesResponseToChatCompletionsResponse(&responsesResp, chatId)
@@ -107,11 +111,19 @@ func OaiResponsesToChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 }
 
 func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.MaxAPIError) {
+	info.EnableFirstResultTracking()
 	if resp == nil || resp.Body == nil {
 		return nil, types.NewOpenAIError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
 	}
 
 	defer service.CloseResponseBodyGracefully(resp)
+	writeObserver := &chatStreamWriteObserver{ResponseWriter: c.Writer}
+	c.Writer = writeObserver
+	defer func() {
+		if writeObserver.err == nil {
+			c.Writer = writeObserver.ResponseWriter
+		}
+	}()
 
 	responseId := helper.GetResponseID(c)
 	createAt := time.Now().Unix()
@@ -126,6 +138,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		sentStop                bool
 		sawToolCall             bool
 		hasVisiblePayload       bool
+		outputDelivered         bool
+		deliveredUsageText      strings.Builder
+		usageReported           bool
 		emptyCompletionRecorded bool
 		streamErr               *types.MaxAPIError
 	)
@@ -147,11 +162,39 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		if chunk == nil {
 			return true
 		}
+		recordFirstResult := func() {
+			firstResult := false
+			for _, choice := range chunk.Choices {
+				content, reasoning := choice.Delta.GetContentString(), choice.Delta.GetReasoningContent()
+				if content != "" || reasoning != "" || len(choice.Delta.ToolCalls) > 0 {
+					outputDelivered = true
+					deliveredUsageText.WriteString(content)
+					deliveredUsageText.WriteString(reasoning)
+					for _, tool := range choice.Delta.ToolCalls {
+						deliveredUsageText.WriteString(tool.Function.Name)
+						deliveredUsageText.WriteString(tool.Function.Arguments)
+					}
+				}
+				if strings.TrimSpace(choice.Delta.GetContentString()) != "" ||
+					strings.TrimSpace(choice.Delta.GetReasoningContent()) != "" || len(choice.Delta.ToolCalls) > 0 {
+					firstResult = true
+				}
+			}
+			if firstResult {
+				info.SetFirstResultTime()
+			}
+		}
 		if info.RelayFormat == types.RelayFormatOpenAI {
+			info.SendResponseCount++
 			if err := helper.ObjectData(c, chunk); err != nil {
 				streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 				return false
 			}
+			if writeObserver.err != nil {
+				streamErr = types.NewOpenAIError(writeObserver.err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+				return false
+			}
+			recordFirstResult()
 			return true
 		}
 
@@ -164,6 +207,11 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 			return false
 		}
+		if writeObserver.err != nil {
+			streamErr = types.NewOpenAIError(writeObserver.err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			return false
+		}
+		recordFirstResult()
 		return true
 	}
 
@@ -254,10 +302,6 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		if callID == "" {
 			return true
 		}
-		if outputText.Len() > 0 {
-			// Prefer streaming assistant text over tool calls to match non-stream behavior.
-			return true
-		}
 		if !sendStartIfNeeded() {
 			return false
 		}
@@ -326,8 +370,15 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		var streamResp dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResp); err != nil {
 			logger.LogError(c, "failed to unmarshal responses stream event: "+err.Error())
-			sr.Error(err)
+			streamErr = types.NewError(err, types.ErrorCodeBadResponseBody)
+			sr.Stop(streamErr)
 			return
+		}
+		if streamResp.Response != nil && (helper.HasUsageTokenFields(data, "response.usage", "input_tokens", "output_tokens") ||
+			helper.HasUsageTokenFields(data, "response.usage", "prompt_tokens", "completion_tokens")) {
+			applyResponsesUsage(usage, streamResp.Response.Usage)
+			usage.BillingUsage = dto.NewReportedOpenAIResponsesBillingUsage(usage)
+			usageReported = true
 		}
 
 		switch streamResp.Type {
@@ -420,8 +471,11 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			if streamResp.Item == nil {
 				break
 			}
-			if streamResp.Item.Type != "function_call" {
+			if streamResp.Item.Type != dto.BuildInCallFunctionCall && streamResp.Item.Type != dto.BuildInCallCustomToolCall {
 				break
+			}
+			if streamResp.Type == dto.ResponsesOutputTypeItemDone {
+				observeResponsesToolOutput(info, streamResp.Item, streamResp.OutputIndex)
 			}
 
 			itemID := strings.TrimSpace(streamResp.Item.ID)
@@ -454,7 +508,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 				return
 			}
 
-		case "response.function_call_arguments.delta":
+		case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
 			itemID := strings.TrimSpace(streamResp.ItemID)
 			callID := toolCallCanonicalIDByItemID[itemID]
 			if callID == "" {
@@ -469,11 +523,25 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 				return
 			}
 
-		case "response.function_call_arguments.done":
+		case "response.function_call_arguments.done", "response.custom_tool_call_input.done":
 
-		case "response.completed":
+		case "response.completed", "response.done", "response.incomplete":
+			if streamResp.Type == "response.incomplete" {
+				if streamResp.Response == nil {
+					streamResp.Response = &dto.OpenAIResponsesResponse{}
+				}
+				if len(streamResp.Response.Status) == 0 {
+					streamResp.Response.Status = []byte(`"incomplete"`)
+				}
+			}
 			completedOutputTypes := []string(nil)
 			if streamResp.Response != nil {
+				if terminalErr := responsesTerminalError(streamResp.Response, http.StatusInternalServerError, info.SendResponseCount > 0); terminalErr != nil {
+					streamErr = terminalErr
+					sr.Stop(streamErr)
+					return
+				}
+				observeResponsesOutputs(info, streamResp.Response.Output)
 				completedOutputTypes = responsesOutputTypes(streamResp.Response)
 				if streamResp.Response.Model != "" {
 					model = streamResp.Response.Model
@@ -481,7 +549,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 				if streamResp.Response.CreatedAt != 0 {
 					createAt = int64(streamResp.Response.CreatedAt)
 				}
-				if streamResp.Response.Usage != nil {
+				if streamResp.Response.Usage != nil && !usageReported {
 					usage = openaicompat.UsageFromResponsesUsage(streamResp.Response.Usage)
 				}
 				if outputText.Len() == 0 {
@@ -515,20 +583,21 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 						hasVisiblePayload = true
 					}
 				}
-				if !sawToolCall {
-					for _, out := range streamResp.Response.Output {
-						if out.Type != "function_call" {
-							continue
-						}
-						itemID := strings.TrimSpace(out.ID)
-						callID := strings.TrimSpace(out.CallId)
-						if callID == "" {
-							callID = itemID
-						}
-						if !sendToolCallDelta(callID, strings.TrimSpace(out.Name), out.ArgumentsString()) {
-							sr.Stop(streamErr)
-							return
-						}
+				for _, out := range streamResp.Response.Output {
+					if out.Type != dto.BuildInCallFunctionCall && out.Type != dto.BuildInCallCustomToolCall {
+						continue
+					}
+					itemID := strings.TrimSpace(out.ID)
+					callID := strings.TrimSpace(out.CallId)
+					if callID == "" {
+						callID = itemID
+					}
+					if _, alreadyEmitted := toolCallIndexByID[callID]; alreadyEmitted {
+						continue
+					}
+					if !sendToolCallDelta(callID, strings.TrimSpace(out.Name), out.ArgumentsString()) {
+						sr.Stop(streamErr)
+						return
 					}
 				}
 				if streamResp.Response.HasImageGenerationCall() {
@@ -554,7 +623,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 					info.ClaudeConvertInfo.Usage = usage
 				}
 				finishReason := "stop"
-				if sawToolCall && outputText.Len() == 0 {
+				if mappedReason, ok := openaicompat.ResponsesFinishReasonFromStatus(streamResp.Response); ok {
+					finishReason = mappedReason
+				} else if sawToolCall {
 					finishReason = "tool_calls"
 				}
 				stop := helper.GenerateStopResponse(responseId, createAt, model, finishReason)
@@ -565,15 +636,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 				sentStop = true
 			}
 
-		case "response.error", "response.failed":
-			if streamResp.Response != nil {
-				if oaiErr := streamResp.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {
-					streamErr = types.WithOpenAIError(*oaiErr, http.StatusInternalServerError)
-					sr.Stop(streamErr)
-					return
-				}
-			}
-			streamErr = types.NewOpenAIError(fmt.Errorf("responses stream error: %s", streamResp.Type), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+		case "error", "response.error", "response.failed", "response.cancelled", "response.canceled":
+			skipRetry := info.SendResponseCount > 0
+			streamErr = responsesStreamTerminalError(&streamResp, skipRetry)
 			sr.Stop(streamErr)
 			return
 
@@ -581,7 +646,26 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		}
 	})
 
+	if apiErr := helper.FirstResultTimeoutError(c, info); apiErr != nil {
+		if outputDelivered && info.RelayFormat == types.RelayFormatOpenAI {
+			if !usageReported {
+				usage = service.ResponseText2Usage(c, deliveredUsageText.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+			}
+			return usage, apiErr
+		}
+		return nil, apiErr
+	}
+
 	if streamErr != nil {
+		if c.Writer.Written() {
+			types.ErrOptionWithSkipRetry()(streamErr)
+		}
+		if outputDelivered && info.RelayFormat == types.RelayFormatOpenAI {
+			if !usageReported {
+				usage = service.ResponseText2Usage(c, deliveredUsageText.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+			}
+			return usage, streamErr
+		}
 		return nil, streamErr
 	}
 	if !hasVisiblePayload && !emptyCompletionRecorded {
@@ -590,8 +674,22 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			return nil, retryErr
 		}
 	}
+	if !sentStop {
+		reason := "upstream_eof"
+		if info.StreamStatus != nil && info.StreamStatus.IsAbnormalEnd() {
+			reason = string(info.StreamStatus.EndReason)
+		}
+		apiErr := openaicompat.NewResponsesStreamIncompleteError(reason)
+		if outputDelivered && info.RelayFormat == types.RelayFormatOpenAI {
+			if !usageReported {
+				usage = service.ResponseText2Usage(c, deliveredUsageText.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+			}
+			return usage, apiErr
+		}
+		return nil, apiErr
+	}
 
-	if usage.TotalTokens == 0 {
+	if !usageReported && usage.TotalTokens == 0 {
 		usage = service.ResponseText2Usage(c, usageText.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 	}
 
@@ -605,7 +703,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			info.ClaudeConvertInfo.Usage = usage
 		}
 		finishReason := "stop"
-		if sawToolCall && outputText.Len() == 0 {
+		if sawToolCall {
 			finishReason = "tool_calls"
 		}
 		stop := helper.GenerateStopResponse(responseId, createAt, model, finishReason)

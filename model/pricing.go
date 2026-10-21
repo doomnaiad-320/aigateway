@@ -1,15 +1,16 @@
 package model
 
 import (
-	"encoding/json"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
-
 	"sync"
 	"time"
 
 	"github.com/MAX-API-Next/MAX-API/common"
 	"github.com/MAX-API-Next/MAX-API/constant"
+	"github.com/MAX-API-Next/MAX-API/dto"
 	"github.com/MAX-API-Next/MAX-API/setting/billing_setting"
 	"github.com/MAX-API-Next/MAX-API/setting/ratio_setting"
 	"github.com/MAX-API-Next/MAX-API/setting/task_billing_setting"
@@ -41,22 +42,37 @@ type Pricing struct {
 }
 
 type TaskRateCardPricing struct {
-	RuleKey         string                   `json:"rule_key,omitempty"`
-	Vendor          string                   `json:"vendor,omitempty"`
-	Unit            string                   `json:"unit,omitempty"`
-	QuantityField   string                   `json:"quantity_field,omitempty"`
-	DefaultQuantity float64                  `json:"default_quantity,omitempty"`
-	Strict          bool                     `json:"strict"`
-	Defaults        map[string]string        `json:"defaults,omitempty"`
-	MinUnitPrice    float64                  `json:"min_unit_price"`
-	MaxUnitPrice    float64                  `json:"max_unit_price"`
-	Rows            []TaskRateCardPricingRow `json:"rows"`
+	RuleKey         string                         `json:"rule_key,omitempty"`
+	Vendor          string                         `json:"vendor,omitempty"`
+	BillingType     string                         `json:"billing_type,omitempty"`
+	SchemaVersion   int                            `json:"schema_version,omitempty"`
+	Mode            string                         `json:"mode,omitempty"`
+	Currency        string                         `json:"currency,omitempty"`
+	Unit            string                         `json:"unit,omitempty"`
+	QuantityField   string                         `json:"quantity_field,omitempty"`
+	DefaultQuantity float64                        `json:"default_quantity,omitempty"`
+	Strict          bool                           `json:"strict"`
+	Defaults        map[string]string              `json:"defaults,omitempty"`
+	MinUnitPrice    float64                        `json:"min_unit_price"`
+	MaxUnitPrice    float64                        `json:"max_unit_price"`
+	Rows            []TaskRateCardPricingRow       `json:"rows"`
+	Components      []TaskRateCardPricingComponent `json:"components,omitempty"`
 }
 
 type TaskRateCardPricingRow struct {
 	ID        string            `json:"id,omitempty"`
 	Match     map[string]string `json:"match"`
 	UnitPrice float64           `json:"unit_price"`
+}
+
+type TaskRateCardPricingComponent struct {
+	Key          string `json:"key"`
+	Variant      string `json:"variant,omitempty"`
+	Unit         string `json:"unit"`
+	UnitPrice    string `json:"unit_price"`
+	FreeQuantity *int64 `json:"free_quantity,omitempty"`
+	MinQuantity  *int64 `json:"min_quantity,omitempty"`
+	MaxQuantity  *int64 `json:"max_quantity,omitempty"`
 }
 
 type PricingVendor struct {
@@ -126,6 +142,74 @@ func GetModelSupportEndpointTypes(model string) []constant.EndpointType {
 		return endpoints
 	}
 	return make([]constant.EndpointType, 0)
+}
+
+func loadPricingAdvancedCustomConfigs(abilities []AbilityWithChannel) map[int]*dto.AdvancedCustomConfig {
+	channelIDs := make([]int, 0)
+	seen := make(map[int]struct{})
+	for _, ability := range abilities {
+		if ability.ChannelType != constant.ChannelTypeAdvancedCustom {
+			continue
+		}
+		if _, ok := seen[ability.ChannelId]; ok {
+			continue
+		}
+		seen[ability.ChannelId] = struct{}{}
+		channelIDs = append(channelIDs, ability.ChannelId)
+	}
+	if len(channelIDs) == 0 {
+		return nil
+	}
+
+	var channels []*Channel
+	if err := DB.Select("id", "type", "settings").
+		Where("id IN ? AND type = ?", channelIDs, constant.ChannelTypeAdvancedCustom).
+		Find(&channels).Error; err != nil {
+		common.SysError(fmt.Sprintf("failed to load advanced custom pricing configs: %v", err))
+		return nil
+	}
+
+	configs := make(map[int]*dto.AdvancedCustomConfig, len(channels))
+	for _, channel := range channels {
+		config, err := validatedAdvancedCustomConfigFromChannel(channel)
+		if err != nil {
+			common.SysError(fmt.Sprintf("failed to parse advanced custom pricing config: channel_id=%d, error=%v", channel.Id, err))
+			continue
+		}
+		if config != nil {
+			configs[channel.Id] = config
+		}
+	}
+	return configs
+}
+
+func getPricingEndpointTypesForAbility(ability AbilityWithChannel, advancedConfigs map[int]*dto.AdvancedCustomConfig) []constant.EndpointType {
+	if ability.ChannelType != constant.ChannelTypeAdvancedCustom {
+		return common.GetEndpointTypesByChannelType(ability.ChannelType, ability.Model)
+	}
+
+	config := advancedConfigs[ability.ChannelId]
+	if config == nil {
+		return nil
+	}
+	endpointTypes := make([]constant.EndpointType, 0, len(config.Routes))
+	for _, route := range config.Routes {
+		endpointType, ok := common.GetDefaultEndpointTypeByPath(strings.TrimSpace(route.IncomingPath))
+		if !ok {
+			continue
+		}
+		duplicate := false
+		for _, existing := range endpointTypes {
+			if existing == endpointType {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			endpointTypes = append(endpointTypes, endpointType)
+		}
+	}
+	return endpointTypes
 }
 
 func updatePricing() {
@@ -222,11 +306,12 @@ func updatePricing() {
 
 	//这里使用切片而不是Set，因为一个模型可能支持多个端点类型，并且第一个端点是优先使用端点
 	modelSupportEndpointsStr := make(map[string][]string)
+	advancedCustomConfigs := loadPricingAdvancedCustomConfigs(enableAbilities)
 
 	// 先根据已有能力填充原生端点
 	for _, ability := range enableAbilities {
 		endpoints := modelSupportEndpointsStr[ability.Model]
-		channelTypes := common.GetEndpointTypesByChannelType(ability.ChannelType, ability.Model)
+		channelTypes := getPricingEndpointTypesForAbility(ability, advancedCustomConfigs)
 		for _, channelType := range channelTypes {
 			if !common.StringsContains(endpoints, string(channelType)) {
 				endpoints = append(endpoints, string(channelType))
@@ -241,7 +326,7 @@ func updatePricing() {
 			continue
 		}
 		var raw map[string]interface{}
-		if err := json.Unmarshal([]byte(meta.Endpoints), &raw); err == nil {
+		if err := common.Unmarshal([]byte(meta.Endpoints), &raw); err == nil {
 			endpoints := make([]string, 0, len(raw))
 			for k, v := range raw {
 				switch v.(type) {
@@ -285,7 +370,7 @@ func updatePricing() {
 			continue
 		}
 		var raw map[string]interface{}
-		if err := json.Unmarshal([]byte(meta.Endpoints), &raw); err == nil {
+		if err := common.Unmarshal([]byte(meta.Endpoints), &raw); err == nil {
 			for k, v := range raw {
 				switch val := v.(type) {
 				case string:
@@ -386,6 +471,21 @@ func newTaskRateCardPricing(ruleKey string, card *task_billing_setting.RateCard)
 	if card == nil {
 		return nil
 	}
+	if card.BillingType == task_billing_setting.MinimaxBillingType {
+		if structured := newStructuredTaskRateCardPricing(ruleKey, card); structured != nil {
+			return structured
+		}
+		// A malformed structured card should not erase a valid legacy price
+		// payload that may still be present in persisted settings.
+		if len(card.Rows) == 0 {
+			return nil
+		}
+	}
+	if card.BillingType != "" && len(card.Rows) == 0 {
+		return nil
+	}
+	// Unknown structured types must not hide legacy row pricing. This keeps
+	// model pricing visible while the billing type is not yet supported.
 	rows := make([]TaskRateCardPricingRow, len(card.Rows))
 	var minUnitPrice float64
 	var maxUnitPrice float64
@@ -414,6 +514,113 @@ func newTaskRateCardPricing(ruleKey string, card *task_billing_setting.RateCard)
 		MaxUnitPrice:    maxUnitPrice,
 		Rows:            rows,
 	}
+}
+
+func newStructuredTaskRateCardPricing(ruleKey string, card *task_billing_setting.RateCard) *TaskRateCardPricing {
+	if card == nil || card.BillingType != task_billing_setting.MinimaxBillingType {
+		return nil
+	}
+	data, err := common.Marshal(card.BillingConfig)
+	if err != nil {
+		return nil
+	}
+	var config task_billing_setting.H3BillingConfig
+	if err := common.Unmarshal(data, &config); err != nil {
+		return nil
+	}
+
+	resolutions := []string{"768P", "2K"}
+	components := make([]TaskRateCardPricingComponent, 0, 6)
+	var minUnitPrice float64
+	var maxUnitPrice float64
+	for i, resolution := range resolutions {
+		priceText := config.OutputUnitPrice[resolution]
+		price, ok := parseTaskRateCardDisplayPrice(priceText)
+		if !ok {
+			return nil
+		}
+		if i == 0 || price < minUnitPrice {
+			minUnitPrice = price
+		}
+		if i == 0 || price > maxUnitPrice {
+			maxUnitPrice = price
+		}
+		components = append(components, TaskRateCardPricingComponent{
+			Key:         "output_video",
+			Variant:     resolution,
+			Unit:        "second",
+			UnitPrice:   priceText,
+			MinQuantity: pricingInt64Pointer(task_billing_setting.H3MinOutputDurationSeconds),
+			MaxQuantity: pricingInt64Pointer(task_billing_setting.H3MaxOutputDurationSeconds),
+		})
+	}
+	for _, resolution := range resolutions {
+		priceText := config.InputVideoUnitPrice[resolution]
+		if _, ok := parseTaskRateCardDisplayPrice(priceText); !ok {
+			return nil
+		}
+		components = append(components, TaskRateCardPricingComponent{
+			Key:         "input_video",
+			Variant:     resolution,
+			Unit:        "second",
+			UnitPrice:   priceText,
+			MaxQuantity: pricingQuantityLimit(config.InputVideoMaxSeconds),
+		})
+	}
+	if _, ok := parseTaskRateCardDisplayPrice(config.InputImageExtraUnitPrice); !ok {
+		return nil
+	}
+	components = append(components, TaskRateCardPricingComponent{
+		Key:          "input_image",
+		Unit:         "image",
+		UnitPrice:    config.InputImageExtraUnitPrice,
+		FreeQuantity: pricingInt64Pointer(config.InputImageFreeCount),
+		MaxQuantity:  pricingInt64Pointer(task_billing_setting.H3MaxInputImageCount),
+	})
+	if _, ok := parseTaskRateCardDisplayPrice(config.InputAudioUnitPrice); !ok {
+		return nil
+	}
+	components = append(components, TaskRateCardPricingComponent{
+		Key:         "input_audio",
+		Unit:        "second",
+		UnitPrice:   config.InputAudioUnitPrice,
+		MaxQuantity: pricingInt64Pointer(task_billing_setting.H3MaxInputMediaDurationSeconds),
+	})
+
+	return &TaskRateCardPricing{
+		RuleKey:       ruleKey,
+		Vendor:        card.Vendor,
+		BillingType:   card.BillingType,
+		SchemaVersion: config.SchemaVersion,
+		Mode:          config.Mode,
+		Currency:      config.Currency,
+		Unit:          "second",
+		QuantityField: "output_duration",
+		Strict:        true,
+		MinUnitPrice:  minUnitPrice,
+		MaxUnitPrice:  maxUnitPrice,
+		Rows:          make([]TaskRateCardPricingRow, 0),
+		Components:    components,
+	}
+}
+
+func parseTaskRateCardDisplayPrice(value string) (float64, bool) {
+	price, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	if err != nil || math.IsNaN(price) || math.IsInf(price, 0) || price < 0 {
+		return 0, false
+	}
+	return price, true
+}
+
+func pricingInt64Pointer(value int64) *int64 {
+	return &value
+}
+
+func pricingQuantityLimit(value int64) *int64 {
+	if value <= 0 {
+		return nil
+	}
+	return pricingInt64Pointer(value)
 }
 
 func clonePricingStringMap(src map[string]string) map[string]string {

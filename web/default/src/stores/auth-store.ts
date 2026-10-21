@@ -21,6 +21,7 @@ import { create } from 'zustand'
 export type UserPermissions = {
   sidebar_settings?: boolean
   sidebar_modules?: Record<string, unknown>
+  admin_permissions?: Record<string, Record<string, boolean>>
 }
 
 export interface AuthUser {
@@ -51,6 +52,7 @@ export interface AuthUser {
 }
 
 interface AuthState {
+  sessionRevision: number
   auth: {
     user: AuthUser | null
     setUser: (user: AuthUser | null) => void
@@ -58,48 +60,33 @@ interface AuthState {
   }
 }
 
-export const useAuthStore = create<AuthState>()((set) => {
-  // Restore user info from localStorage
-  const initUser = (() => {
-    try {
-      if (typeof window !== 'undefined') {
-        const saved = window.localStorage.getItem('user')
-        return saved ? JSON.parse(saved) : null
-      }
-    } catch {
-      // Clear dirty data when parsing fails
-      if (typeof window !== 'undefined') {
-        window.localStorage.removeItem('user')
-      }
-    }
-    return null
-  })()
-
-  return {
-    auth: {
-      user: initUser,
-      setUser: (user) =>
-        set((state) => {
-          // Persist user to localStorage
-          if (typeof window !== 'undefined') {
-            if (user) {
-              window.localStorage.setItem('user', JSON.stringify(user))
-            } else {
-              window.localStorage.removeItem('user')
-            }
-          }
-          return { ...state, auth: { ...state.auth, user } }
-        }),
-      reset: () =>
-        set((state) => {
-          if (typeof window !== 'undefined') {
-            window.localStorage.removeItem('user')
-          }
-          return {
-            ...state,
-            auth: { ...state.auth, user: null },
-          }
-        }),
-    },
-  }
-})
+export const useAuthStore = create<AuthState>()((set) => ({
+  sessionRevision: 0,
+  auth: {
+    user: null,
+    setUser: (user) =>
+      set((state) => {
+        const previous = state.auth.user
+        const identityChanged =
+          user === null || previous === null
+            ? user !== previous
+            : user.id !== previous.id ||
+              user.role !== previous.role ||
+              user.status !== previous.status ||
+              user.group !== previous.group ||
+              JSON.stringify(user.permissions ?? null) !==
+                JSON.stringify(previous.permissions ?? null)
+        return {
+          ...state,
+          sessionRevision: state.sessionRevision + (identityChanged ? 1 : 0),
+          auth: { ...state.auth, user },
+        }
+      }),
+    reset: () =>
+      set((state) => ({
+        ...state,
+        sessionRevision: state.sessionRevision + 1,
+        auth: { ...state.auth, user: null },
+      })),
+  },
+}))

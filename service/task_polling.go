@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MAX-API-Next/MAX-API/common"
@@ -15,8 +16,10 @@ import (
 	"github.com/MAX-API-Next/MAX-API/dto"
 	"github.com/MAX-API-Next/MAX-API/logger"
 	"github.com/MAX-API-Next/MAX-API/model"
+	"github.com/MAX-API-Next/MAX-API/pkg/taskusage"
 	"github.com/MAX-API-Next/MAX-API/relay/channel/task/taskcommon"
 	relaycommon "github.com/MAX-API-Next/MAX-API/relay/common"
+	"github.com/MAX-API-Next/MAX-API/types"
 
 	"github.com/samber/lo"
 )
@@ -31,56 +34,219 @@ type TaskPollingAdaptor interface {
 	AdjustBillingOnComplete(task *model.Task, taskResult *relaycommon.TaskInfo) int
 }
 
+// taskUsageProvider is an optional provider-specific usage extractor. It is
+// deliberately local to service so the polling package does not import the
+// relay/channel host package and create an import cycle. Usage facts remain
+// evidence only; billing is still owned by the existing settlement path.
+type taskUsageProvider interface {
+	ExtractTaskUsage(responseBody []byte) (*types.TaskUsage, error)
+}
+
+type taskUsageFactProvider interface {
+	UsageContract() types.TaskUsageContract
+	// UsageProducerKind is host-owned provenance. The polling boundary must
+	// validate against this trusted value instead of the envelope's self-report.
+	UsageProducerKind() string
+	ProduceUsage(ctx types.TaskUsageContext) (*types.TaskUsageEnvelope, error)
+}
+
 // GetTaskAdaptorFunc 由 main 包注入，用于获取指定平台的任务适配器。
 // 打破 service -> relay -> relay/channel -> service 的循环依赖。
 var GetTaskAdaptorFunc func(platform constant.TaskPlatform) TaskPollingAdaptor
 
+const legacyTaskRefundCutoff int64 = 1740182400 // 2025-02-22 00:00:00 UTC
+const timedOutTaskTransitionBudget = 100
+
+var timedOutTaskScanBudget = 2000
+
+var timedOutTaskSweepCursor struct {
+	sync.Mutex
+	afterSubmitTime int64
+	afterID         int64
+}
+
+type appliedTaskRecoveryOutcome uint8
+
+const (
+	appliedTaskRecoveryNoEvidence appliedTaskRecoveryOutcome = iota
+	appliedTaskRecoveryUpdated
+	appliedTaskRecoveryCASLost
+)
+
 // sweepTimedOutTasks 在主轮询之前独立清理超时任务。
-// 每次最多处理 100 条，剩余的下个周期继续处理。
+// 每次最多转换 100 条、扫描 2000 条，剩余的从游标位置在下个周期继续处理。
 // 使用 per-task CAS (UpdateWithStatus) 防止覆盖被正常轮询已推进的任务。
 func sweepTimedOutTasks(ctx context.Context) {
 	if constant.TaskTimeoutMinutes <= 0 {
 		return
 	}
 	cutoff := time.Now().Unix() - int64(constant.TaskTimeoutMinutes)*60
-	tasks := model.GetTimedOutUnfinishedTasks(cutoff, 100)
-	if len(tasks) == 0 {
-		return
-	}
-
-	const legacyTaskCutoff int64 = 1740182400 // 2026-02-22 00:00:00 UTC
 	reason := fmt.Sprintf("任务超时（%d分钟）", constant.TaskTimeoutMinutes)
 	legacyReason := "任务超时（旧系统遗留任务，不进行退款，请联系管理员）"
 	now := time.Now().Unix()
 	timedOutCount := 0
+	timedOutTaskSweepCursor.Lock()
+	defer timedOutTaskSweepCursor.Unlock()
 
-	for _, task := range tasks {
-		isLegacy := task.SubmitTime > 0 && task.SubmitTime < legacyTaskCutoff
-
-		oldStatus := task.Status
-		task.Status = model.TaskStatusFailure
-		task.Progress = "100%"
-		task.FinishTime = now
-		if isLegacy {
-			task.FailReason = legacyReason
-		} else {
-			task.FailReason = reason
-		}
-
-		won, err := task.UpdateWithStatus(oldStatus)
-		if err != nil {
-			logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks CAS update error for task %s: %v", task.TaskID, err))
-			continue
-		}
-		if !won {
-			logger.LogInfo(ctx, fmt.Sprintf("sweepTimedOutTasks: task %s already transitioned, skip", task.TaskID))
-			continue
-		}
-		timedOutCount++
-		if !isLegacy && task.Quota != 0 {
-			RefundTaskQuota(ctx, task, reason)
+	remaining := timedOutTaskTransitionBudget
+	scanBudget := timedOutTaskScanBudget
+	if recovered, err := model.GetAppliedTaskFinalizeRecoveryCandidates(cutoff, remaining); err != nil {
+		logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks applied-finalize recovery query error: %v", err))
+	} else {
+		for _, task := range recovered {
+			if remaining <= 0 {
+				break
+			}
+			recoveryOutcome, recoveryErr := recoverAppliedTaskTerminalEvidence(task)
+			if recoveryErr != nil {
+				logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks applied-finalize terminal recovery error for task %s: %v", task.TaskID, recoveryErr))
+				continue
+			}
+			if recoveryOutcome == appliedTaskRecoveryCASLost {
+				continue
+			}
+			if recoveryOutcome == appliedTaskRecoveryNoEvidence {
+				recoveryOutcome, recoveryErr = markAppliedTaskEvidenceMissing(task, now)
+				if recoveryErr != nil {
+					logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks applied-finalize evidence disposition error for task %s: %v", task.TaskID, recoveryErr))
+					continue
+				}
+				if recoveryOutcome == appliedTaskRecoveryCASLost {
+					continue
+				}
+			}
+			if recoveryOutcome == appliedTaskRecoveryUpdated {
+				remaining--
+			}
 		}
 	}
+	afterSubmitTime := timedOutTaskSweepCursor.afterSubmitTime
+	afterID := timedOutTaskSweepCursor.afterID
+	for remaining > 0 && scanBudget > 0 {
+		queryLimit := 100
+		if scanBudget < queryLimit {
+			queryLimit = scanBudget
+		}
+		tasks, queryErr := model.GetTimedOutUnfinishedTasksAfter(cutoff, afterSubmitTime, afterID, queryLimit)
+		if queryErr != nil {
+			logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks query error after cursor (%d, %d): %v", afterSubmitTime, afterID, queryErr))
+			break
+		}
+		if len(tasks) == 0 {
+			afterSubmitTime = 0
+			afterID = 0
+			break
+		}
+		for _, task := range tasks {
+			if remaining <= 0 || scanBudget <= 0 {
+				break
+			}
+			afterSubmitTime = task.SubmitTime
+			afterID = task.ID
+			scanBudget--
+			settlementPending, taskFinalizeApplied, settlementErr := taskTerminalSettlementState(task, true)
+			if settlementErr != nil {
+				logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks settlement lookup error for task %s: %v", task.TaskID, settlementErr))
+				continue
+			}
+			if settlementPending || taskFinalizeApplied {
+				// Pending/manual funding remains operator/retry owned. Applied
+				// funding with durable terminal evidence only needs a status update;
+				// legacy applied rows without evidence retain the historical timeout
+				// path so they cannot be stranded.
+				if taskFinalizeApplied {
+					latestTask, reloadErr := model.GetTaskByID(task.ID)
+					if reloadErr != nil {
+						logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks applied-finalize task reload error for task %s: %v", task.TaskID, reloadErr))
+						continue
+					}
+					if latestTask.Status == model.TaskStatusFailure || latestTask.Status == model.TaskStatusSuccess {
+						continue
+					}
+					recoveryOutcome, recoveryErr := recoverAppliedTaskTerminalEvidence(latestTask)
+					if recoveryErr != nil {
+						logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks applied-finalize terminal recovery error for task %s: %v", task.TaskID, recoveryErr))
+						continue
+					}
+					if recoveryOutcome == appliedTaskRecoveryNoEvidence {
+						recoveryOutcome, recoveryErr = markAppliedTaskEvidenceMissing(latestTask, now)
+						if recoveryErr != nil {
+							logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks applied-finalize evidence disposition error for task %s: %v", task.TaskID, recoveryErr))
+							continue
+						}
+					}
+					if recoveryOutcome == appliedTaskRecoveryUpdated {
+						remaining--
+					}
+					continue
+				} else {
+					continue
+				}
+			}
+			remaining--
+			isLegacy := task.SubmitTime > 0 && task.SubmitTime < legacyTaskRefundCutoff
+			isUnconfirmedSubmit := task.PrivateData.AwaitingUpstreamID
+			terminalDecision := prepareTaskTerminalBillingDecision(ctx, nil, task, &relaycommon.TaskInfo{
+				Status: string(model.TaskStatusFailure), Reason: reason,
+			}, 0)
+			if terminalDecision.UsesPlan && terminalDecision.ManualReason != "" {
+				won, err := persistTaskManualBillingDecision(task, task.Status, task.UpdatedAt, terminalDecision)
+				if err != nil {
+					logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks manual settlement error for task %s: %v", task.TaskID, err))
+				} else if !won {
+					logger.LogInfo(ctx, fmt.Sprintf("sweepTimedOutTasks: task %s manual settlement CAS lost", task.TaskID))
+				}
+				continue
+			}
+
+			oldStatus := task.Status
+			task.Status = model.TaskStatusFailure
+			task.Progress = "100%"
+			task.FinishTime = now
+			if isLegacy {
+				task.FailReason = legacyReason
+			} else if isUnconfirmedSubmit {
+				task.FailReason = "任务提交超时（无法确认上游是否已创建任务，未自动退款，请人工核对）"
+			} else {
+				task.FailReason = reason
+			}
+
+			var settlement *model.BillingSettlementInput
+			if !isLegacy && !isUnconfirmedSubmit {
+				if terminalDecision.UsesPlan {
+					settlement = terminalDecision.Settlement
+				} else {
+					settlement = BuildTaskRefundSettlementInput(task, reason)
+				}
+			}
+			var won bool
+			var err error
+			if settlement != nil {
+				won, err = task.UpdateWithStatusAndSettlement(oldStatus, *settlement)
+			} else {
+				won, err = task.UpdateWithStatus(oldStatus)
+			}
+			if err != nil {
+				logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks CAS update error for task %s: %v", task.TaskID, err))
+				continue
+			}
+			if !won {
+				logger.LogInfo(ctx, fmt.Sprintf("sweepTimedOutTasks: task %s already transitioned, skip", task.TaskID))
+				continue
+			}
+			timedOutCount++
+			if settlement != nil {
+				applyTaskBillingSettlement(ctx, task, settlement)
+			}
+		}
+		if len(tasks) < queryLimit && remaining > 0 && scanBudget > 0 {
+			afterSubmitTime = 0
+			afterID = 0
+			break
+		}
+	}
+	timedOutTaskSweepCursor.afterSubmitTime = afterSubmitTime
+	timedOutTaskSweepCursor.afterID = afterID
 
 	if timedOutCount > 0 {
 		logger.LogInfo(ctx, fmt.Sprintf("sweepTimedOutTasks: timed out %d tasks", timedOutCount))
@@ -105,27 +271,15 @@ func TaskPollingLoop() {
 			}
 			taskChannelM := make(map[int][]string)
 			taskM := make(map[string]*model.Task)
-			nullTaskIds := make([]int64, 0)
 			for _, task := range tasks {
 				upstreamID := task.GetUpstreamTaskID()
 				if upstreamID == "" {
-					// 统计失败的未完成任务
-					nullTaskIds = append(nullTaskIds, task.ID)
+					// Submission placeholders remain non-terminal until the timeout
+					// sweeper can classify them for manual review.
 					continue
 				}
 				taskM[upstreamID] = task
 				taskChannelM[task.ChannelId] = append(taskChannelM[task.ChannelId], upstreamID)
-			}
-			if len(nullTaskIds) > 0 {
-				err := model.TaskBulkUpdateByID(nullTaskIds, map[string]any{
-					"status":   "FAILURE",
-					"progress": "100%",
-				})
-				if err != nil {
-					logger.LogError(ctx, fmt.Sprintf("Fix null task_id task error: %v", err))
-				} else {
-					logger.LogInfo(ctx, fmt.Sprintf("Fix null task_id task success: %v", nullTaskIds))
-				}
 			}
 			if len(taskChannelM) == 0 {
 				continue
@@ -170,22 +324,7 @@ func updateSunoTasks(ctx context.Context, channelId int, taskIds []string, taskM
 	ch, err := model.CacheGetChannel(channelId)
 	if err != nil {
 		common.SysLog(fmt.Sprintf("CacheGetChannel: %v", err))
-		// Collect DB primary key IDs for bulk update (taskIds are upstream IDs, not task_id column values)
-		var failedIDs []int64
-		for _, upstreamID := range taskIds {
-			if t, ok := taskM[upstreamID]; ok {
-				failedIDs = append(failedIDs, t.ID)
-			}
-		}
-		err = model.TaskBulkUpdateByID(failedIDs, map[string]any{
-			"fail_reason": fmt.Sprintf("获取渠道信息失败，请联系管理员，渠道ID：%d", channelId),
-			"status":      "FAILURE",
-			"progress":    "100%",
-		})
-		if err != nil {
-			common.SysLog(fmt.Sprintf("UpdateSunoTask error: %v", err))
-		}
-		return err
+		return fmt.Errorf("CacheGetChannel failed: %w", err)
 	}
 	adaptor := GetTaskAdaptorFunc(constant.TaskPlatformSuno)
 	if adaptor == nil {
@@ -212,41 +351,84 @@ func updateSunoTasks(ctx context.Context, channelId int, taskIds []string, taskM
 	var responseItems dto.TaskResponse[[]dto.SunoDataResponse]
 	err = common.Unmarshal(responseBody, &responseItems)
 	if err != nil {
-		logger.LogError(ctx, fmt.Sprintf("Get Suno Task parse body error2: %v, body: %s", err, string(responseBody)))
+		logger.LogError(ctx, fmt.Sprintf("Get Suno Task parse body error2: %v, body_bytes=%d", err, len(responseBody)))
 		return err
 	}
 	if !responseItems.IsSuccess() {
-		common.SysLog(fmt.Sprintf("渠道 #%d 未完成的任务有: %d, 成功获取到任务数: %s", channelId, len(taskIds), string(responseBody)))
-		return err
+		common.SysLog(fmt.Sprintf("渠道 #%d 未完成的任务有: %d, response_bytes=%d", channelId, len(taskIds), len(responseBody)))
+		return fmt.Errorf(
+			"Suno task polling failed for channel #%d: code=%q, message=%q",
+			channelId,
+			responseItems.Code,
+			common.SanitizePersistedLogContent(common.MaskSensitiveInfo(responseItems.Message)),
+		)
 	}
 
 	for _, responseItem := range responseItems.Data {
 		task := taskM[responseItem.TaskID]
-		if !taskNeedsUpdate(task, responseItem) {
+		if task == nil {
+			logger.LogWarn(ctx, fmt.Sprintf("Suno task response ignored: unknown task_id=%s", responseItem.TaskID))
 			continue
 		}
-
-		task.Status = lo.If(model.TaskStatus(responseItem.Status) != "", model.TaskStatus(responseItem.Status)).Else(task.Status)
-		task.FailReason = lo.If(responseItem.FailReason != "", responseItem.FailReason).Else(task.FailReason)
-		task.SubmitTime = lo.If(responseItem.SubmitTime != 0, responseItem.SubmitTime).Else(task.SubmitTime)
-		task.StartTime = lo.If(responseItem.StartTime != 0, responseItem.StartTime).Else(task.StartTime)
-		task.FinishTime = lo.If(responseItem.FinishTime != 0, responseItem.FinishTime).Else(task.FinishTime)
-		if responseItem.FailReason != "" || task.Status == model.TaskStatusFailure {
-			logger.LogInfo(ctx, task.TaskID+" 构建失败，"+task.FailReason)
-			task.Progress = "100%"
-			RefundTaskQuota(ctx, task, task.FailReason)
-		}
-		if responseItem.Status == model.TaskStatusSuccess {
-			task.Progress = "100%"
-		}
-		task.Data = responseItem.Data
-
-		err = task.Update()
-		if err != nil {
-			common.SysLog("UpdateSunoTask task error: " + err.Error())
-		}
+		processSunoTaskResponse(ctx, task, responseItem)
 	}
 	return nil
+}
+
+func processSunoTaskResponse(ctx context.Context, task *model.Task, responseItem dto.SunoDataResponse) {
+	if !taskNeedsUpdate(task, responseItem) {
+		return
+	}
+	mergedTask := *task
+	mergedTask.Status = lo.If(model.TaskStatus(responseItem.Status) != "", model.TaskStatus(responseItem.Status)).Else(mergedTask.Status)
+	mergedTask.FailReason = lo.If(responseItem.FailReason != "", common.SanitizePersistedLogContent(responseItem.FailReason)).Else(mergedTask.FailReason)
+	mergedTask.SubmitTime = lo.If(responseItem.SubmitTime != 0, responseItem.SubmitTime).Else(mergedTask.SubmitTime)
+	mergedTask.StartTime = lo.If(responseItem.StartTime != 0, responseItem.StartTime).Else(mergedTask.StartTime)
+	mergedTask.FinishTime = lo.If(responseItem.FinishTime != 0, responseItem.FinishTime).Else(mergedTask.FinishTime)
+	isFailure := responseItem.FailReason != "" || mergedTask.Status == model.TaskStatusFailure
+	if isFailure {
+		mergedTask.Status = model.TaskStatusFailure
+		mergedTask.Progress = "100%"
+	}
+	if responseItem.Status == model.TaskStatusSuccess {
+		mergedTask.Progress = "100%"
+	}
+	mergedTask.Data = responseItem.Data
+	providerTerminal := mergedTask.Status == model.TaskStatusSuccess ||
+		mergedTask.Status == model.TaskStatusFailure || mergedTask.FailReason != ""
+	pending, settlementErr := taskTerminalSettlementPending(task, providerTerminal)
+	if settlementErr != nil {
+		logger.LogError(ctx, fmt.Sprintf("Suno task %s settlement lookup failed: %v", task.TaskID, settlementErr))
+		return
+	}
+	if pending {
+		return
+	}
+
+	previousStatus := task.Status
+	*task = mergedTask
+	if isFailure {
+		logger.LogInfo(ctx, task.TaskID+" 构建失败，"+task.FailReason)
+	}
+
+	var settlement *model.BillingSettlementInput
+	if isFailure {
+		settlement = BuildTaskRefundSettlementInput(task, task.FailReason)
+	}
+	var won bool
+	var err error
+	if settlement != nil {
+		won, err = task.UpdateWithStatusAndSettlement(previousStatus, *settlement)
+	} else {
+		won, err = task.UpdateWithStatus(previousStatus)
+	}
+	if err != nil {
+		common.SysLog("UpdateSunoTask task error: " + err.Error())
+	} else if !won {
+		logger.LogWarn(ctx, fmt.Sprintf("Task %s CAS lost or no-op update, skip billing", task.TaskID))
+	} else if settlement != nil {
+		applyTaskBillingSettlement(ctx, task, settlement)
+	}
 }
 
 // taskNeedsUpdate 检查 Suno 任务是否需要更新
@@ -263,7 +445,14 @@ func taskNeedsUpdate(oldTask *model.Task, newTask dto.SunoDataResponse) bool {
 	if string(oldTask.Status) != newTask.Status {
 		return true
 	}
-	if oldTask.FailReason != newTask.FailReason {
+	if newTask.FailReason != "" && oldTask.Status != model.TaskStatusFailure {
+		return true
+	}
+	newFailReason := oldTask.FailReason
+	if newTask.FailReason != "" {
+		newFailReason = common.SanitizePersistedLogContent(newTask.FailReason)
+	}
+	if oldTask.FailReason != newFailReason {
 		return true
 	}
 
@@ -304,21 +493,6 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 	}
 	cacheGetChannel, err := model.CacheGetChannel(channelId)
 	if err != nil {
-		// Collect DB primary key IDs for bulk update (taskIds are upstream IDs, not task_id column values)
-		var failedIDs []int64
-		for _, upstreamID := range taskIds {
-			if t, ok := taskM[upstreamID]; ok {
-				failedIDs = append(failedIDs, t.ID)
-			}
-		}
-		errUpdate := model.TaskBulkUpdateByID(failedIDs, map[string]any{
-			"fail_reason": fmt.Sprintf("Failed to get channel info, channel ID: %d", channelId),
-			"status":      "FAILURE",
-			"progress":    "100%",
-		})
-		if errUpdate != nil {
-			common.SysLog(fmt.Sprintf("UpdateVideoTask error: %v", errUpdate))
-		}
 		return fmt.Errorf("CacheGetChannel failed: %w", err)
 	}
 	adaptor := GetTaskAdaptorFunc(platform)
@@ -377,28 +551,40 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		return fmt.Errorf("readAll failed for task %s: %w", taskId, err)
 	}
 
-	logger.LogDebug(ctx, "updateVideoSingleTask response: %s", responseBody)
+	logger.LogDebug(ctx, "updateVideoSingleTask response bytes: %d", len(responseBody))
 
 	snap := task.Snapshot()
+	expectedUpdatedAt := task.UpdatedAt
 
 	taskResult := &relaycommon.TaskInfo{}
-	// try parse as MAX API response format
-	var responseItems dto.TaskResponse[model.Task]
-	if err = common.Unmarshal(responseBody, &responseItems); err == nil && responseItems.IsSuccess() {
-		logger.LogDebug(ctx, "updateVideoSingleTask parsed as compatible response format: %+v", responseItems)
-		t := responseItems.Data
-		taskResult.TaskID = t.TaskID
-		taskResult.Status = string(t.Status)
-		taskResult.Url = t.GetResultURL()
-		taskResult.Progress = t.Progress
-		taskResult.Reason = t.FailReason
-		task.Data = t.Data
-	} else if configuredResult, ok, parseErr := taskcommon.ParseConfiguredTaskResult(responseBody, ch.GetOtherSettings()); parseErr != nil {
+	// Configured task protocols take precedence over the MAX envelope. Relay
+	// gateways may return code=success while their nested data.data object is
+	// the actual provider result; consuming the outer wrapper first would keep
+	// the task in the gateway's local IN_PROGRESS state forever.
+	if configuredResult, ok, parseErr := taskcommon.ParseConfiguredTaskResult(responseBody, ch.GetOtherSettings()); parseErr != nil {
 		return fmt.Errorf("parse configured task result failed for task %s: %w", taskId, parseErr)
 	} else if ok {
 		taskResult = configuredResult
-	} else if taskResult, err = adaptor.ParseTaskResult(responseBody); err != nil {
-		return fmt.Errorf("parseTaskResult failed for task %s: %w", taskId, err)
+	} else {
+		// try parse as MAX API response format
+		var responseItems dto.TaskResponse[model.Task]
+		if err = common.Unmarshal(responseBody, &responseItems); err == nil && responseItems.IsSuccess() {
+			logger.LogDebug(ctx, "updateVideoSingleTask parsed as compatible response format: %+v", responseItems)
+			t := responseItems.Data
+			taskResult.TaskID = t.TaskID
+			taskResult.Status = string(t.Status)
+			taskResult.Url = t.GetResultURL()
+			taskResult.Progress = t.Progress
+			taskResult.Reason = t.FailReason
+			task.Data = t.Data
+		} else if taskResult, err = adaptor.ParseTaskResult(responseBody); err != nil {
+			return fmt.Errorf("parseTaskResult failed for task %s: %w", taskId, err)
+		} else if taskResult == nil {
+			return fmt.Errorf("parseTaskResult returned no result for task %s", taskId)
+		}
+	}
+	if err := applyTaskUsageFacts(adaptor, responseBody, taskResult); err != nil {
+		return fmt.Errorf("extract task usage failed for task %s: %w", taskId, err)
 	}
 
 	task.Data = redactVideoResponseBody(responseBody)
@@ -422,9 +608,66 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 				taskResult = relaycommon.FailTaskInfo("upstream returned error")
 			} else {
 				// unknown error format, log original response
-				logger.LogError(ctx, fmt.Sprintf("Task %s returned empty status with unrecognized error format, response: %s", taskId, string(responseBody)))
+				logger.LogError(ctx, fmt.Sprintf("Task %s returned empty status with unrecognized error format, body_bytes=%d", taskId, len(responseBody)))
 				taskResult = relaycommon.FailTaskInfo("upstream returned unrecognized message")
 			}
+		}
+	}
+	providerTerminal := taskResult.Status == string(model.TaskStatusSuccess) || taskResult.Status == string(model.TaskStatusFailure)
+	pending, taskFinalizeApplied, settlementErr := taskTerminalSettlementState(task, providerTerminal)
+	if settlementErr != nil {
+		return fmt.Errorf("load task submission settlement for task %s: %w", task.TaskID, settlementErr)
+	}
+	if pending {
+		// A task-finalize manual record created by incomplete H3 usage may be
+		// safely reopened when a later provider poll supplies complete,
+		// validated usage. Other manual reasons remain operator-gated.
+		if providerTerminal {
+			recoveryDecision := prepareTaskTerminalBillingDecision(ctx, adaptor, task, taskResult, ch.Type, ch.GetOtherSettings())
+			recovered, recoveryErr := recoverManualTaskBillingSettlement(ctx, task, recoveryDecision, taskResult, snap.Status, expectedUpdatedAt)
+			if recoveryErr != nil {
+				return fmt.Errorf("recover manual task settlement for task %s: %w", task.TaskID, recoveryErr)
+			}
+			if recovered {
+				pending, taskFinalizeApplied, settlementErr = taskTerminalSettlementState(task, providerTerminal)
+				if settlementErr != nil {
+					return fmt.Errorf("reload recovered task settlement for task %s: %w", task.TaskID, settlementErr)
+				}
+			}
+		}
+		if pending {
+			return nil
+		}
+	}
+	terminalDecision := taskTerminalBillingDecision{}
+	if providerTerminal && !taskFinalizeApplied {
+		terminalDecision = prepareTaskTerminalBillingDecision(ctx, adaptor, task, taskResult, ch.Type, ch.GetOtherSettings())
+		if terminalDecision.UsesPlan && terminalDecision.ManualReason != "" {
+			won, manualErr := persistTaskManualBillingDecision(task, snap.Status, expectedUpdatedAt, terminalDecision)
+			if manualErr != nil {
+				return fmt.Errorf("persist manual task settlement for task %s: %w", task.TaskID, manualErr)
+			}
+			if !won {
+				logger.LogWarn(ctx, fmt.Sprintf("Task %s manual settlement CAS lost", task.TaskID))
+			}
+			return nil
+		}
+		if terminalDecision.UsesPlan && task.PrivateData.BillingContext != nil {
+			task.PrivateData.BillingContext.TaskUsage = types.CloneTaskUsage(terminalDecision.Usage)
+			task.PrivateData.BillingContext.TaskUsageEnvelope = types.CloneTaskUsageEnvelope(terminalDecision.UsageEnvelope)
+			persistPendingTaskTerminalEvidence(task, taskResult, time.Now().Unix())
+			won, intentErr := task.UpdateWithStatusAndSettlementIntent(snap.Status, expectedUpdatedAt, *terminalDecision.Settlement)
+			if intentErr != nil {
+				return fmt.Errorf("persist task settlement intent for task %s: %w", task.TaskID, intentErr)
+			}
+			if !won {
+				logger.LogWarn(ctx, fmt.Sprintf("Task %s settlement intent CAS lost", task.TaskID))
+				return nil
+			}
+			if !applyTaskBillingSettlement(ctx, task, terminalDecision.Settlement) {
+				return nil
+			}
+			taskFinalizeApplied = true
 		}
 	}
 
@@ -466,7 +709,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		if task.FinishTime == 0 {
 			task.FinishTime = now
 		}
-		task.FailReason = taskResult.Reason
+		task.FailReason = common.SanitizePersistedLogContent(taskResult.Reason)
 		logger.LogInfo(ctx, fmt.Sprintf("Task %s failed: %s", task.TaskID, task.FailReason))
 		taskResult.Progress = taskcommon.ProgressComplete
 		if quota != 0 {
@@ -480,8 +723,28 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
+	var settlement *model.BillingSettlementInput
+	transitionWon := false
 	if isDone && snap.Status != task.Status {
-		won, err := task.UpdateWithStatus(snap.Status)
+		if taskFinalizeApplied {
+			clearPendingTaskTerminalEvidence(task)
+		}
+		if taskFinalizeApplied {
+			settlement = nil
+		} else if terminalDecision.UsesPlan {
+			return fmt.Errorf("task %s terminal settlement was not applied", task.TaskID)
+		} else if shouldSettle {
+			settlement = prepareTaskCompletionSettlement(ctx, adaptor, task, taskResult, ch.Type, ch.GetOtherSettings())
+		} else if shouldRefund {
+			settlement = BuildTaskRefundSettlementInput(task, task.FailReason)
+		}
+		var won bool
+		var err error
+		if settlement != nil {
+			won, err = task.UpdateWithStatusAndSettlement(snap.Status, *settlement)
+		} else {
+			won, err = task.UpdateWithStatus(snap.Status)
+		}
 		if err != nil {
 			logger.LogError(ctx, fmt.Sprintf("UpdateWithStatus failed for task %s: %s", task.TaskID, err.Error()))
 			shouldRefund = false
@@ -490,6 +753,8 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 			logger.LogWarn(ctx, fmt.Sprintf("Task %s already transitioned by another process, skip billing", task.TaskID))
 			shouldRefund = false
 			shouldSettle = false
+		} else {
+			transitionWon = true
 		}
 	} else if !snap.Equal(task.Snapshot()) {
 		if _, err := task.UpdateWithStatus(snap.Status); err != nil {
@@ -500,14 +765,258 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		logger.LogDebug(ctx, "No update needed for task %s", task.TaskID)
 	}
 
-	if shouldSettle {
-		settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
-	}
-	if shouldRefund {
-		RefundTaskQuota(ctx, task, task.FailReason)
+	if transitionWon && settlement != nil {
+		applyTaskBillingSettlement(ctx, task, settlement)
 	}
 
 	return nil
+}
+
+func persistPendingTaskTerminalEvidence(task *model.Task, result *relaycommon.TaskInfo, now int64) {
+	if task == nil || result == nil {
+		return
+	}
+	task.PrivateData.PendingTerminalStatus = model.TaskStatus(result.Status)
+	task.PrivateData.PendingTerminalProgress = result.Progress
+	task.PrivateData.PendingTerminalFinishTime = now
+	task.PrivateData.PendingTerminalReason = common.SanitizePersistedLogContent(result.Reason)
+	task.PrivateData.PendingTerminalResultURL = result.Url
+	task.IncludePrivateDataInUpdate()
+}
+
+func recoverAppliedTaskTerminalEvidence(task *model.Task) (appliedTaskRecoveryOutcome, error) {
+	if task == nil || task.ID <= 0 {
+		return appliedTaskRecoveryNoEvidence, errors.New("applied-finalize task is required")
+	}
+	pending := task.PrivateData.PendingTerminalStatus
+	if pending != model.TaskStatusSuccess && pending != model.TaskStatusFailure {
+		return appliedTaskRecoveryNoEvidence, nil
+	}
+	// Stage all changes on a copy. A lost CAS must leave the caller's snapshot
+	// untouched so it cannot be mistaken for missing evidence and overwritten.
+	candidate := *task
+	oldStatus := candidate.Status
+	candidate.Status = pending
+	candidate.Progress = candidate.PrivateData.PendingTerminalProgress
+	if candidate.Progress == "" {
+		candidate.Progress = taskcommon.ProgressComplete
+	}
+	candidate.FinishTime = candidate.PrivateData.PendingTerminalFinishTime
+	if candidate.FinishTime == 0 {
+		candidate.FinishTime = time.Now().Unix()
+	}
+	candidate.FailReason = candidate.PrivateData.PendingTerminalReason
+	if pending == model.TaskStatusSuccess && candidate.PrivateData.PendingTerminalResultURL != "" {
+		candidate.PrivateData.ResultURL = candidate.PrivateData.PendingTerminalResultURL
+	}
+	clearPendingTaskTerminalEvidence(&candidate)
+	won, err := candidate.UpdateWithStatus(oldStatus)
+	if err != nil {
+		return appliedTaskRecoveryNoEvidence, err
+	}
+	if !won {
+		return appliedTaskRecoveryCASLost, nil
+	}
+	*task = candidate
+	return appliedTaskRecoveryUpdated, nil
+}
+
+func clearPendingTaskTerminalEvidence(task *model.Task) {
+	if task == nil {
+		return
+	}
+	task.PrivateData.PendingTerminalStatus = ""
+	task.PrivateData.PendingTerminalProgress = ""
+	task.PrivateData.PendingTerminalFinishTime = 0
+	task.PrivateData.PendingTerminalReason = ""
+	task.PrivateData.PendingTerminalResultURL = ""
+	task.IncludePrivateDataInUpdate()
+}
+
+func markAppliedTaskEvidenceMissing(task *model.Task, now int64) (appliedTaskRecoveryOutcome, error) {
+	if task == nil || task.ID <= 0 {
+		return appliedTaskRecoveryNoEvidence, errors.New("applied-finalize task is required")
+	}
+	// Use the same copy-and-CAS discipline as terminal recovery. This preserves
+	// a concurrently published terminal state when the CAS is lost.
+	candidate := *task
+	oldStatus := candidate.Status
+	candidate.Status = model.TaskStatusFailure
+	candidate.Progress = taskcommon.ProgressComplete
+	candidate.FinishTime = now
+	candidate.FailReason = "task settlement was already applied but terminal provider evidence is unavailable; manual reconciliation required"
+	clearPendingTaskTerminalEvidence(&candidate)
+	won, err := candidate.UpdateWithStatus(oldStatus)
+	if err != nil {
+		return appliedTaskRecoveryNoEvidence, err
+	}
+	if !won {
+		return appliedTaskRecoveryCASLost, nil
+	}
+	*task = candidate
+	return appliedTaskRecoveryUpdated, nil
+}
+
+func applyTaskUsageFacts(adaptor TaskPollingAdaptor, responseBody []byte, taskResult *relaycommon.TaskInfo) error {
+	if adaptor == nil || taskResult == nil {
+		return nil
+	}
+	if provider, ok := adaptor.(taskUsageFactProvider); ok {
+		contract := provider.UsageContract()
+		envelope := taskResult.UsageEnvelope
+		if envelope == nil {
+			var err error
+			envelope, err = provider.ProduceUsage(types.TaskUsageContext{
+				Stage: types.TaskUsageSourceProviderResponse, Payload: responseBody,
+			})
+			if err != nil {
+				return err
+			}
+		}
+		if err := taskusage.ValidateEnvelope(contract, envelope, provider.UsageProducerKind()); err != nil {
+			return err
+		}
+		if envelope.Stage != types.TaskUsageSourceProviderResponse {
+			return fmt.Errorf("task usage envelope stage %q is not supported for polling", envelope.Stage)
+		}
+		// Doubao's legacy token fields feed the historical token-ratio
+		// settlement path. Partial provider evidence must not become a billing
+		// input, while other legacy providers retain their documented partial
+		// compatibility behavior.
+		if contract.SourceID != taskusage.SourceIDDoubaoVideo ||
+			envelope.Completeness == types.TaskUsageCompletenessComplete {
+			if err := applyLegacyTaskUsageFields(taskResult, envelope); err != nil {
+				return err
+			}
+		}
+		taskResult.UsageEnvelope = types.CloneTaskUsageEnvelope(envelope)
+		taskResult.Usage = types.CloneTaskUsage(envelope.Usage)
+		return nil
+	}
+	provider, ok := adaptor.(taskUsageProvider)
+	if !ok {
+		return nil
+	}
+	usage, err := provider.ExtractTaskUsage(responseBody)
+	if err != nil {
+		return err
+	}
+	if usage != nil {
+		taskResult.Usage = usage
+	}
+	return nil
+}
+
+// applyLegacyTaskUsageFields keeps the historical token fields synchronized
+// with validated provider usage. Only complete or partial envelopes are
+// eligible; invalid and missing usage must never become billing inputs.
+func applyLegacyTaskUsageFields(taskResult *relaycommon.TaskInfo, envelope *types.TaskUsageEnvelope) error {
+	if taskResult == nil || envelope == nil || envelope.Usage == nil {
+		return nil
+	}
+	if envelope.Completeness != types.TaskUsageCompletenessComplete &&
+		envelope.Completeness != types.TaskUsageCompletenessPartial {
+		return nil
+	}
+	usage := envelope.Usage
+	if usage.CompletionTokens != nil {
+		value := int(*usage.CompletionTokens)
+		if int64(value) != *usage.CompletionTokens {
+			return fmt.Errorf("completion token usage exceeds platform integer range")
+		}
+		taskResult.CompletionTokens = value
+	}
+	if usage.TotalTokens != nil {
+		value := int(*usage.TotalTokens)
+		if int64(value) != *usage.TotalTokens {
+			return fmt.Errorf("total token usage exceeds platform integer range")
+		}
+		taskResult.TotalTokens = value
+	}
+	if usage.CompletionTokens != nil && usage.TotalTokens != nil {
+		promptTokens := *usage.TotalTokens - *usage.CompletionTokens
+		if promptTokens < 0 {
+			return fmt.Errorf("total token usage cannot be less than completion token usage")
+		}
+		value := int(promptTokens)
+		if int64(value) != promptTokens {
+			return fmt.Errorf("prompt token usage exceeds platform integer range")
+		}
+		taskResult.PromptTokens = value
+	}
+	return nil
+}
+
+func recoverManualTaskBillingSettlement(
+	ctx context.Context,
+	task *model.Task,
+	decision taskTerminalBillingDecision,
+	providerResult *relaycommon.TaskInfo,
+	fromStatus model.TaskStatus,
+	expectedUpdatedAt int64,
+) (bool, error) {
+	if task == nil || task.ID <= 0 || !decision.UsesPlan || decision.ManualReason != "" || decision.Settlement == nil {
+		return false, nil
+	}
+	if providerResult == nil || (providerResult.Status != string(model.TaskStatusSuccess) && providerResult.Status != string(model.TaskStatusFailure)) {
+		return false, errors.New("terminal provider result is required for manual settlement recovery")
+	}
+	if submissionPending, err := taskFinalSettlementPending(task); err != nil || submissionPending {
+		return false, err
+	}
+	status, found, err := model.GetBillingSettlementStatus(model.BillingTaskFinalizeOperationKey(task.ID))
+	if err != nil || !found || (status != model.BillingSettlementStatusManual && status != model.BillingSettlementStatusPending) {
+		return false, err
+	}
+	// Persist the provider terminal facts before promoting the manual settlement
+	// to a funding operation. A crash after promotion must remain recoverable as
+	// the provider's terminal state, not be misclassified as missing evidence.
+	candidate := *task
+	if task.PrivateData.BillingContext != nil {
+		billingContext := *task.PrivateData.BillingContext
+		candidate.PrivateData.BillingContext = &billingContext
+		candidate.PrivateData.BillingContext.TaskUsage = types.CloneTaskUsage(decision.Usage)
+		candidate.PrivateData.BillingContext.TaskUsageEnvelope = types.CloneTaskUsageEnvelope(decision.UsageEnvelope)
+	}
+	persistPendingTaskTerminalEvidence(&candidate, providerResult, time.Now().Unix())
+	won, err := candidate.UpdateWithStatusAndPendingTerminalEvidence(fromStatus, expectedUpdatedAt)
+	if err != nil {
+		return false, fmt.Errorf("persist manual task terminal evidence: %w", err)
+	}
+	if !won {
+		return false, nil
+	}
+	*task = candidate
+	const h3UsageManualReasonPrefix = "H3 terminal usage requires manual reconciliation:"
+	recoveryNote := "H3 task settlement automatically recovered after a complete provider usage response"
+	ready, err := model.PromoteManualTaskBillingSettlement(*decision.Settlement, h3UsageManualReasonPrefix, recoveryNote)
+	if errors.Is(err, model.ErrBillingSettlementOperationConflict) {
+		// A different manual reason or a concurrent/permanent recovery failure
+		// must remain operator-gated; do not turn that durable state into a
+		// polling error or publish a terminal task status.
+		return false, nil
+	}
+	if err != nil || !ready {
+		return false, err
+	}
+	if !applyTaskBillingSettlement(ctx, task, decision.Settlement) {
+		return false, nil
+	}
+	return true, nil
+}
+
+func persistTaskManualBillingDecision(task *model.Task, fromStatus model.TaskStatus, expectedUpdatedAt int64, decision taskTerminalBillingDecision) (bool, error) {
+	if task == nil || !decision.UsesPlan || decision.ManualReason == "" || decision.Settlement == nil {
+		return false, errors.New("complete manual task billing decision is required")
+	}
+	if task.PrivateData.BillingContext == nil {
+		return false, errors.New("task billing context is required")
+	}
+	task.Status = fromStatus
+	task.PrivateData.BillingContext.TaskUsage = types.CloneTaskUsage(decision.Usage)
+	task.PrivateData.BillingContext.TaskUsageEnvelope = types.CloneTaskUsageEnvelope(decision.UsageEnvelope)
+	task.UpdatedAt = time.Now().Unix()
+	return task.UpdateWithStatusAndManualSettlement(fromStatus, expectedUpdatedAt, *decision.Settlement, decision.ManualReason)
 }
 
 func shouldApplyTaskResultProgress(taskResult *relaycommon.TaskInfo) bool {
@@ -563,21 +1072,31 @@ func truncateBase64(s string) string {
 //
 //  2. taskResult.TotalTokens > 0 → 按 token 重算
 //  3. 都不满足 → 保持预扣额度不变
-func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, taskResult *relaycommon.TaskInfo) {
+func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, taskResult *relaycommon.TaskInfo, channelType int, channelSettings ...dto.ChannelOtherSettings) {
+	applyTaskBillingSettlement(ctx, task, prepareTaskCompletionSettlement(ctx, adaptor, task, taskResult, channelType, channelSettings...))
+}
+
+func prepareTaskCompletionSettlement(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, taskResult *relaycommon.TaskInfo, channelType int, channelSettings ...dto.ChannelOtherSettings) *model.BillingSettlementInput {
 	// 0. 按次计费的任务不做差额结算
 	if bc := task.PrivateData.BillingContext; bc != nil && bc.PerCallBilling {
 		logger.LogInfo(ctx, fmt.Sprintf("任务 %s 按次计费，跳过差额结算", task.TaskID))
-		return
+		return nil
+	}
+	if task.DeltaSettlementDisabledForChannel(channelType, channelSettings...) {
+		logger.LogInfo(ctx, fmt.Sprintf("任务 %s 已按渠道设置跳过完成态差额结算", task.TaskID))
+		return nil
 	}
 	// 1. 优先让 adaptor 决定最终额度
 	if actualQuota := adaptor.AdjustBillingOnComplete(task, taskResult); actualQuota > 0 {
-		RecalculateTaskQuota(ctx, task, actualQuota, "adaptor计费调整")
-		return
+		return buildTaskFinalSettlementInput(task, actualQuota, "adaptor计费调整")
 	}
 	// 2. 回退到 token 重算
 	if taskResult.TotalTokens > 0 {
-		RecalculateTaskQuotaByTokens(ctx, task, taskResult.TotalTokens)
-		return
+		actualQuota, reason, clamp, ok := calculateTaskQuotaByTokens(task, taskResult.TotalTokens)
+		if ok {
+			return buildTaskFinalSettlementInput(task, actualQuota, reason, clamp)
+		}
 	}
 	// 3. 无调整，保持预扣额度
+	return nil
 }

@@ -213,6 +213,21 @@ func TestListModelsIncludesTieredBillingModel(t *testing.T) {
 	require.Empty(t, missingExprPricing.BillingExpr)
 }
 
+func TestGetEnabledModelsForGroupsIncludesModelsFromEveryOwnerGroup(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.Create(&[]model.Ability{
+		{Group: "vip", Model: "zz-manual-first-model", ChannelId: 1, Enabled: true},
+		{Group: "default", Model: "zz-manual-later-model", ChannelId: 2, Enabled: true},
+		{Group: "default", Model: "zz-manual-first-model", ChannelId: 3, Enabled: true},
+	}).Error)
+
+	models := getEnabledModelsForGroups([]string{"vip", "default"})
+	require.ElementsMatch(t, []string{
+		"zz-manual-first-model",
+		"zz-manual-later-model",
+	}, models)
+}
+
 func TestListModelsTokenLimitIncludesTieredBillingModel(t *testing.T) {
 	withSelfUseModeDisabled(t)
 	withTieredBillingConfig(t, map[string]string{
@@ -242,6 +257,27 @@ func TestListModelsTokenLimitIncludesTieredBillingModel(t *testing.T) {
 	require.NotContains(t, ids, "zz-token-tiered-empty-expr-model")
 	require.NotContains(t, ids, "zz-token-tiered-missing-expr-model")
 	require.NotContains(t, ids, "zz-token-unpriced-model")
+}
+
+func TestListModelsAnthropicAllowsEmptyModelList(t *testing.T) {
+	withSelfUseModeDisabled(t)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	common.SetContextKey(ctx, constant.ContextKeyTokenModelLimitEnabled, true)
+	common.SetContextKey(ctx, constant.ContextKeyTokenModelLimit, map[string]bool{})
+
+	ListModels(ctx, constant.ChannelTypeAnthropic)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var payload struct {
+		Data    []dto.AnthropicModel `json:"data"`
+		HasMore bool                 `json:"has_more"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &payload))
+	require.Empty(t, payload.Data)
+	require.False(t, payload.HasMore)
 }
 
 func TestCheckUpdatePasswordRequiresCurrentPassword(t *testing.T) {

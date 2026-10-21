@@ -27,19 +27,19 @@ import {
   handleOIDCOAuth,
   handleDiscordOAuth,
   handleLinuxDOOAuth,
+  indexCustomOAuthBindings,
+  type CustomOAuthBinding,
 } from '@/lib/oauth'
 import { useDialogs } from '@/hooks/use-dialog'
+import { useReadScope } from '@/hooks/use-read-scope'
+import { useResettableState } from '@/hooks/use-resettable-state'
 import { useStatus } from '@/hooks/use-status'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { StatusBadge } from '@/components/status-badge'
 import { OAUTH_BIND_STORAGE_KEY } from '@/features/auth/constants'
-import {
-  getSelfOAuthBindings,
-  unbindCustomOAuth,
-  type CustomOAuthBinding,
-} from '../../api'
+import { getSelfOAuthBindings, unbindCustomOAuth } from '../../api'
 import type { UserProfile, BindingItem } from '../../types'
 import { EmailBindDialog } from '../dialogs/email-bind-dialog'
 import { TelegramBindDialog } from '../dialogs/telegram-bind-dialog'
@@ -63,27 +63,36 @@ export function AccountBindingsTab({
   const { t } = useTranslation()
   const dialogs = useDialogs<DialogKey>()
   const { status, loading } = useStatus()
-  const [customBindings, setCustomBindings] = useState<CustomOAuthBinding[]>([])
+  const beginRead = useReadScope(profile?.id)
+  const [customBindings, setCustomBindings] = useResettableState<
+    CustomOAuthBinding[]
+  >([], profile?.id)
   const [unbindTarget, setUnbindTarget] = useState<CustomOAuthBinding | null>(
     null
+  )
+  const customBindingIndex = useMemo(
+    () => indexCustomOAuthBindings(customBindings),
+    [customBindings]
   )
   const [unbinding, setUnbinding] = useState(false)
 
   const customProviders = status?.custom_oauth_providers as
-    | Array<{ id: string; name: string }>
+    | Array<{ id: number; name: string }>
     | undefined
 
-  const fetchCustomBindings = useCallback(async () => {
-    if (!customProviders || customProviders.length === 0) return
-    try {
-      const res = await getSelfOAuthBindings()
-      if (res.success && res.data) {
-        setCustomBindings(res.data)
-      }
-    } catch {
-      // ignore
-    }
-  }, [customProviders])
+  const fetchCustomBindings = useCallback(() => {
+    if (!customProviders || customProviders.length === 0)
+      return Promise.resolve()
+    const current = beginRead()
+    if (!current()) return Promise.resolve()
+    return getSelfOAuthBindings()
+      .then((res) => {
+        if (current() && res.success && res.data) setCustomBindings(res.data)
+      })
+      .catch(() => {
+        /* retain the last successful read */
+      })
+  }, [customProviders, beginRead, setCustomBindings])
 
   useEffect(() => {
     fetchCustomBindings()
@@ -113,9 +122,11 @@ export function AccountBindingsTab({
     }
   }
 
-  const handleBindCustomOAuth = (provider: { id: string; name: string }) => {
+  const handleBindCustomOAuth = (provider: { id: number; name: string }) => {
     const redirectUrl = `${window.location.origin}/oauth/${provider.id}?bind=true`
-    window.location.href = `/api/oauth/${provider.id}?redirect=${encodeURIComponent(redirectUrl)}`
+    window.location.assign(
+      `/api/oauth/${provider.id}?redirect=${encodeURIComponent(redirectUrl)}`
+    )
   }
 
   useEffect(() => {
@@ -315,9 +326,7 @@ export function AccountBindingsTab({
           </p>
           <div className='grid grid-cols-1 gap-2.5 sm:grid-cols-2 sm:gap-3'>
             {customProviders.map((provider) => {
-              const binding = customBindings.find(
-                (b) => b.provider_id === provider.id
-              )
+              const binding = customBindingIndex.get(provider.id)
               const isBound = !!binding
               return (
                 <div
@@ -341,7 +350,7 @@ export function AccountBindingsTab({
                       </div>
                       <p className='text-muted-foreground truncate text-xs'>
                         {isBound
-                          ? binding?.external_id || t('Bound')
+                          ? binding?.provider_user_id || t('Bound')
                           : t('Not bound')}
                       </p>
                     </div>

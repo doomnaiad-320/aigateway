@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/MAX-API-Next/MAX-API/common"
 	"github.com/MAX-API-Next/MAX-API/dto"
@@ -16,6 +17,7 @@ import (
 	"github.com/MAX-API-Next/MAX-API/logger"
 	"github.com/MAX-API-Next/MAX-API/model"
 	"github.com/MAX-API-Next/MAX-API/service"
+	"github.com/MAX-API-Next/MAX-API/service/authz"
 	"github.com/MAX-API-Next/MAX-API/setting"
 	"github.com/MAX-API-Next/MAX-API/setting/operation_setting"
 
@@ -134,20 +136,38 @@ func recordLoginAudit(user *model.User, c *gin.Context) {
 	}, extra)
 }
 
+func isOAuthCredentialReauthentication(method string) bool {
+	return method == "wechat" || method == "oauth" ||
+		strings.HasPrefix(method, "oauth:")
+}
+
 // setup session & cookies and then return user info
 func setupLogin(user *model.User, c *gin.Context) {
 	model.UpdateUserLastLoginAt(user.Id)
 	session := sessions.Default(c)
+	loginMethod := loginMethodFromContext(c)
 	session.Delete(SecureVerificationSessionKey)
 	session.Delete(secureVerificationMethodSessionKey)
 	session.Delete(secureVerificationUserSessionKey)
 	session.Delete(secureVerificationScopeSessionKey)
 	session.Delete(PasskeyReadySessionKey)
+	if isOAuthCredentialReauthentication(loginMethod) {
+		allowed, grantErr := model.CanUseOAuthReauthentication(user.Id)
+		if grantErr != nil {
+			common.SysError(fmt.Sprintf("failed to evaluate OAuth reauthentication grant for user %d: %v", user.Id, grantErr))
+		} else if allowed {
+			session.Set(SecureVerificationSessionKey, time.Now().Unix())
+			session.Set(secureVerificationMethodSessionKey, model.SecureVerificationMethodOAuth)
+			session.Set(secureVerificationUserSessionKey, user.Id)
+			session.Set(secureVerificationScopeSessionKey, model.SecureVerificationScopeOAuthReauthentication)
+		}
+	}
 	session.Set("id", user.Id)
 	session.Set("username", user.Username)
 	session.Set("role", user.Role)
 	session.Set("status", user.Status)
 	session.Set("group", user.Group)
+	session.Set("session_generation", user.SessionGeneration)
 	err := session.Save()
 	if err != nil {
 		common.ApiErrorI18n(c, i18n.MsgUserSessionSaveFailed)
@@ -183,6 +203,18 @@ func Logout(c *gin.Context) {
 		"message": "",
 		"success": true,
 	})
+}
+
+func RevokeOtherSessions(c *gin.Context) {
+	userID := c.GetInt("id")
+	generation, err := model.BumpUserSessionGeneration(userID)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	preserveCurrentSessionAfterCommittedSecurityChange(c, userID, generation, "revoking other sessions")
+	recordUserSecurityAudit(c, userID, "user.sessions_revoke_other", nil)
+	common.ApiSuccess(c, nil)
 }
 
 func Register(c *gin.Context) {
@@ -388,7 +420,12 @@ func GenerateAccessToken(c *gin.Context) {
 		return
 	}
 	// get rand int 28-32
-	randI := common.GetRandomInt(4)
+	randI, err := common.SecureRandomInt(4)
+	if err != nil {
+		common.ApiErrorI18n(c, i18n.MsgGenerateFailed)
+		common.SysLog("failed to generate access token length: " + err.Error())
+		return
+	}
 	key, err := common.GenerateRandomKey(29 + randI)
 	if err != nil {
 		common.ApiErrorI18n(c, i18n.MsgGenerateFailed)
@@ -451,7 +488,13 @@ func GetAffCode(c *gin.Context) {
 		return
 	}
 	if user.AffCode == "" {
-		user.AffCode = common.GetRandomString(4)
+		affCode, err := common.GenerateRandomCharsKey(4)
+		if err != nil {
+			common.ApiErrorI18n(c, i18n.MsgGenerateFailed)
+			common.SysLog("failed to generate affiliate code: " + err.Error())
+			return
+		}
+		user.AffCode = affCode
 		if err := user.UpdateFields(false, model.UserUpdateFieldAffCode); err != nil {
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,
@@ -468,6 +511,21 @@ func GetAffCode(c *gin.Context) {
 	return
 }
 
+func safeSelfUserSettingString(user *model.User) string {
+	if user == nil {
+		return "{}"
+	}
+	userSetting := user.GetSetting()
+	userSetting.WebhookSecret = ""
+	userSetting.GotifyToken = ""
+	settingBytes, err := common.Marshal(userSetting)
+	if err != nil {
+		common.SysLog("failed to marshal redacted user setting: " + err.Error())
+		return "{}"
+	}
+	return string(settingBytes)
+}
+
 func GetSelf(c *gin.Context) {
 	id := c.GetInt("id")
 	userRole := c.GetInt("role")
@@ -481,6 +539,7 @@ func GetSelf(c *gin.Context) {
 
 	// 计算用户权限信息
 	permissions := calculateUserPermissions(userRole)
+	permissions["admin_permissions"] = authz.Capabilities(id, userRole)
 
 	// 获取用户设置并提取sidebar_modules
 	userSetting := user.GetSetting()
@@ -508,7 +567,7 @@ func GetSelf(c *gin.Context) {
 		"aff_history_quota": user.AffHistoryQuota,
 		"inviter_id":        user.InviterId,
 		"linux_do_id":       user.LinuxDOId,
-		"setting":           user.Setting,
+		"setting":           safeSelfUserSettingString(user),
 		"stripe_customer":   user.StripeCustomer,
 		"sidebar_modules":   userSetting.SidebarModules, // 正确提取sidebar_modules字段
 		"permissions":       permissions,                // 新增权限字段
@@ -860,9 +919,13 @@ func UpdateSelf(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	if err := cleanUser.UpdateFields(updatePassword, updateFields...); err != nil {
+	generation, err := cleanUser.UpdateFieldsWithSessionGeneration(updatePassword, updateFields...)
+	if err != nil {
 		common.ApiError(c, err)
 		return
+	}
+	if updatePassword {
+		preserveCurrentSessionAfterCommittedSecurityChange(c, cleanUser.Id, generation, "changing password")
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -870,6 +933,50 @@ func UpdateSelf(c *gin.Context) {
 		"message": "",
 	})
 	return
+}
+
+func preserveCurrentSessionAfterSecurityChange(c *gin.Context, userID int, generation int64) error {
+	session := sessions.Default(c)
+	session.Set("id", userID)
+	session.Set("session_generation", generation)
+	session.Delete(SecureVerificationSessionKey)
+	session.Delete(secureVerificationMethodSessionKey)
+	session.Delete(secureVerificationUserSessionKey)
+	session.Delete(secureVerificationScopeSessionKey)
+	session.Delete(PasskeyReadySessionKey)
+	return session.Save()
+}
+
+func preserveCurrentSessionAfterCommittedSecurityChange(c *gin.Context, userID int, generation int64, action string) {
+	if err := preserveCurrentSessionAfterSecurityChange(c, userID, generation); err != nil {
+		common.SysError(fmt.Sprintf(
+			"failed to preserve current session after %s for user %d: %v",
+			action,
+			userID,
+			err,
+		))
+		expireCurrentSessionAfterSecurityChange(c, userID, action)
+	}
+}
+
+func expireCurrentSessionAfterSecurityChange(c *gin.Context, userID int, action string) {
+	session := sessions.Default(c)
+	session.Clear()
+	session.Options(sessions.Options{
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   common.SessionCookieSecure,
+		SameSite: http.SameSiteLaxMode,
+	})
+	if err := session.Save(); err != nil {
+		common.SysError(fmt.Sprintf(
+			"failed to expire current session after %s for user %d: %v",
+			action,
+			userID,
+			err,
+		))
+	}
 }
 
 func checkUpdatePassword(originalPassword string, newPassword string, userId int) (updatePassword bool, err error) {
@@ -915,9 +1022,6 @@ func DeleteUser(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	if err := model.InvalidateUserTokensCache(id); err != nil {
-		common.SysLog(fmt.Sprintf("failed to invalidate tokens cache for user %d: %s", id, err.Error()))
-	}
 	recordManageAuditFor(c, originUser.Id, "user.delete", map[string]interface{}{
 		"username": originUser.Username,
 		"id":       originUser.Id,
@@ -942,9 +1046,6 @@ func DeleteSelf(c *gin.Context) {
 	if err != nil {
 		common.ApiError(c, err)
 		return
-	}
-	if err := model.InvalidateUserTokensCache(id); err != nil {
-		common.SysLog(fmt.Sprintf("failed to invalidate tokens cache for user %d: %s", id, err.Error()))
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
@@ -1136,12 +1237,9 @@ func ManageUser(c *gin.Context) {
 				return
 			}
 			oldQuota := user.Quota
-			if err := model.DB.Model(&model.User{}).Where("id = ?", user.Id).Update("quota", req.Value).Error; err != nil {
+			if err := model.OverrideUserQuota(user.Id, req.Value); err != nil {
 				common.ApiError(c, err)
 				return
-			}
-			if err := model.InvalidateUserCache(user.Id); err != nil {
-				common.SysLog(fmt.Sprintf("failed to invalidate user cache for user %d: %s", user.Id, err.Error()))
 			}
 			recordManageAuditFor(c, user.Id, "user.quota_override", map[string]interface{}{
 				"from": logger.LogQuota(oldQuota),
@@ -1169,14 +1267,9 @@ func ManageUser(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	// 禁用 / 角色调整后，强制失效用户缓存与其全部令牌缓存，
-	// 避免在 Redis TTL 过期前仍使用旧状态（尤其是禁用后仍可发起请求的问题）。
-	// InvalidateUserCache 会让下一次 GetUserCache 从数据库重新加载，
-	// InvalidateUserTokensCache 则确保令牌侧的缓存也同步刷新。
-	if req.Action == "disable" || req.Action == "promote" || req.Action == "demote" {
-		if err := model.InvalidateUserCache(user.Id); err != nil {
-			common.SysLog(fmt.Sprintf("failed to invalidate user cache for user %d: %s", user.Id, err.Error()))
-		}
+	// UpdateFields 已在同一事务中登记用户缓存失效；状态或角色变化时
+	// 额外刷新该用户的 Token 缓存，避免令牌侧继续使用旧快照。
+	if req.Action == "enable" || req.Action == "disable" || req.Action == "promote" || req.Action == "demote" {
 		if err := model.InvalidateUserTokensCache(user.Id); err != nil {
 			common.SysLog(fmt.Sprintf("failed to invalidate tokens cache for user %d: %s", user.Id, err.Error()))
 		}
@@ -1438,8 +1531,17 @@ func UpdateUserSetting(c *gin.Context) {
 			return
 		}
 		if req.GotifyToken == "" {
-			common.ApiErrorI18n(c, i18n.MsgSettingGotifyTokenEmpty)
-			return
+			userId := c.GetInt("id")
+			user, err := model.GetUserById(userId, true)
+			if err != nil {
+				common.ApiError(c, err)
+				return
+			}
+			existingSettings := user.GetSetting()
+			if existingSettings.NotifyType != dto.NotifyTypeGotify || existingSettings.GotifyToken == "" {
+				common.ApiErrorI18n(c, i18n.MsgSettingGotifyTokenEmpty)
+				return
+			}
 		}
 		// 验证URL格式
 		if _, err := url.ParseRequestURI(req.GotifyUrl); err != nil {
@@ -1485,6 +1587,8 @@ func UpdateUserSetting(c *gin.Context) {
 		settings.WebhookUrl = req.WebhookUrl
 		if req.WebhookSecret != "" {
 			settings.WebhookSecret = req.WebhookSecret
+		} else if existingSettings.NotifyType == dto.NotifyTypeWebhook {
+			settings.WebhookSecret = existingSettings.WebhookSecret
 		}
 	}
 
@@ -1501,7 +1605,11 @@ func UpdateUserSetting(c *gin.Context) {
 	// 如果是Gotify类型，添加Gotify配置到设置中
 	if req.QuotaWarningType == dto.NotifyTypeGotify {
 		settings.GotifyUrl = req.GotifyUrl
-		settings.GotifyToken = req.GotifyToken
+		if req.GotifyToken != "" {
+			settings.GotifyToken = req.GotifyToken
+		} else if existingSettings.NotifyType == dto.NotifyTypeGotify {
+			settings.GotifyToken = existingSettings.GotifyToken
+		}
 		// Gotify优先级范围0-10，超出范围则使用默认值5
 		if req.GotifyPriority < 0 || req.GotifyPriority > 10 {
 			settings.GotifyPriority = 5

@@ -99,37 +99,46 @@ func calcViolationFeeQuota(amount, groupRatio float64) int {
 	return int(quota)
 }
 
-// ChargeViolationFeeIfNeeded charges an additional fee after the normal flow finishes (including refund).
-// It uses Grok fee settings as the fee policy.
+type violationFeeChargeResult struct {
+	applicable bool
+	settled    bool
+}
+
+// HandleFailedBilling finalizes a failed request as either a violation fee or
+// a normal refund. Once a violation settlement intent exists, it must not be
+// replaced by a refund using the same request-finalize operation key.
+func HandleFailedBilling(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, apiErr *types.MaxAPIError) {
+	result := chargeViolationFeeIfNeeded(ctx, relayInfo, apiErr)
+	if !result.applicable && relayInfo != nil && relayInfo.Billing != nil {
+		relayInfo.Billing.Refund(ctx)
+	}
+}
+
 func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, apiErr *types.MaxAPIError) bool {
+	return chargeViolationFeeIfNeeded(ctx, relayInfo, apiErr).settled
+}
+
+func chargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, apiErr *types.MaxAPIError) violationFeeChargeResult {
 	if ctx == nil || relayInfo == nil || apiErr == nil {
-		return false
+		return violationFeeChargeResult{}
 	}
 	//if relayInfo.IsPlayground {
 	//	return false
 	//}
 	if !shouldChargeViolationFee(apiErr) {
-		return false
+		return violationFeeChargeResult{}
 	}
 
 	settings := model_setting.GetGrokSettings()
 	if settings == nil || !settings.ViolationDeductionEnabled {
-		return false
+		return violationFeeChargeResult{}
 	}
 
 	groupRatio := relayInfo.PriceData.GroupRatioInfo.GroupRatio
 	feeQuota := calcViolationFeeQuota(settings.ViolationDeductionAmount, groupRatio)
 	if feeQuota <= 0 {
-		return false
+		return violationFeeChargeResult{}
 	}
-
-	if err := PostConsumeQuota(relayInfo, feeQuota, 0, true); err != nil {
-		logger.LogError(ctx, fmt.Sprintf("failed to charge violation fee: %s", err.Error()))
-		return false
-	}
-
-	model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, feeQuota)
-	model.UpdateChannelUsedQuota(relayInfo.ChannelId, feeQuota)
 
 	useTimeSeconds := time.Now().Unix() - relayInfo.StartTime.Unix()
 	tokenName := ctx.GetString("token_name")
@@ -146,8 +155,8 @@ func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 		"upstream_error_code":  fmt.Sprintf("%v", oai.Code),
 		"violation_fee_marker": CSAMViolationMarker,
 	}
-
-	model.RecordConsumeLog(ctx, relayInfo.UserId, model.RecordConsumeLogParams{
+	requestID, upstreamRequestID := billingEffectRequestIDs(ctx, relayInfo)
+	logParams := model.RecordConsumeLogParams{
 		ChannelId:      relayInfo.ChannelId,
 		ModelName:      relayInfo.OriginModelName,
 		TokenName:      tokenName,
@@ -158,7 +167,21 @@ func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 		IsStream:       relayInfo.IsStream,
 		Group:          relayInfo.UsingGroup,
 		Other:          other,
-	})
+	}
+	effect := newConsumeBillingSettlementEffect(relayInfo, logParams, requestID, upstreamRequestID, true)
 
-	return true
+	effectHandled, err := SettleBillingWithEffect(ctx, relayInfo, feeQuota, effect)
+	if err != nil {
+		logger.LogError(ctx, fmt.Sprintf("violation fee settlement remains pending/manual: %s", err.Error()))
+		return violationFeeChargeResult{applicable: true}
+	}
+	if effectHandled {
+		return violationFeeChargeResult{applicable: true, settled: true}
+	}
+	model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, feeQuota)
+	model.UpdateChannelUsedQuota(relayInfo.ChannelId, feeQuota)
+
+	model.RecordConsumeLog(ctx, relayInfo.UserId, logParams)
+
+	return violationFeeChargeResult{applicable: true, settled: true}
 }

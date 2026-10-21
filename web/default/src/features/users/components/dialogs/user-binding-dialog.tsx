@@ -16,7 +16,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact https://github.com/MAX-API-Next/MAX-API/issues
 */
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import {
+  useState,
+  useEffect,
+  useEffectEvent,
+  useCallback,
+  useMemo,
+} from 'react'
 import {
   Mail,
   Globe,
@@ -32,6 +38,8 @@ import { useTranslation } from 'react-i18next'
 import { SiGithub, SiDiscord } from 'react-icons/si'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
+import { useReadScope } from '@/hooks/use-read-scope'
+import { useResettableState } from '@/hooks/use-resettable-state'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -72,7 +80,7 @@ interface BindingItem {
   icon: React.ReactNode
   value: string
   type: 'builtin' | 'custom'
-  providerId?: string
+  providerId?: number
   isBound: boolean
   isEnabled: boolean
 }
@@ -85,7 +93,7 @@ interface StatusInfo {
   telegram_oauth?: boolean
   linuxdo_oauth?: boolean
   custom_oauth_providers?: Array<{
-    id: string
+    id: number
     name: string
     icon?: string
   }>
@@ -165,58 +173,79 @@ function CustomProviderIcon(props: { iconUrl?: string }) {
 
 export function UserBindingDialog(props: Props) {
   const { t } = useTranslation()
-  const [user, setUser] = useState<User | null>(null)
-  const [oauthBindings, setOauthBindings] = useState<OAuthBinding[]>([])
-  const [statusInfo, setStatusInfo] = useState<StatusInfo>({})
-  const [loading, setLoading] = useState(false)
-  const [showBoundOnly, setShowBoundOnly] = useState(true)
-  const [unbindTarget, setUnbindTarget] = useState<BindingItem | null>(null)
+  const beginRead = useReadScope(JSON.stringify([props.open, props.userId]))
+  const [user, setUser] = useResettableState<User | null>(null, beginRead)
+  const [oauthBindings, setOauthBindings] = useResettableState<OAuthBinding[]>(
+    [],
+    beginRead
+  )
+  const [statusInfo, setStatusInfo] = useResettableState<StatusInfo>(
+    {},
+    beginRead
+  )
+  const [loading, setLoading] = useResettableState(
+    Boolean(props.open && props.userId),
+    beginRead
+  )
+  const [showBoundOnly, setShowBoundOnly] = useResettableState(true, beginRead)
+  const [unbindTarget, setUnbindTarget] =
+    useResettableState<BindingItem | null>(null, beginRead)
   const [unbinding, setUnbinding] = useState(false)
 
-  const fetchData = useCallback(async () => {
-    if (!props.userId) return
-    setLoading(true)
-    try {
-      const [userRes, oauthRes, statusRes] = await Promise.all([
-        getUser(props.userId),
-        getUserOAuthBindings(props.userId).catch(() => ({
+  const loadData = useCallback(() => {
+    if (!props.userId) return Promise.resolve()
+    const current = beginRead()
+    if (!current()) return Promise.resolve()
+    return Promise.all([
+      getUser(props.userId),
+      getUserOAuthBindings(props.userId).catch(() => ({
+        success: false,
+        data: [],
+      })),
+      api
+        .get('/api/status')
+        .then((r) => r.data)
+        .catch(() => ({
           success: false,
-          data: [],
+          data: {},
         })),
-        api
-          .get('/api/status')
-          .then((r) => r.data)
-          .catch(() => ({
-            success: false,
-            data: {},
-          })),
-      ])
-      if (userRes.success && userRes.data) {
-        setUser(userRes.data)
-      }
-      if (oauthRes.success && oauthRes.data) {
-        setOauthBindings(oauthRes.data as OAuthBinding[])
-      }
-      if (statusRes.success && statusRes.data) {
-        setStatusInfo(statusRes.data as StatusInfo)
-      }
-    } catch {
-      toast.error(t('Failed to load'))
-    } finally {
-      setLoading(false)
-    }
-  }, [props.userId, t])
+    ])
+      .then(([userRes, oauthRes, statusRes]) => {
+        if (!current()) return
+        if (userRes.success && userRes.data) {
+          setUser(userRes.data)
+        }
+        if (oauthRes.success && oauthRes.data) {
+          setOauthBindings(oauthRes.data as OAuthBinding[])
+        }
+        if (statusRes.success && statusRes.data) {
+          setStatusInfo(statusRes.data as StatusInfo)
+        }
+      })
+      .catch(() => {
+        if (current()) toast.error(t('Failed to load'))
+      })
+      .finally(() => {
+        if (current()) setLoading(false)
+      })
+  }, [
+    props.userId,
+    beginRead,
+    setUser,
+    setOauthBindings,
+    setStatusInfo,
+    setLoading,
+    t,
+  ])
+  const fetchData = useCallback(() => {
+    setLoading(true)
+    return loadData()
+  }, [loadData, setLoading])
 
+  const readInitialData = useEffectEvent(() => loadData())
   useEffect(() => {
-    if (props.open && props.userId) {
-      setShowBoundOnly(true)
-      fetchData()
-    } else {
-      setUser(null)
-      setOauthBindings([])
-      setStatusInfo({})
-    }
-  }, [props.open, props.userId, fetchData])
+    if (props.open && props.userId) void readInitialData()
+  }, [props.open, props.userId, beginRead])
 
   const allBindings = useMemo<BindingItem[]>(() => {
     const items: BindingItem[] = []
@@ -241,7 +270,7 @@ export function UserBindingDialog(props: Props) {
     }
 
     const oauthBindingMap = new Map(
-      oauthBindings.map((b) => [String(b.provider_id), b])
+      oauthBindings.map((b) => [b.provider_id, b])
     )
 
     const customProviders = statusInfo.custom_oauth_providers || []
@@ -249,14 +278,14 @@ export function UserBindingDialog(props: Props) {
 
     for (const provider of customProviders) {
       seenProviderIds.add(String(provider.id))
-      const binding = oauthBindingMap.get(String(provider.id))
+      const binding = oauthBindingMap.get(provider.id)
       items.push({
         key: `oauth_${provider.id}`,
-        label: provider.name || provider.id,
+        label: provider.name || String(provider.id),
         icon: <CustomProviderIcon iconUrl={provider.icon} />,
-        value: binding?.external_id || '',
+        value: binding?.provider_user_id || '',
         type: 'custom',
-        providerId: String(provider.id),
+        providerId: provider.id,
         isBound: !!binding,
         isEnabled: true,
       })
@@ -266,11 +295,11 @@ export function UserBindingDialog(props: Props) {
       if (!seenProviderIds.has(String(binding.provider_id))) {
         items.push({
           key: `oauth_${binding.provider_id}`,
-          label: binding.provider_name || binding.provider_id,
+          label: binding.provider_name || String(binding.provider_id),
           icon: <Link2 className='h-4 w-4' />,
-          value: binding.external_id || '-',
+          value: binding.provider_user_id || '-',
           type: 'custom',
-          providerId: String(binding.provider_id),
+          providerId: binding.provider_id,
           isBound: true,
           isEnabled: false,
         })

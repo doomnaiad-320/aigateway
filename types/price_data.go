@@ -5,6 +5,10 @@ import (
 	"math"
 )
 
+// ErrorCodeBillingReconciliationPending identifies admission blocks caused by
+// a previous positive final settlement that still requires reconciliation.
+const ErrorCodeBillingReconciliationPending ErrorCode = "billing_reconciliation_pending"
+
 type GroupRatioInfo struct {
 	GroupRatio        float64
 	GroupSpecialRatio float64
@@ -26,8 +30,11 @@ type PriceData struct {
 	OtherRatios          map[string]float64
 	UsePrice             bool
 	Quota                int // 按次计费的最终额度（MJ / Task）
-	QuotaToPreConsume    int // 按量计费的预消耗额度
-	GroupRatioInfo       GroupRatioInfo
+	QuotaToPreConsume    int // 预消耗额度（真实估算额度应用预扣下限后）
+	// TaskBillingPlanRequired records that this pricing result deliberately
+	// deferred its estimate and reservation to a structured task plan.
+	TaskBillingPlanRequired bool
+	GroupRatioInfo          GroupRatioInfo
 }
 
 func (p *PriceData) AddOtherRatio(key string, ratio float64) {

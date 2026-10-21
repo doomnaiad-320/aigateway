@@ -61,6 +61,8 @@ jobs:
           files: |
             max-api-*
             checksums-linux.txt
+            LICENSE
+            THIRD-PARTY-LICENSES.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -107,6 +109,8 @@ jobs:
           files: |
             max-api-macos-*
             checksums-macos.txt
+            LICENSE
+            THIRD-PARTY-LICENSES.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -155,5 +159,7 @@ jobs:
           files: |
             max-api-*.exe
             checksums-windows.txt
+            LICENSE
+            THIRD-PARTY-LICENSES.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

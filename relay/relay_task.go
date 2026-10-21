@@ -19,6 +19,7 @@ import (
 	relayconstant "github.com/MAX-API-Next/MAX-API/relay/constant"
 	"github.com/MAX-API-Next/MAX-API/relay/helper"
 	"github.com/MAX-API-Next/MAX-API/service"
+	"github.com/MAX-API-Next/MAX-API/setting/task_billing_setting"
 	"github.com/MAX-API-Next/MAX-API/types"
 	"github.com/gin-gonic/gin"
 )
@@ -28,7 +29,117 @@ type TaskSubmitResult struct {
 	TaskData       []byte
 	Platform       constant.TaskPlatform
 	Quota          int
+	Task           *model.Task
+	response       *taskResponseSnapshot
 	//PerCallPrice   types.PriceData
+}
+
+func (r *TaskSubmitResult) WriteResponse(c *gin.Context) error {
+	if r == nil {
+		return errors.New("task submit result is nil")
+	}
+	return r.response.writeTo(c)
+}
+
+func populateTaskBillingMetadata(task *model.Task, info *relaycommon.RelayInfo) {
+	if task == nil || info == nil {
+		return
+	}
+	deltaSettlementDisabled := false
+	if info.ChannelMeta != nil && info.ChannelType == constant.ChannelTypeDoubaoVideo {
+		deltaSettlementDisabled = info.ChannelOtherSettings.DisableTaskDeltaSettlement
+	}
+	task.PrivateData.BillingSource = info.BillingSource
+	task.PrivateData.BillingRequestId = info.RequestId
+	task.PrivateData.SubscriptionId = info.SubscriptionId
+	task.PrivateData.TokenId = info.TokenId
+	task.PrivateData.NodeName = common.NodeName
+	structuredTaskPlan := info.TaskBillingPlan != nil
+	task.PrivateData.BillingContext = &model.TaskBillingContext{
+		ModelPrice:              info.PriceData.ModelPrice,
+		GroupRatio:              info.PriceData.GroupRatioInfo.GroupRatio,
+		ModelRatio:              info.PriceData.ModelRatio,
+		OtherRatios:             info.PriceData.OtherRatios,
+		TaskBilling:             info.TaskBilling,
+		TaskBillingPlan:         types.CloneTaskBillingPlan(info.TaskBillingPlan),
+		OriginModelName:         info.OriginModelName,
+		PerCallBilling:          !structuredTaskPlan && (common.StringsContains(constant.TaskPricePatches, info.OriginModelName) || info.PriceData.UsePrice || info.TaskBilling != nil),
+		DeltaSettlementDisabled: common.GetPointer(deltaSettlementDisabled),
+	}
+	task.Action = info.Action
+}
+
+func ensureTaskPlaceholder(platform constant.TaskPlatform, info *relaycommon.RelayInfo, preConsumedQuota int) (*model.Task, *dto.TaskError) {
+	if info == nil || info.TaskRelayInfo == nil {
+		return nil, service.TaskErrorWrapperLocal(errors.New("task relay metadata is unavailable"), "persist_task_failed", http.StatusInternalServerError)
+	}
+	if preConsumedQuota < 0 {
+		return nil, service.TaskErrorWrapperLocal(errors.New("pre-consumed quota cannot be negative"), "persist_task_failed", http.StatusInternalServerError)
+	}
+	if info.PersistedTaskID > 0 {
+		var task model.Task
+		if err := model.DB.First(&task, info.PersistedTaskID).Error; err != nil {
+			return nil, TaskPersistenceError(err, "load_persisted_task_failed", "failed to load persisted task")
+		}
+		fresh := model.InitTask(platform, info)
+		task.Platform = platform
+		task.ChannelId = fresh.ChannelId
+		task.Group = fresh.Group
+		task.Properties = fresh.Properties
+		task.PrivateData.Key = fresh.PrivateData.Key
+		task.PrivateData.AwaitingUpstreamID = true
+		task.Quota = preConsumedQuota
+		populateTaskBillingMetadata(&task, info)
+		if err := task.Update(); err != nil {
+			return nil, TaskPersistenceError(err, "update_persisted_task_failed", "failed to update persisted task")
+		}
+		return &task, nil
+	}
+
+	task := model.InitTask(platform, info)
+	task.Quota = preConsumedQuota
+	task.PrivateData.AwaitingUpstreamID = true
+	populateTaskBillingMetadata(task, info)
+	if err := task.Insert(); err != nil {
+		return nil, TaskPersistenceError(err, "persist_task_failed", "failed to persist task")
+	}
+	info.PersistedTaskID = task.ID
+	return task, nil
+}
+
+func TaskPersistenceError(err error, code string, safeMessage string) *dto.TaskError {
+	common.SysLog(fmt.Sprintf("%s: %s", code, err.Error()))
+	return service.TaskErrorWrapperLocal(errors.New(safeMessage), code, http.StatusInternalServerError)
+}
+
+func reserveTaskQuota(c *gin.Context, info *relaycommon.RelayInfo, targetQuota int) (int, *dto.TaskError) {
+	if info == nil {
+		return 0, service.TaskErrorWrapperLocal(errors.New("task relay metadata is unavailable"), "reserve_task_quota_failed", http.StatusInternalServerError)
+	}
+	if !info.PriceData.FreeModel {
+		if info.Billing == nil {
+			info.ForcePreConsume = true
+			if apiErr := service.PreConsumeBilling(c, targetQuota, info); apiErr != nil {
+				return 0, service.TaskErrorFromAPIError(apiErr)
+			}
+		} else if reserveErr := info.Billing.Reserve(targetQuota); reserveErr != nil {
+			return 0, service.TaskErrorWrapperLocal(reserveErr, "reserve_task_quota_failed", http.StatusForbidden)
+		}
+	}
+	if info.Billing != nil {
+		// A free retry still owns any reservation from an earlier paid attempt
+		// until the upstream accepts it. Keep that reservation on the task
+		// placeholder, then settle the successful free result to quota zero;
+		// failed attempts may continue to another paid channel.
+		return info.Billing.GetPreConsumedQuota(), nil
+	}
+	if info.PriceData.FreeModel {
+		// No Billing session means this attempt did not reserve any quota. Keep
+		// the placeholder at zero even if a future estimator accidentally
+		// supplies a non-zero target for a free route.
+		return 0, nil
+	}
+	return targetQuota, nil
 }
 
 type taskBillingEstimator interface {
@@ -159,21 +270,25 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		return nil, service.TaskErrorWrapperLocal(fmt.Errorf("invalid api platform: %s", platform), "invalid_api_platform", http.StatusBadRequest)
 	}
 	adaptor.Init(info)
+	modelName := info.OriginModelName
+	if modelName != "" {
+		info.UpstreamModelName = modelName
+		if err := helper.ModelMappedHelper(c, info, nil); err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "model_mapping_failed", http.StatusBadRequest)
+		}
+	}
 	if taskErr := adaptor.ValidateRequestAndSetAction(c, info); taskErr != nil {
 		return nil, taskErr
 	}
 
 	// 2. 确定模型名称
-	modelName := info.OriginModelName
 	if modelName == "" {
 		modelName = service.CoverTaskActionToModelName(platform, info.Action)
-	}
-
-	// 2.5 应用渠道的模型映射（与同步任务对齐）
-	info.OriginModelName = modelName
-	info.UpstreamModelName = modelName
-	if err := helper.ModelMappedHelper(c, info, nil); err != nil {
-		return nil, service.TaskErrorWrapperLocal(err, "model_mapping_failed", http.StatusBadRequest)
+		info.OriginModelName = modelName
+		info.UpstreamModelName = modelName
+		if err := helper.ModelMappedHelper(c, info, nil); err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "model_mapping_failed", http.StatusBadRequest)
+		}
 	}
 
 	// 3. 预生成公开 task ID（仅首次）
@@ -189,11 +304,20 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 
 	// 5. 价格计算：基础模型价格
 	info.OriginModelName = modelName
-	priceData, err := helper.ModelPriceHelperPerCall(c, info)
+	_, taskPlanCapable := adaptor.(channel.TaskBillingPlanProvider)
+	priceData, err := helper.ModelPriceHelperPerCallWithPlanCapability(c, info, taskPlanCapable)
 	if err != nil {
 		return nil, service.TaskErrorWrapper(err, "model_price_error", http.StatusBadRequest)
 	}
 	info.PriceData = priceData
+
+	// Structured task plans become the formal price source only after the
+	// adaptor has normalized the final request body. A plan error must stop the
+	// request before upstream admission rather than silently falling back to a
+	// different legacy price.
+	if err := captureTaskBillingPlan(c, info, adaptor); err != nil {
+		return nil, service.TaskErrorWrapperLocal(err, "task_billing_plan_error", http.StatusBadRequest)
+	}
 
 	// 6. Prefer a parameterized rate card when the adaptor can normalize the
 	// request. Legacy task models continue to use OtherRatios.
@@ -228,12 +352,25 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		}
 	}
 
-	// 7. 预扣费（仅首次 — 重试时 info.Billing 已存在，跳过）
-	if info.Billing == nil && !info.PriceData.FreeModel {
-		info.ForcePreConsume = true
-		if apiErr := service.PreConsumeBilling(c, info.PriceData.Quota, info); apiErr != nil {
-			return nil, service.TaskErrorFromAPIError(apiErr)
-		}
+	// Keep estimate and reservation separate. Bounded-actual plans reserve their
+	// own proven upper bound; the site-wide floor is applied to that complete
+	// reservation exactly once and is never added as a fee.
+	taskEstimateQuota, preConsumedQuota, taskPlanActive, err := resolveTaskBillingQuotas(info)
+	if err != nil {
+		return nil, service.TaskErrorWrapperLocal(err, "task_billing_plan_error", http.StatusBadRequest)
+	}
+	info.PriceData.Quota = taskEstimateQuota
+	info.PriceData.QuotaToPreConsume = preConsumedQuota
+
+	// 7. 预扣费。重试可能因路由/分组变化得到更高的目标额度，必须通过
+	// BillingSession.Reserve 幂等补足，不能继续沿用较小的首次预留。
+	actualReservedQuota, reservationErr := reserveTaskQuota(c, info, preConsumedQuota)
+	if reservationErr != nil {
+		return nil, reservationErr
+	}
+	task, taskErr := ensureTaskPlaceholder(platform, info, actualReservedQuota)
+	if taskErr != nil {
+		return nil, taskErr
 	}
 
 	// 9. 发送请求
@@ -245,45 +382,157 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		return nil, service.TaskErrorWrapper(err, "do_request_failed", http.StatusInternalServerError)
 	}
 	if resp != nil && resp.StatusCode != http.StatusOK {
-		responseBody, _ := io.ReadAll(resp.Body)
-		return nil, service.TaskErrorWrapper(fmt.Errorf("%s", string(responseBody)), "fail_to_fetch_task", resp.StatusCode)
+		return nil, mapUpstreamTaskError(c, service.TaskErrorFromUpstreamResponse(c, resp, "fail_to_fetch_task"))
 	}
-
-	// 10. 返回 OtherRatios 给下游（header 必须在 DoResponse 写 body 之前设置）
-	otherRatios := info.PriceData.OtherRatios
-	if otherRatios == nil {
-		otherRatios = map[string]float64{}
+	if resp == nil {
+		return nil, service.TaskErrorWrapperLocal(errors.New("task upstream response is nil"), "empty_upstream_response", http.StatusBadGateway)
 	}
-	ratiosJSON, _ := common.Marshal(otherRatios)
-	c.Header("X-Max-Api-Other-Ratios", string(ratiosJSON))
-	c.Header("X-New-Api-Other-Ratios", string(ratiosJSON))
+	info.UpstreamTaskResponseReceived = true
 
-	// 11. 解析响应
-	upstreamTaskID, taskData, taskErr := adaptor.DoResponse(c, resp, info)
+	// 10-11. Buffer the adapter response until the task row and settlement
+	// intent are durable. Adapters may write the body while parsing.
+	var upstreamTaskID string
+	var taskData []byte
+	var responseSnapshot *taskResponseSnapshot
+	func() {
+		originalWriter := c.Writer
+		bufferedWriter := newTaskResponseBuffer(originalWriter)
+		c.Writer = bufferedWriter
+		defer func() { c.Writer = originalWriter }()
+
+		setTaskOtherRatioHeaders(bufferedWriter.Header(), info.PriceData.OtherRatios)
+
+		upstreamTaskID, taskData, taskErr = adaptor.DoResponse(c, resp, info)
+		responseSnapshot = bufferedWriter.snapshot()
+	}()
 	if taskErr != nil {
-		return nil, taskErr
+		return nil, mapUpstreamTaskError(c, taskErr)
+	}
+	if strings.TrimSpace(upstreamTaskID) == "" {
+		return nil, service.TaskErrorWrapperLocal(errors.New("task upstream response did not contain a task id"), "missing_upstream_task_id", http.StatusBadGateway)
+	}
+	if !info.IsStream {
+		info.SetFirstResponseTime()
 	}
 
 	// 11. 提交后计费调整：让适配器根据上游实际返回调整 OtherRatios
-	finalQuota := info.PriceData.Quota
-	if !taskBillingOverride {
+	finalQuota := taskEstimateQuota
+	if taskPlanActive {
+		// Submission finalization closes the reservation lifecycle only. Actual
+		// H3 consumption is projected once canonical terminal usage is available.
+		finalQuota = actualReservedQuota
+	} else if !taskBillingOverride {
 		if adjustedRatios := adaptor.AdjustBillingOnSubmit(info, taskData); len(adjustedRatios) > 0 {
 			// 基于调整后的 ratios 重新计算 quota
-			finalQuota = recalcQuotaFromRatios(info, adjustedRatios)
+			finalQuota = recalcQuotaFromRatios(info, taskEstimateQuota, adjustedRatios)
 			info.PriceData.OtherRatios = adjustedRatios
 			info.PriceData.Quota = finalQuota
 		}
 	}
+	if responseSnapshot != nil {
+		setTaskOtherRatioHeaders(responseSnapshot.header, info.PriceData.OtherRatios)
+	}
+	task.PrivateData.UpstreamTaskID = upstreamTaskID
+	task.PrivateData.AwaitingUpstreamID = false
+	// Keep the persisted task at the actual reservation until the durable
+	// request-finalize operation applies the funding delta and task quota in one
+	// transaction. Writing finalQuota here would make an unpaid target look
+	// settled and would break settlement recovery's task-quota CAS.
+	task.Quota = actualReservedQuota
+	task.Data = taskData
+	populateTaskBillingMetadata(task, info)
 
 	return &TaskSubmitResult{
 		UpstreamTaskID: upstreamTaskID,
 		TaskData:       taskData,
 		Platform:       platform,
 		Quota:          finalQuota,
+		Task:           task,
+		response:       responseSnapshot,
 	}, nil
 }
 
+func captureTaskBillingPlan(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.TaskAdaptor) error {
+	if info == nil {
+		return nil
+	}
+	info.TaskBillingPlan = nil
+	planner, ok := adaptor.(channel.TaskBillingPlanProvider)
+	if !ok {
+		if info.PriceData.TaskBillingPlanRequired {
+			return errors.New("required task billing plan provider is unavailable")
+		}
+		return nil
+	}
+	plan, err := planner.BuildTaskBillingPlan(c, info)
+	if err != nil {
+		return err
+	}
+	if info.PriceData.TaskBillingPlanRequired && plan == nil {
+		return errors.New("required task billing plan was not produced")
+	}
+	info.TaskBillingPlan = plan
+	return nil
+}
+
+func resolveTaskBillingQuotas(info *relaycommon.RelayInfo) (estimateQuota int, reservationQuota int, usesPlan bool, err error) {
+	if info == nil {
+		return 0, 0, false, errors.New("task relay metadata is unavailable")
+	}
+	estimateQuota = info.PriceData.Quota
+	reservationQuota = estimateQuota
+	if plan := info.TaskBillingPlan; plan != nil {
+		if validateErr := task_billing_setting.ValidateH3BillingPlanSnapshot(plan); validateErr != nil {
+			return 0, 0, true, validateErr
+		}
+		estimateQuota = plan.EstimateQuota
+		reservationQuota = plan.ReserveQuota
+		usesPlan = true
+	}
+	if estimateQuota < 0 || reservationQuota < 0 {
+		return 0, 0, usesPlan, errors.New("task billing quota cannot be negative")
+	}
+	if !info.PriceData.FreeModel && info.PriceData.GroupRatioInfo.GroupRatio > 0 {
+		reservationQuota, err = helper.ApplyPreConsumedQuotaFloor(reservationQuota, true)
+		if err != nil {
+			return 0, 0, usesPlan, err
+		}
+	}
+	return estimateQuota, reservationQuota, usesPlan, nil
+}
+
+func setTaskOtherRatioHeaders(header http.Header, otherRatios map[string]float64) {
+	if header == nil {
+		return
+	}
+	if otherRatios == nil {
+		otherRatios = map[string]float64{}
+	}
+	ratiosJSON, err := common.Marshal(otherRatios)
+	if err != nil {
+		common.SysLog("failed to marshal task ratio headers: " + err.Error())
+		ratiosJSON = []byte("{}")
+	}
+	header.Set("X-Max-Api-Other-Ratios", string(ratiosJSON))
+	header.Set("X-New-Api-Other-Ratios", string(ratiosJSON))
+}
+
+// mapUpstreamTaskError is only called after an upstream response is available.
+func mapUpstreamTaskError(c *gin.Context, taskErr *dto.TaskError) *dto.TaskError {
+	if c != nil {
+		service.ResetTaskStatusCode(taskErr, c.GetString("status_code_mapping"))
+	}
+	return taskErr
+}
+
 func estimateTaskBilling(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.TaskAdaptor, platform constant.TaskPlatform) (*types.TaskBillingResult, error) {
+	// A structured task plan is the sole pricing source for its provider. Do not
+	// retain a legacy rate-card result alongside it, or later settlement/logging
+	// could observe two competing billing identities for one task.
+	if info != nil && info.TaskBillingPlan != nil {
+		info.TaskBilling = nil
+		return nil, nil
+	}
 	if estimator, ok := adaptor.(taskBillingEstimator); ok {
 		taskBilling, err := estimator.EstimateTaskBilling(c, info)
 		if err != nil || taskBilling != nil {
@@ -358,10 +607,12 @@ func buildTaskSubmitRequestBody(c *gin.Context, info *relaycommon.RelayInfo, ada
 }
 
 // recalcQuotaFromRatios 根据 adjustedRatios 重新计算 quota。
-// 公式: baseQuota × ∏(ratio) — 其中 baseQuota 是不含 OtherRatios 的基础额度。
-func recalcQuotaFromRatios(info *relaycommon.RelayInfo, ratios map[string]float64) int {
-	// 从 PriceData 获取不含 OtherRatios 的基础价格
-	baseQuota := float64(info.PriceData.Quota)
+// estimatedQuota 是应用原始 OtherRatios 后、预扣下限前的估算额度。
+// 先还原不含 OtherRatios 的基础额度，再应用上游返回的新倍率。
+func recalcQuotaFromRatios(info *relaycommon.RelayInfo, estimatedQuota int, ratios map[string]float64) int {
+	// estimatedQuota includes the ratios used for the original reservation.
+	// Remove those ratios before applying the upstream-adjusted values.
+	baseQuota := float64(estimatedQuota)
 	// 先除掉原有的 OtherRatios 恢复基础额度
 	for _, ra := range info.PriceData.OtherRatios {
 		if ra != 1.0 && ra > 0 {
@@ -619,7 +870,10 @@ func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
 		task.PrivateData.ResultURL = taskcommon.BuildProxyURL(task.TaskID)
 	}
 
-	if !snap.Equal(task.Snapshot()) {
+	// Terminal transitions must go through the polling settlement path. The
+	// realtime fetch may report terminal data to this caller, but must not make
+	// that state durable without the matching refund/final-settlement intent.
+	if !isTerminalTaskStatus(task.Status) && !snap.Equal(task.Snapshot()) {
 		_, _ = task.UpdateWithStatus(snap.Status)
 	}
 
@@ -643,6 +897,10 @@ func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
 		Data: out,
 	})
 	return respBody
+}
+
+func isTerminalTaskStatus(status model.TaskStatus) bool {
+	return status == model.TaskStatusSuccess || status == model.TaskStatusFailure
 }
 
 // detectVideoFormat 从 Gemini/Vertex 原始响应中探测视频格式

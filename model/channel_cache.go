@@ -3,7 +3,6 @@ package model
 import (
 	"errors"
 	"fmt"
-	"math/rand"
 	"sort"
 	"strings"
 	"sync"
@@ -88,12 +87,15 @@ func InitChannelCache() {
 		if channel.ChannelInfo.IsMultiKey {
 			channel.Keys = channel.GetKeys()
 			if channel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
+				pollingLock := GetChannelPollingLock(i)
+				pollingLock.Lock()
 				if oldChannel, ok := channelsIDM[i]; ok {
 					// 存在旧的渠道，如果是多key且轮询，保留轮询索引信息
 					if oldChannel.ChannelInfo.IsMultiKey && oldChannel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
 						channel.ChannelInfo.MultiKeyPollingIndex = oldChannel.ChannelInfo.MultiKeyPollingIndex
 					}
 				}
+				pollingLock.Unlock()
 			}
 		}
 	}
@@ -113,17 +115,23 @@ func SyncChannelCache(frequency int) {
 }
 
 func GetRandomSatisfiedChannel(group string, model string, retry int, requestPath string) (*Channel, error) {
+	return GetRandomSatisfiedChannelExcluding(group, model, retry, requestPath, nil)
+}
+
+// GetRandomSatisfiedChannelExcluding selects from the cache while excluding
+// channels already attempted by the current relay request.
+func GetRandomSatisfiedChannelExcluding(group string, model string, retry int, requestPath string, excludedChannelIDs map[int]struct{}) (*Channel, error) {
 	// if memory cache is disabled, get channel directly from database
 	if !common.MemoryCacheEnabled {
-		return GetChannel(group, model, retry, requestPath)
+		return GetChannelExcluding(group, model, retry, requestPath, excludedChannelIDs)
 	}
 
 	channelSyncLock.RLock()
-	defer channelSyncLock.RUnlock()
 
 	// First, try to find channels with the exact model name.
 	channels, err := filterChannelsByRequestPath(group2model2channels[group][model], requestPath)
 	if err != nil {
+		channelSyncLock.RUnlock()
 		return nil, err
 	}
 
@@ -132,51 +140,72 @@ func GetRandomSatisfiedChannel(group string, model string, retry int, requestPat
 		normalizedModel := ratio_setting.FormatMatchingModelName(model)
 		channels, err = filterChannelsByRequestPath(group2model2channels[group][normalizedModel], requestPath)
 		if err != nil {
+			channelSyncLock.RUnlock()
 			return nil, err
 		}
 	}
 
 	if len(channels) == 0 {
+		channelSyncLock.RUnlock()
+		return nil, nil
+	}
+	if len(excludedChannelIDs) > 0 {
+		availableChannels := make([]int, 0, len(channels))
+		for _, channelID := range channels {
+			if _, excluded := excludedChannelIDs[channelID]; !excluded {
+				availableChannels = append(availableChannels, channelID)
+			}
+		}
+		channels = availableChannels
+	}
+	if len(channels) == 0 {
+		channelSyncLock.RUnlock()
 		return nil, nil
 	}
 
-	if len(channels) == 1 {
-		if channel, ok := channelsIDM[channels[0]]; ok {
-			return channel, nil
+	cachedChannels := make([]*Channel, 0, len(channels))
+	for _, channelID := range channels {
+		channel, ok := channelsIDM[channelID]
+		if !ok {
+			channelSyncLock.RUnlock()
+			return nil, fmt.Errorf("数据库一致性错误，渠道# %d 不存在，请联系管理员修复", channelID)
 		}
-		return nil, fmt.Errorf("数据库一致性错误，渠道# %d 不存在，请联系管理员修复", channels[0])
+		cachedChannels = append(cachedChannels, channel)
+	}
+	channelSyncLock.RUnlock()
+
+	candidates := buildChannelRoutingCandidates(cachedChannels)
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	if len(candidates) == 1 {
+		return candidates[0].channel, nil
 	}
 
-	uniquePriorities := make(map[int]bool)
-	for _, channelId := range channels {
-		if channel, ok := channelsIDM[channelId]; ok {
-			uniquePriorities[int(channel.GetPriority())] = true
-		} else {
-			return nil, fmt.Errorf("数据库一致性错误，渠道# %d 不存在，请联系管理员修复", channelId)
-		}
+	uniquePriorities := make(map[int64]bool)
+	for _, candidate := range candidates {
+		uniquePriorities[candidate.priority] = true
 	}
-	var sortedUniquePriorities []int
+	var sortedUniquePriorities []int64
 	for priority := range uniquePriorities {
 		sortedUniquePriorities = append(sortedUniquePriorities, priority)
 	}
-	sort.Sort(sort.Reverse(sort.IntSlice(sortedUniquePriorities)))
+	sort.Slice(sortedUniquePriorities, func(i, j int) bool {
+		return sortedUniquePriorities[i] > sortedUniquePriorities[j]
+	})
 
 	if retry >= len(uniquePriorities) {
 		retry = len(uniquePriorities) - 1
 	}
-	targetPriority := int64(sortedUniquePriorities[retry])
+	targetPriority := sortedUniquePriorities[retry]
 
 	// get the priority for the given retry number
 	var sumWeight = 0
 	var targetChannels []*Channel
-	for _, channelId := range channels {
-		if channel, ok := channelsIDM[channelId]; ok {
-			if channel.GetPriority() == targetPriority {
-				sumWeight += channel.GetWeight()
-				targetChannels = append(targetChannels, channel)
-			}
-		} else {
-			return nil, fmt.Errorf("数据库一致性错误，渠道# %d 不存在，请联系管理员修复", channelId)
+	for _, candidate := range candidates {
+		if candidate.priority == targetPriority {
+			sumWeight += candidate.channel.GetWeight()
+			targetChannels = append(targetChannels, candidate.channel)
 		}
 	}
 
@@ -202,7 +231,10 @@ func GetRandomSatisfiedChannel(group string, model string, retry int, requestPat
 	totalWeight := sumWeight * smoothingFactor
 
 	// Generate a random value in the range [0, totalWeight)
-	randomWeight := rand.Intn(totalWeight)
+	randomWeight, err := common.SecureRandomInt(totalWeight)
+	if err != nil {
+		return nil, err
+	}
 
 	// Find a channel based on its weight
 	for _, channel := range targetChannels {
@@ -223,7 +255,12 @@ func filterChannelsByRequestPath(channels []int, requestPath string) ([]int, err
 	for _, channelId := range channels {
 		channel, ok := channelsIDM[channelId]
 		if !ok {
-			filtered = append(filtered, channelId)
+			if requestPath != "/v1/alpha/search" {
+				filtered = append(filtered, channelId)
+			}
+			continue
+		}
+		if !channelTypeSupportsRequestPath(channel.Type, requestPath) {
 			continue
 		}
 		if channel.Type != constant.ChannelTypeAdvancedCustom {
@@ -240,8 +277,18 @@ func filterChannelsByRequestPath(channels []int, requestPath string) ([]int, err
 	return filtered, nil
 }
 
+func channelTypeSupportsRequestPath(channelType int, requestPath string) bool {
+	if requestPath != "/v1/alpha/search" {
+		return true
+	}
+	return channelType == constant.ChannelTypeCodex || channelType == constant.ChannelTypeAdvancedCustom
+}
+
 func ChannelSupportsRequestPath(channel *Channel, requestPath string) bool {
 	if channel == nil {
+		return false
+	}
+	if !channelTypeSupportsRequestPath(channel.Type, requestPath) {
 		return false
 	}
 	if channel.Type != constant.ChannelTypeAdvancedCustom {

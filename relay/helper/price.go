@@ -9,6 +9,7 @@ import (
 	"github.com/MAX-API-Next/MAX-API/model"
 	"github.com/MAX-API-Next/MAX-API/pkg/billingexpr"
 	relaycommon "github.com/MAX-API-Next/MAX-API/relay/common"
+	relayconstant "github.com/MAX-API-Next/MAX-API/relay/constant"
 	"github.com/MAX-API-Next/MAX-API/setting/billing_setting"
 	"github.com/MAX-API-Next/MAX-API/setting/operation_setting"
 	"github.com/MAX-API-Next/MAX-API/setting/ratio_setting"
@@ -19,7 +20,7 @@ import (
 )
 
 func modelPriceNotConfiguredError(modelName string, userId int) error {
-	if model.IsAdmin(userId) {
+	if userId > 0 && model.IsAdmin(userId) {
 		return fmt.Errorf(
 			"模型 %s 的价格未配置。请前往「系统设置 → 运营设置」开启自用模式，或在「系统设置 → 分组与模型定价设置」中为该模型配置价格；"+
 				"Model %s price not configured. Go to System Settings → Operation Settings to enable self-use mode, or configure the model price in System Settings → Group & Model Pricing.",
@@ -31,6 +32,50 @@ func modelPriceNotConfiguredError(modelName string, userId int) error {
 			"Model %s has not been priced by the administrator yet. Please contact the site administrator to enable this model.",
 		modelName, modelName,
 	)
+}
+
+func taskModelRequiresConfiguredPrice(modelName string) bool {
+	modelName = strings.ToLower(strings.TrimSpace(modelName))
+	return modelName == "swap_face" || strings.HasPrefix(modelName, "mj_") || strings.HasPrefix(modelName, "suno_")
+}
+
+func configuredPreConsumedQuota() (int, error) {
+	if common.PreConsumedQuota < 0 {
+		return 0, fmt.Errorf("pre-consumed quota cannot be negative: %d", common.PreConsumedQuota)
+	}
+	return common.PreConsumedQuota, nil
+}
+
+// ApplyPreConsumedQuotaFloor makes the administrator's pre-consume setting
+// effective for every paid pricing mode. The floor is applied to the quota
+// amount, after model/group pricing, and never to a free group.
+func ApplyPreConsumedQuotaFloor(quota int, billable bool) (int, error) {
+	if quota < 0 {
+		return 0, fmt.Errorf("calculated pre-consume quota cannot be negative: %d", quota)
+	}
+	configured, err := configuredPreConsumedQuota()
+	if err != nil {
+		return 0, err
+	}
+	if billable && quota < configured {
+		return configured, nil
+	}
+	return quota, nil
+}
+
+func addNonNegativeInts(values ...int) (int, error) {
+	maxInt := int(^uint(0) >> 1)
+	total := 0
+	for _, value := range values {
+		if value < 0 {
+			return 0, fmt.Errorf("billing estimate cannot be negative: %d", value)
+		}
+		if total > maxInt-value {
+			return 0, fmt.Errorf("billing estimate overflows integer range")
+		}
+		total += value
+	}
+	return total, nil
 }
 
 // https://docs.claude.com/en/docs/build-with-claude/prompt-caching#1-hour-cache-duration
@@ -66,6 +111,12 @@ func HandleGroupRatio(ctx *gin.Context, relayInfo *relaycommon.RelayInfo) types.
 }
 
 func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens int, meta *types.TokenCountMeta) (types.PriceData, error) {
+	if _, err := configuredPreConsumedQuota(); err != nil {
+		return types.PriceData{}, err
+	}
+	if promptTokens < 0 {
+		return types.PriceData{}, fmt.Errorf("prompt token estimate cannot be negative: %d", promptTokens)
+	}
 	modelPrice, usePrice := ratio_setting.GetModelPrice(info.OriginModelName, false)
 
 	groupRatioInfo := HandleGroupRatio(c, info)
@@ -86,10 +137,14 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 	var audioRatio float64
 	var audioCompletionRatio float64
 	var freeModel bool
+	var err error
 	if !usePrice {
-		preConsumedTokens := common.Max(promptTokens, common.PreConsumedQuota)
-		if meta.MaxTokens != 0 {
-			preConsumedTokens += meta.MaxTokens
+		preConsumedTokens := promptTokens
+		if meta != nil && meta.MaxTokens != 0 {
+			preConsumedTokens, err = addNonNegativeInts(preConsumedTokens, meta.MaxTokens)
+			if err != nil {
+				return types.PriceData{}, err
+			}
 		}
 		var success bool
 		var matchName string
@@ -119,7 +174,7 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		}
 		preConsumedQuota = quota
 	} else {
-		if meta.ImagePriceRatio != 0 {
+		if meta != nil && meta.ImagePriceRatio != 0 {
 			modelPrice = modelPrice * meta.ImagePriceRatio
 		}
 		quota, err := common.QuotaFromFloatStrict(modelPrice * common.QuotaPerUnit * groupRatioInfo.GroupRatio)
@@ -145,6 +200,14 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 				preConsumedQuota = 0
 				freeModel = true
 			}
+		}
+	}
+	// Alpha Search adds its deterministic tool surcharge in the controller.
+	// Defer the reservation floor until that complete estimate is available.
+	if !freeModel && groupRatioInfo.GroupRatio > 0 && info.RelayMode != relayconstant.RelayModeAlphaSearch {
+		preConsumedQuota, err = ApplyPreConsumedQuotaFloor(preConsumedQuota, true)
+		if err != nil {
+			return types.PriceData{}, err
 		}
 	}
 
@@ -174,12 +237,44 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 
 // ModelPriceHelperPerCall 按次/按量计费的 PriceHelper (MJ、Task)
 func ModelPriceHelperPerCall(c *gin.Context, info *relaycommon.RelayInfo) (types.PriceData, error) {
+	return modelPriceHelperPerCall(c, info, false)
+}
+
+// ModelPriceHelperPerCallWithPlanCapability allows the selected task adaptor
+// to opt into structured task-plan pricing. Other callers remain on the
+// ordinary fixed-price or ratio path.
+func ModelPriceHelperPerCallWithPlanCapability(c *gin.Context, info *relaycommon.RelayInfo, taskPlanCapable bool) (types.PriceData, error) {
+	return modelPriceHelperPerCall(c, info, taskPlanCapable)
+}
+
+func modelPriceHelperPerCall(c *gin.Context, info *relaycommon.RelayInfo, taskPlanCapable bool) (types.PriceData, error) {
+	if info == nil {
+		return types.PriceData{}, fmt.Errorf("relay info is nil")
+	}
 	groupRatioInfo := HandleGroupRatio(c, info)
+	if _, err := configuredPreConsumedQuota(); err != nil {
+		return types.PriceData{}, err
+	}
 
 	modelPrice, success := ratio_setting.GetModelPrice(info.OriginModelName, true)
 	usePrice := success
 	var modelRatio float64
-	rateCardPriced := task_billing_setting.HasRateCard(info.OriginModelName, info.UpstreamModelName)
+	upstreamModelName := ""
+	if info.ChannelMeta != nil {
+		upstreamModelName = info.UpstreamModelName
+	}
+	rateCardPriced := task_billing_setting.HasRateCard(info.OriginModelName, upstreamModelName)
+	effectiveTaskModel := strings.TrimSpace(info.OriginModelName)
+	if strings.TrimSpace(upstreamModelName) != "" {
+		effectiveTaskModel = strings.TrimSpace(upstreamModelName)
+	}
+	taskPlanPriced := taskPlanCapable && task_billing_setting.HasH3BillingPlanForModel(effectiveTaskModel)
+	if taskPlanPriced {
+		// A structured task plan owns H3 pricing. Ignore a stale legacy card
+		// match so it cannot turn the request into per-call billing or a second
+		// generic task estimate.
+		rateCardPriced = false
+	}
 
 	if !success {
 		defaultPrice, ok := ratio_setting.GetDefaultModelPriceMap()[info.OriginModelName]
@@ -189,6 +284,13 @@ func ModelPriceHelperPerCall(c *gin.Context, info *relaycommon.RelayInfo) (types
 		} else if rateCardPriced {
 			modelPrice = 0
 			usePrice = true
+		} else if taskPlanPriced {
+			// Structured task plans own the actual estimate and reservation. This
+			// helper only supplies the selected group ratio and must not require or
+			// synthesize a legacy model price.
+			modelPrice = 0
+		} else if taskModelRequiresConfiguredPrice(info.OriginModelName) {
+			return types.PriceData{}, modelPriceNotConfiguredError(info.OriginModelName, info.UserId)
 		} else {
 			var ratioSuccess bool
 			var matchName string
@@ -204,10 +306,15 @@ func ModelPriceHelperPerCall(c *gin.Context, info *relaycommon.RelayInfo) (types
 	}
 
 	var quota int
+	var err error
 	freeModel := false
 
-	if usePrice {
-		var err error
+	if taskPlanPriced {
+		quota = 0
+		if !operation_setting.GetQuotaSetting().EnableFreeModelPreConsume && groupRatioInfo.GroupRatio == 0 {
+			freeModel = true
+		}
+	} else if usePrice {
 		quota, err = common.QuotaFromFloatStrict(modelPrice * common.QuotaPerUnit * groupRatioInfo.GroupRatio)
 		if err != nil {
 			return types.PriceData{}, err
@@ -220,7 +327,6 @@ func ModelPriceHelperPerCall(c *gin.Context, info *relaycommon.RelayInfo) (types
 		}
 	} else {
 		// 按量计费：以模型倍率的一半作为预扣额度
-		var err error
 		quota, err = common.QuotaFromFloatStrict(modelRatio / 2 * common.QuotaPerUnit * groupRatioInfo.GroupRatio)
 		if err != nil {
 			return types.PriceData{}, err
@@ -234,13 +340,25 @@ func ModelPriceHelperPerCall(c *gin.Context, info *relaycommon.RelayInfo) (types
 		}
 	}
 
+	// Keep the model price in Quota for final settlement. The configured
+	// minimum belongs only to the reservation made before the request.
+	preConsumedQuota := quota
+	if !taskPlanPriced && !freeModel && groupRatioInfo.GroupRatio > 0 {
+		preConsumedQuota, err = ApplyPreConsumedQuotaFloor(quota, true)
+		if err != nil {
+			return types.PriceData{}, err
+		}
+	}
+
 	priceData := types.PriceData{
-		FreeModel:      freeModel,
-		ModelPrice:     modelPrice,
-		ModelRatio:     modelRatio,
-		UsePrice:       usePrice,
-		Quota:          quota,
-		GroupRatioInfo: groupRatioInfo,
+		FreeModel:               freeModel,
+		ModelPrice:              modelPrice,
+		ModelRatio:              modelRatio,
+		UsePrice:                usePrice,
+		Quota:                   quota,
+		QuotaToPreConsume:       preConsumedQuota,
+		TaskBillingPlanRequired: taskPlanPriced,
+		GroupRatioInfo:          groupRatioInfo,
 	}
 	return priceData, nil
 }
@@ -266,7 +384,7 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptT
 	}
 
 	estimatedCompletionTokens := 0
-	if meta.MaxTokens != 0 {
+	if meta != nil && meta.MaxTokens != 0 {
 		estimatedCompletionTokens = meta.MaxTokens
 	}
 
@@ -290,12 +408,21 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptT
 	if err != nil {
 		return types.PriceData{}, err
 	}
+	estimatedQuotaAfterGroup := preConsumedQuota
 
 	freeModel := false
 	if !operation_setting.GetQuotaSetting().EnableFreeModelPreConsume {
 		if groupRatioInfo.GroupRatio == 0 {
 			preConsumedQuota = 0
 			freeModel = true
+		}
+	}
+	// Alpha Search adds its deterministic tool surcharge in the controller.
+	// Defer the reservation floor until that complete estimate is available.
+	if !freeModel && groupRatioInfo.GroupRatio > 0 && info.RelayMode != relayconstant.RelayModeAlphaSearch {
+		preConsumedQuota, err = ApplyPreConsumedQuotaFloor(preConsumedQuota, true)
+		if err != nil {
+			return types.PriceData{}, err
 		}
 	}
 
@@ -309,7 +436,7 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptT
 		EstimatedPromptTokens:     promptTokens,
 		EstimatedCompletionTokens: estimatedCompletionTokens,
 		EstimatedQuotaBeforeGroup: quotaBeforeGroup,
-		EstimatedQuotaAfterGroup:  preConsumedQuota,
+		EstimatedQuotaAfterGroup:  estimatedQuotaAfterGroup,
 		EstimatedTier:             trace.MatchedTier,
 		QuotaPerUnit:              common.QuotaPerUnit,
 		ExprVersion:               billingexpr.ExprVersion(exprStr),

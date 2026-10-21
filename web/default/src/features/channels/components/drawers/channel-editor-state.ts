@@ -34,6 +34,68 @@ export const createEmptyModelMappingGuardrail = (): ModelMappingGuardrail => ({
   exposedTargetModels: [],
 })
 
+export function getModelMappingGuardrail(
+  modelMapping: string | undefined,
+  publishedModels: string[]
+): ModelMappingGuardrail {
+  if (!modelMapping?.trim()) {
+    return createEmptyModelMappingGuardrail()
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(modelMapping)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ...createEmptyModelMappingGuardrail(), invalidJson: true }
+    }
+
+    let hasInvalidTarget = false
+    const entries = Object.entries(parsed).reduce<
+      Array<{ source: string; target: string }>
+    >((acc, [rawSource, rawTarget]) => {
+      const source = String(rawSource).trim()
+      if (typeof rawTarget !== 'string') {
+        hasInvalidTarget = true
+        return acc
+      }
+      const target = rawTarget.trim()
+
+      if (source && target) {
+        acc.push({ source, target })
+      }
+      return acc
+    }, [])
+
+    if (hasInvalidTarget) {
+      return { ...createEmptyModelMappingGuardrail(), invalidJson: true }
+    }
+
+    const publishedModelSet = new Set(publishedModels)
+    const missingSourceModels = Array.from(
+      new Set(
+        entries
+          .filter((entry) => !publishedModelSet.has(entry.source))
+          .map((entry) => entry.source)
+      )
+    )
+    const exposedTargetModels = Array.from(
+      new Set(
+        entries
+          .filter((entry) => publishedModelSet.has(entry.target))
+          .map((entry) => entry.target)
+      )
+    )
+
+    return {
+      invalidJson: false,
+      entries,
+      missingSourceModels,
+      exposedTargetModels,
+    }
+  } catch {
+    return { ...createEmptyModelMappingGuardrail(), invalidJson: true }
+  }
+}
+
 export const formatModelNames = (models: string[]): string =>
   models.map((model) => `"${model}"`).join(', ')
 
@@ -61,6 +123,7 @@ export const ADVANCED_SETTINGS_SECTION_IDS = {
   internalNotes: 'channel-section-advanced-internal-notes',
   overrideRules: 'channel-section-advanced-override-rules',
   videoTaskProtocol: 'channel-section-advanced-video-task-protocol',
+  videoTaskBilling: 'channel-section-advanced-video-task-billing',
   responseMapping: 'channel-section-advanced-response-mapping',
   fieldPassthrough: 'channel-section-advanced-field-passthrough',
   extraSettings: 'channel-section-advanced-extra-settings',
@@ -95,6 +158,7 @@ export const ADVANCED_ERROR_FIELDS = [
   'upstream_model_update_check_enabled',
   'upstream_model_update_auto_sync_enabled',
   'upstream_model_update_ignored_models',
+  'video_task_delta_settlement_enabled',
   'video_task_path_override_enabled',
   'video_task_protocol_enabled',
   'video_task_submit_path',
@@ -102,6 +166,8 @@ export const ADVANCED_ERROR_FIELDS = [
   'video_task_task_id_path',
   'video_task_status_path',
   'video_task_progress_path',
+  'video_task_created_at_path',
+  'video_task_updated_at_path',
   'video_task_result_url_paths',
   'video_task_error_message_path',
   'video_task_status_submitted',
@@ -153,6 +219,7 @@ export function hasAdvancedSettingsValues(values: ChannelFormValues): boolean {
     values.pass_through_body_enabled ||
     values.system_prompt_override ||
     values.claude_beta_query ||
+    values.video_task_delta_settlement_enabled === false ||
     values.video_task_path_override_enabled ||
     values.video_task_protocol_enabled ||
     values.upstream_model_update_check_enabled ||

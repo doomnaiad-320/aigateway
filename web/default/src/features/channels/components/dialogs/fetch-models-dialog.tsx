@@ -59,16 +59,26 @@ function normalizeModelNameList(models: readonly string[]): string[] {
   )
 }
 
-type FetchModelsDialogProps = {
+type FetchModelsDialogBaseProps = {
   open: boolean
   onOpenChange: (open: boolean) => void
-  onModelsSelected?: (models: string[]) => void
   redirectModels?: string[]
   redirectSourceModels?: string[]
   customFetcher?: () => Promise<string[]>
-  existingModelsOverride?: string[]
   channelName?: string | null
 }
+
+type FetchModelsDialogProps = FetchModelsDialogBaseProps &
+  (
+    | {
+        onModelsSelected: (models: string[]) => void
+        existingModelsOverride: string[]
+      }
+    | {
+        onModelsSelected?: undefined
+        existingModelsOverride?: undefined
+      }
+  )
 
 export function FetchModelsDialog({
   open,
@@ -135,7 +145,7 @@ export function FetchModelsDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, activeChannel?.id, customFetcher])
 
-  const handleFetchModels = async () => {
+  async function handleFetchModels() {
     if (!activeChannel && !customFetcher) return
 
     setIsFetching(true)

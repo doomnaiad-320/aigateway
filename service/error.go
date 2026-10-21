@@ -135,7 +135,77 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 	return
 }
 
+func TaskErrorFromUpstreamResponse(ctx context.Context, resp *http.Response, code string) *dto.TaskError {
+	if resp == nil {
+		return TaskErrorWrapperLocal(errors.New("task upstream response is nil"), code, http.StatusBadGateway)
+	}
+	responseBody, truncated, err := readUpstreamErrorBody(resp.Body)
+	CloseResponseBodyGracefully(resp)
+	if err != nil {
+		return TaskErrorWrapper(err, code, resp.StatusCode)
+	}
+
+	message := safeUpstreamTaskErrorMessage(responseBody)
+	if message == "" {
+		logger.LogError(ctx, fmt.Sprintf("task upstream bad response status code %d, body_bytes=%d, truncated=%t", resp.StatusCode, len(responseBody), truncated))
+		message = fmt.Sprintf("bad upstream response status code %d", resp.StatusCode)
+	} else if truncated {
+		message += fmt.Sprintf("...[truncated after %d bytes]", maxUpstreamErrorBodyBytes)
+	}
+	message = common.SanitizePersistedLogContent(common.MaskSensitiveInfo(message))
+	if message == "" {
+		message = fmt.Sprintf("bad upstream response status code %d", resp.StatusCode)
+	}
+	return &dto.TaskError{
+		Code:       code,
+		Message:    message,
+		StatusCode: resp.StatusCode,
+		Error:      errors.New(message),
+	}
+}
+
+func safeUpstreamTaskErrorMessage(responseBody []byte) string {
+	var errResponse dto.GeneralErrorResponse
+	if err := common.Unmarshal(responseBody, &errResponse); err != nil {
+		return ""
+	}
+	if openAIError := errResponse.TryToOpenAIError(); openAIError != nil {
+		return openAIError.Message
+	}
+	if errResponse.Message != "" {
+		return errResponse.Message
+	}
+	if errResponse.Msg != "" {
+		return errResponse.Msg
+	}
+	if errResponse.Err != "" {
+		return errResponse.Err
+	}
+	if errResponse.ErrorMsg != "" {
+		return errResponse.ErrorMsg
+	}
+	if errResponse.Detail != "" {
+		return errResponse.Detail
+	}
+	if errResponse.Header.Message != "" {
+		return errResponse.Header.Message
+	}
+	if errResponse.Response.Error.Message != "" {
+		return errResponse.Response.Error.Message
+	}
+	if len(errResponse.Error) > 0 && common.GetJsonType(errResponse.Error) == "string" {
+		var message string
+		if err := common.Unmarshal(errResponse.Error, &message); err == nil {
+			return message
+		}
+	}
+	return ""
+}
+
 func readUpstreamErrorBody(body io.Reader) ([]byte, bool, error) {
+	if body == nil {
+		return nil, false, nil
+	}
 	responseBody, err := io.ReadAll(io.LimitReader(body, maxUpstreamErrorBodyBytes+1))
 	if err != nil {
 		return nil, false, err
@@ -150,25 +220,86 @@ func ResetStatusCode(maxApiErr *types.MaxAPIError, statusCodeMappingStr string) 
 	if maxApiErr == nil {
 		return
 	}
-	if statusCodeMappingStr == "" || statusCodeMappingStr == "{}" {
+	maxApiErr.StatusCode = MapStatusCode(maxApiErr.StatusCode, statusCodeMappingStr)
+}
+
+func ResetTaskStatusCode(taskErr *dto.TaskError, statusCodeMappingStr string) {
+	if taskErr == nil {
 		return
 	}
-	statusCodeMapping := make(map[string]any)
-	err := common.Unmarshal([]byte(statusCodeMappingStr), &statusCodeMapping)
+	mappedStatusCode := MapStatusCode(taskErr.StatusCode, statusCodeMappingStr)
+	if mappedStatusCode == taskErr.StatusCode {
+		return
+	}
+	if taskErr.UpstreamStatusCode == 0 {
+		taskErr.UpstreamStatusCode = taskErr.StatusCode
+	}
+	taskErr.StatusCode = mappedStatusCode
+}
+
+func MapStatusCode(statusCode int, statusCodeMappingStr string) int {
+	if statusCode == http.StatusOK {
+		return statusCode
+	}
+	rawMapping, err := decodeStatusCodeMapping(statusCodeMappingStr)
 	if err != nil {
-		return
+		return statusCode
 	}
-	if maxApiErr.StatusCode == http.StatusOK {
-		return
+	value, ok := rawMapping[strconv.Itoa(statusCode)]
+	if !ok {
+		return statusCode
 	}
-	codeStr := strconv.Itoa(maxApiErr.StatusCode)
-	if value, ok := statusCodeMapping[codeStr]; ok {
-		intCode, ok := parseStatusCodeMappingValue(value)
-		if !ok {
-			return
+	mappedStatusCode, ok := parseStatusCodeMappingValue(value)
+	if !ok || mappedStatusCode < http.StatusContinue || mappedStatusCode > 599 {
+		return statusCode
+	}
+	return mappedStatusCode
+}
+
+func ValidateStatusCodeMapping(statusCodeMappingStr string) error {
+	_, err := parseStatusCodeMapping(statusCodeMappingStr)
+	return err
+}
+
+func parseStatusCodeMapping(statusCodeMappingStr string) (map[int]int, error) {
+	rawMapping, err := decodeStatusCodeMapping(statusCodeMappingStr)
+	if err != nil {
+		return nil, err
+	}
+
+	statusCodeMapping := make(map[int]int, len(rawMapping))
+	for source, value := range rawMapping {
+		normalizedSource := strings.TrimSpace(source)
+		sourceCode, err := strconv.Atoi(normalizedSource)
+		if err != nil || sourceCode < http.StatusContinue || sourceCode > 599 || strconv.Itoa(sourceCode) != normalizedSource {
+			return nil, fmt.Errorf("invalid source status code %q", source)
 		}
-		maxApiErr.StatusCode = intCode
+		targetCode, ok := parseStatusCodeMappingValue(value)
+		if !ok || targetCode < http.StatusContinue || targetCode > 599 {
+			return nil, fmt.Errorf("invalid target status code for %q", source)
+		}
+		if _, exists := statusCodeMapping[sourceCode]; exists {
+			return nil, fmt.Errorf("duplicate source status code %d", sourceCode)
+		}
+		statusCodeMapping[sourceCode] = targetCode
 	}
+	return statusCodeMapping, nil
+}
+
+func decodeStatusCodeMapping(statusCodeMappingStr string) (map[string]any, error) {
+	trimmed := strings.TrimSpace(statusCodeMappingStr)
+	if trimmed == "" || trimmed == "{}" {
+		return map[string]any{}, nil
+	}
+
+	rawMapping := make(map[string]any)
+	if err := common.Unmarshal([]byte(trimmed), &rawMapping); err != nil {
+		return nil, fmt.Errorf("invalid JSON object: %w", err)
+	}
+	if rawMapping == nil {
+		return nil, fmt.Errorf("mapping must be a JSON object")
+	}
+	return rawMapping, nil
 }
 
 func parseStatusCodeMappingValue(value any) (int, bool) {

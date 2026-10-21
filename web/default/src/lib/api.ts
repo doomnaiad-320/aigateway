@@ -20,12 +20,15 @@ import axios, { type AxiosRequestConfig } from 'axios'
 import { t } from 'i18next'
 import { toast } from 'sonner'
 import { useAuthStore } from '@/stores/auth-store'
+import type { AutoGroupRoute } from '@/lib/auto-routes'
 
 declare module 'axios' {
   export interface AxiosRequestConfig {
     skipBusinessError?: boolean
     skipErrorHandler?: boolean
     disableDuplicate?: boolean
+    authSessionRevision?: number
+    staleAuthResponse?: boolean
   }
 }
 
@@ -54,6 +57,9 @@ export const api = axios.create({
 // Deduplicate concurrent GET requests to the same URL
 // Prevents multiple identical requests from being sent simultaneously
 const inFlightGet = new Map<string, Promise<unknown>>()
+useAuthStore.subscribe((state, previous) => {
+  if (state.sessionRevision !== previous.sessionRevision) inFlightGet.clear()
+})
 const originalGet = api.get.bind(api)
 
 api.get = ((url: string, config: ApiRequestConfig = {}) => {
@@ -61,7 +67,7 @@ api.get = ((url: string, config: ApiRequestConfig = {}) => {
   if (disableDuplicate) return originalGet(url, config)
 
   const params = config.params ? JSON.stringify(config.params) : '{}'
-  const key = `${url}?${params}`
+  const key = `${useAuthStore.getState().sessionRevision}:${url}?${params}`
 
   // Return existing in-flight request if available
   if (inFlightGet.has(key)) return inFlightGet.get(key)!
@@ -101,6 +107,13 @@ api.interceptors.response.use(
     const status = error?.response?.status
 
     if (status === 401) {
+      const belongsToCurrentSession =
+        error?.config?.authSessionRevision ===
+        useAuthStore.getState().sessionRevision
+      if (!belongsToCurrentSession) {
+        if (error.config) error.config.staleAuthResponse = true
+        return Promise.reject(error)
+      }
       try {
         useAuthStore.getState().auth.reset()
       } catch {
@@ -159,14 +172,20 @@ export function getCommonHeaders(): Record<string, string> {
 // ============================================================================
 
 // Attach user ID header for all requests
-api.interceptors.request.use((config) => {
-  const uid = getUserId()
-  if (uid) {
-    // Custom header for user identification
-    ;(config.headers as Record<string, string>)['Max-Api-User'] = uid
-  }
-  return config
-})
+api.interceptors.request.use(
+  (config) => {
+    config.authSessionRevision = useAuthStore.getState().sessionRevision
+    config.staleAuthResponse = false
+    const uid = getUserId()
+    if (uid) {
+      // Custom header for user identification
+      ;(config.headers as Record<string, string>)['Max-Api-User'] = uid
+    }
+    return config
+  },
+  undefined,
+  { synchronous: true }
+)
 
 // ============================================================================
 // Common API Functions
@@ -199,6 +218,7 @@ export async function getUserModels(): Promise<{
 export async function getUserGroups(): Promise<{
   success: boolean
   message?: string
+  auto_routes?: AutoGroupRoute[]
   data?: Record<
     string,
     { desc: string; ratio: number | string; auto?: boolean; groups?: string[] }
@@ -232,32 +252,86 @@ export async function getNotice(): Promise<{
 // 2FA Management APIs
 // ----------------------------------------------------------------------------
 
+export const sensitiveActionConfig: ApiRequestConfig = {
+  skipBusinessError: true,
+  skipErrorHandler: true,
+}
+
+export interface TwoFASetupResponse {
+  success: boolean
+  message?: string
+  data?: {
+    secret: string
+    qr_code_data: string
+    backup_codes: string[]
+  }
+}
+
+export interface TwoFAActionResponse {
+  success: boolean
+  message?: string
+}
+
+export interface TwoFABackupCodesResponse extends TwoFAActionResponse {
+  data?: {
+    backup_codes: string[]
+  }
+}
+
+export interface TwoFAStatusResponse {
+  success: boolean
+  message?: string
+  data?: {
+    enabled: boolean
+    locked: boolean
+    backup_codes_remaining: number
+  }
+}
+
 // Get 2FA status
-export async function get2FAStatus() {
-  const res = await api.get('/api/user/2fa/status')
+export async function get2FAStatus(): Promise<TwoFAStatusResponse> {
+  const res = await api.get<TwoFAStatusResponse>('/api/user/2fa/status')
   return res.data
 }
 
 // Setup 2FA
-export async function setup2FA() {
-  const res = await api.post('/api/user/2fa/setup')
+export async function setup2FA(): Promise<TwoFASetupResponse> {
+  const res = await api.post<TwoFASetupResponse>(
+    '/api/user/2fa/setup',
+    undefined,
+    sensitiveActionConfig
+  )
   return res.data
 }
 
 // Enable 2FA with verification code
-export async function enable2FA(code: string) {
-  const res = await api.post('/api/user/2fa/enable', { code })
+export async function enable2FA(code: string): Promise<TwoFAActionResponse> {
+  const res = await api.post<TwoFAActionResponse>(
+    '/api/user/2fa/enable',
+    { code },
+    sensitiveActionConfig
+  )
   return res.data
 }
 
 // Disable 2FA with verification code
-export async function disable2FA(code: string) {
-  const res = await api.post('/api/user/2fa/disable', { code })
+export async function disable2FA(code: string): Promise<TwoFAActionResponse> {
+  const res = await api.post<TwoFAActionResponse>(
+    '/api/user/2fa/disable',
+    { code },
+    sensitiveActionConfig
+  )
   return res.data
 }
 
 // Regenerate 2FA backup codes
-export async function regenerate2FABackupCodes(code: string) {
-  const res = await api.post('/api/user/2fa/backup_codes', { code })
+export async function regenerate2FABackupCodes(
+  code: string
+): Promise<TwoFABackupCodesResponse> {
+  const res = await api.post<TwoFABackupCodesResponse>(
+    '/api/user/2fa/backup_codes',
+    { code },
+    sensitiveActionConfig
+  )
   return res.data
 }
